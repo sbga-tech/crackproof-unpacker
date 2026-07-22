@@ -10,11 +10,14 @@ pub(crate) mod managed;
 
 const EXPORT_DIRECTORY: usize = 0;
 const IMPORT_DIRECTORY: usize = 1;
+const EXCEPTION_DIRECTORY: usize = 3;
 const SECURITY_DIRECTORY: usize = 4;
+const BASE_RELOCATION_DIRECTORY: usize = 5;
 const IMAGE_IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const IMAGE_EXPORT_DIRECTORY_SIZE: usize = 40;
 const IAT_DIRECTORY: usize = 12;
 mod clr;
+const DELAY_IMPORT_DIRECTORY: usize = 13;
 #[cfg(test)]
 mod tests;
 const MAX_IMPORT_MODULES: usize = 4_096;
@@ -26,6 +29,11 @@ const IMPORT_SECTION_CHARACTERISTICS: u32 = 0xc030_0040;
 const SECTION_HEADER_SIZE: usize = 40;
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+const BASE_RELOCATION_BLOCK_HEADER_SIZE: usize = 8;
+const DELAY_IMPORT_DESCRIPTOR_SIZE: usize = 32;
+const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
+const IMAGE_REL_BASED_HIGHLOW: u16 = 3;
+const IMAGE_REL_BASED_DIR64: u16 = 10;
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
 const MAX_SCAN_STARTS: usize = 1 << 27;
 const MAX_SCAN_CANDIDATES: usize = 4_096;
@@ -991,11 +999,11 @@ fn validate_retained_directory(
     )
     .context("retained directory is not section-backed")?;
     match index {
-        3 => validate_exception_directory(mapped, pe, directory),
-        5 => validate_base_relocation_directory(mapped, pe, directory),
-        13 => validate_delay_import_directory(mapped, pe, directory),
+        EXCEPTION_DIRECTORY => validate_exception_directory(mapped, pe, directory),
+        BASE_RELOCATION_DIRECTORY => validate_base_relocation_directory(mapped, pe, directory),
         6 => validate_debug_directory(mapped, pe, directory),
         9 => validate_tls_directory(mapped, pe, directory),
+        DELAY_IMPORT_DIRECTORY => validate_delay_import_directory(mapped, pe, directory),
         14 => validate_clr_directory(mapped, pe, directory),
         _ => bail!("nonempty unsupported data directory {index}"),
     }
@@ -1309,12 +1317,12 @@ fn validate_base_relocation_directory(
             cursor.is_multiple_of(4),
             "relocation block is not DWORD-aligned"
         );
-        let header =
-            rva_slice(mapped, pe, cursor, 8).context("relocation header is not section-backed")?;
+        let header = rva_slice(mapped, pe, cursor, BASE_RELOCATION_BLOCK_HEADER_SIZE)
+            .context("relocation header is not section-backed")?;
         let page = u32::from_le_bytes(header[0..4].try_into().expect("four bytes"));
         let block_size = u32::from_le_bytes(header[4..8].try_into().expect("four bytes"));
         ensure!(
-            block_size >= 8 && block_size.is_multiple_of(4),
+            block_size >= BASE_RELOCATION_BLOCK_HEADER_SIZE as u32 && block_size.is_multiple_of(4),
             "relocation block size is invalid"
         );
         let next = cursor
@@ -1323,7 +1331,7 @@ fn validate_base_relocation_directory(
         ensure!(next <= end, "relocation block exceeds directory");
         // Linkers emit this eight-byte no-op block for an otherwise empty
         // relocation directory. It has no PageRVA or entries to retain.
-        if page == 0 && block_size == 8 {
+        if page == 0 && block_size == BASE_RELOCATION_BLOCK_HEADER_SIZE as u32 {
             cursor = next;
             continue;
         }
@@ -1334,7 +1342,7 @@ fn validate_base_relocation_directory(
         ensure!(page < pe.size_of_image, "relocation PageRVA exceeds image");
         pe.section_containing_rva(page)
             .with_context(|| format!("relocation PageRVA {page:#x} is not section-backed"))?;
-        for entry_offset in (8..block_size).step_by(2) {
+        for entry_offset in (BASE_RELOCATION_BLOCK_HEADER_SIZE as u32..block_size).step_by(2) {
             let entry = rva_slice(
                 mapped,
                 pe,
@@ -1349,10 +1357,10 @@ fn validate_base_relocation_directory(
             let target = page
                 .checked_add(u32::from(word & 0x0fff))
                 .context("relocation target overflow")?;
-            let width = match kind {
-                0 => continue,
-                3 => 4,
-                10 if pe.pointer_width() == PointerWidth::U64 => 8,
+            let width = match (pe.pointer_width(), kind) {
+                (_, IMAGE_REL_BASED_ABSOLUTE) => continue,
+                (PointerWidth::U32, IMAGE_REL_BASED_HIGHLOW) => 4,
+                (PointerWidth::U64, IMAGE_REL_BASED_DIR64) => 8,
                 _ => bail!("unsupported relocation kind {kind}"),
             };
             let target_end = target
@@ -1373,7 +1381,9 @@ fn validate_base_relocation_directory(
 
 fn validate_delay_import_directory(mapped: &[u8], pe: &Pe, directory: DataDirectory) -> Result<()> {
     ensure!(
-        directory.size.is_multiple_of(32),
+        directory
+            .size
+            .is_multiple_of(DELAY_IMPORT_DESCRIPTOR_SIZE as u32),
         "delay-import directory is not descriptor aligned"
     );
     let end = directory
@@ -1382,7 +1392,7 @@ fn validate_delay_import_directory(mapped: &[u8], pe: &Pe, directory: DataDirect
         .context("delay-import directory overflow")?;
     let mut cursor = directory.virtual_address;
     while cursor < end {
-        let descriptor = rva_slice(mapped, pe, cursor, 32)
+        let descriptor = rva_slice(mapped, pe, cursor, DELAY_IMPORT_DESCRIPTOR_SIZE)
             .context("delay-import descriptor is not section-backed")?;
         if descriptor.iter().all(|byte| *byte == 0) {
             ensure!(
@@ -1445,7 +1455,7 @@ fn validate_delay_import_directory(mapped: &[u8], pe: &Pe, directory: DataDirect
         }
         validate_delay_import_tables(mapped, pe, int, iat, bound, unload, rva_mode)?;
         cursor = cursor
-            .checked_add(32)
+            .checked_add(DELAY_IMPORT_DESCRIPTOR_SIZE as u32)
             .context("delay-import descriptor overflow")?;
     }
     bail!("delay-import descriptor array has no terminator")
@@ -1576,7 +1586,6 @@ fn validate_delay_import_tables(
             );
             return Ok(());
         }
-        ensure!(iat_value != 0, "delay-import IAT ends before INT");
         validate_delay_thunk(mapped, pe, int_value, rva_mode, "INT")?;
         // A bound IAT and a delay-loaded IAT may already hold resolved external
         // function VAs. Their format-defined invariant is the paired terminator,

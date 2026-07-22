@@ -1,5 +1,7 @@
 use std::ops::Range;
 
+use super::decoder::CustomDecoderSource;
+use super::replay::NestedTransformedSource;
 use super::*;
 use crate::pe::{DataDirectory, Machine, Pe, Section};
 use crate::unpack::bootstrap::{
@@ -7,7 +9,7 @@ use crate::unpack::bootstrap::{
 };
 use crate::unpack::nested::{
     MAX_AL_PROGRAM_BYTES, amd64_runtime_header_checksums, crackproof_checksum, crc32_table,
-    lfsr_al_maps, lfsr_decode_program, nested_apply_dword_transform, parse_al_byte_map,
+    lfsr_al_maps, lfsr_decode_program, nested_transform_dwords_into, parse_al_byte_map,
 };
 use crate::unpack::profile::{
     SparsePageKey, decode_sparse_text_pages_in_place, unique_sparse_page_keys,
@@ -435,11 +437,12 @@ fn mwemu_executes_recovered_dword_transform_helper() {
     });
     assert_eq!(observed, EXPECTED);
 
-    let mut static_output = INPUT_DWORDS
+    let static_source = INPUT_DWORDS
         .into_iter()
         .flat_map(u32::to_le_bytes)
         .collect::<Vec<_>>();
-    nested_apply_dword_transform(&mut static_output, KEY, 19);
+    let mut static_output = vec![0; static_source.len()];
+    nested_transform_dwords_into(&static_source, &mut static_output, KEY, 19);
     assert_eq!(
         static_output,
         EXPECTED
@@ -447,6 +450,42 @@ fn mwemu_executes_recovered_dword_transform_helper() {
             .flat_map(u32::to_le_bytes)
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn nested_dword_transform_copies_a_partial_tail() {
+    let source = [1, 2, 3, 4, 0xaa, 0xbb, 0xcc];
+    let mut destination = [0x55; 7];
+
+    nested_transform_dwords_into(&source, &mut destination, 0, 0);
+
+    assert_eq!(destination, source);
+}
+
+#[test]
+fn lazy_nested_transform_matches_materialized_bytes() {
+    let mut byte_map = [0u8; 256];
+    for (index, byte) in byte_map.iter_mut().enumerate() {
+        *byte = (index as u8).rotate_left(3) ^ 0xa5;
+    }
+
+    for length in [1, 3, 4, 5, 7, 8, 17, 65] {
+        let source = (0..length)
+            .map(|index| (index as u8).wrapping_mul(0x3d).wrapping_add(0x17))
+            .collect::<Vec<_>>();
+        let mut materialized = vec![0; source.len()];
+        nested_transform_dwords_into(&source, &mut materialized, 0x89ab_cdef, 19);
+
+        for map in [None, Some(&byte_map)] {
+            let mut lazy = NestedTransformedSource::new(&source, 0x89ab_cdef, map);
+            for index in (0..source.len()).chain((0..source.len()).rev()) {
+                let expected = map.map_or(materialized[index], |map| {
+                    map[usize::from(materialized[index])]
+                });
+                assert_eq!(lazy.byte(index), expected, "length {length}, byte {index}");
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -822,6 +861,86 @@ fn primitives_round_trip_and_custom_decoder_consumes_exact_stream() {
 }
 
 #[test]
+fn custom_decoder_prefix_filter_never_rejects_a_successful_stream() {
+    let token_table = |symbol: u16| {
+        let mut table = root_literal_table(0);
+        for node in table.chunks_exact_mut(CUSTOM_DECODER_NODE_SIZE) {
+            node[..2].copy_from_slice(&(0x8000 | symbol).to_le_bytes());
+        }
+        table
+    };
+
+    let literal_source = [0x3f];
+    let literal_table = root_literal_table(b'Q');
+    assert!(custom_decoder_prefix_is_viable(
+        &literal_table,
+        &literal_source,
+        literal_source.len(),
+        0,
+        2,
+        false,
+    ));
+
+    let pending_source = [0x10];
+    let pending_table = root_table_for_tokens(&pending_source, &[0x101, 0x201]);
+    let mut pending_output = [0];
+    decode_custom_stream_with_history_mode(
+        &pending_table,
+        &pending_source,
+        b"A",
+        &mut pending_output,
+        false,
+    )
+    .expect("prefix followed by a valid repeat");
+    assert!(custom_decoder_prefix_is_viable(
+        &pending_table,
+        &pending_source,
+        pending_source.len(),
+        1,
+        pending_output.len(),
+        false,
+    ));
+
+    for rejected in [0x203, 0x301] {
+        assert!(!custom_decoder_prefix_is_viable(
+            &token_table(rejected),
+            &[0],
+            1,
+            4,
+            4,
+            false,
+        ));
+    }
+
+    for symbol in 0..=0x3ff {
+        let table = token_table(symbol);
+        let source = [0];
+        let history = [0xa5; 4];
+        let mut destination = [0; 2];
+        let successful = decode_custom_stream_with_history_mode(
+            &table,
+            &source,
+            &history,
+            &mut destination,
+            false,
+        )
+        .is_ok();
+        assert!(
+            !successful
+                || custom_decoder_prefix_is_viable(
+                    &table,
+                    &source,
+                    source.len(),
+                    history.len(),
+                    destination.len(),
+                    false,
+                ),
+            "successful initial token {symbol:#x} was filtered"
+        );
+    }
+}
+
+#[test]
 fn custom_decoder_rejects_unsupported_repeat_widths_and_pending_prefixes() {
     let source = [0x21];
     let table = root_table_for_tokens(&source, &[0x203]);
@@ -840,6 +959,44 @@ fn custom_decoder_rejects_unsupported_repeat_widths_and_pending_prefixes() {
         Err(CustomDecodeError::PendingPrefix { pending: 1 })
     );
     assert_eq!(destination, [b'Z']);
+}
+
+#[test]
+fn custom_decoder_can_reuse_a_dirty_destination_after_failure() {
+    let failing_source = [0x10];
+    let failing_table = root_table_for_tokens(&failing_source, &[0x101, u16::from(b'Z')]);
+    let mut destination = [0xa5; 4];
+    assert!(
+        decode_custom_stream_with_history_mode(
+            &failing_table,
+            &failing_source,
+            &[],
+            &mut destination,
+            false,
+        )
+        .is_err()
+    );
+    assert_eq!(destination[0], b'Z');
+
+    let successful_source = [0x21, 0x43];
+    let successful_table = root_table_for_tokens(
+        &successful_source,
+        &[
+            u16::from(b'W'),
+            u16::from(b'X'),
+            u16::from(b'Y'),
+            u16::from(b'Z'),
+        ],
+    );
+    decode_custom_stream_with_history_mode(
+        &successful_table,
+        &successful_source,
+        &[],
+        &mut destination,
+        false,
+    )
+    .expect("successful replay into dirty destination");
+    assert_eq!(destination, *b"WXYZ");
 }
 
 #[test]

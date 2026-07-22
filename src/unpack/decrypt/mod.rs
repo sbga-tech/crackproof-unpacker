@@ -13,7 +13,7 @@ use decoder::discover_decoder_candidates;
 #[cfg(test)]
 use decoder::{CustomDecodeError, decode_custom_stream};
 pub(crate) use decoder::{
-    DecoderCandidate, decode_custom_stream_with_history, decode_custom_stream_with_history_mode,
+    DecoderCandidate, custom_decoder_prefix_is_viable, decode_custom_stream_with_history,
 };
 pub(crate) use replay::{DecryptionSelectionError, decrypt_packed_image};
 

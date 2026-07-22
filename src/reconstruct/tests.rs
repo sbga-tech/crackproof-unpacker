@@ -1,5 +1,6 @@
 use super::*;
 use crate::pe::{Machine, Section};
+use crate::unpack::profile::AMD64_RUNTIME_FUNCTION_LEN;
 
 fn test_pe() -> Pe {
     Pe {
@@ -1135,4 +1136,85 @@ fn serializer_maps_trimmed_zero_tail_back_to_the_original_image() {
     let emitted = Pe::parse(&output).unwrap();
     let remapped = emitted.map_image(&output).unwrap();
     assert_eq!(&remapped[0x1000..0x2000], &mapped[0x1000..0x2000]);
+}
+
+#[test]
+fn retained_exception_directory_reuses_amd64_runtime_validation() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x0000_0001_4000_0000;
+    pe.sections[0].name_bytes = *b".text\0\0\0";
+    pe.sections[0].characteristics = 0x6000_0020;
+    pe.sections.push(Section {
+        index: 1,
+        header_offset: 0x1a0,
+        name_bytes: *b".pdata\0\0",
+        virtual_size: 0x1000,
+        virtual_address: 0x2000,
+        raw_size: 0x1000,
+        raw_pointer: 0x1200,
+        characteristics: 0x4000_0040,
+    });
+    pe.section_count = 2;
+    pe.size_of_image = 0x3000;
+    pe.file_len = 0x2200;
+    let directory = DataDirectory {
+        virtual_address: 0x2000,
+        size: AMD64_RUNTIME_FUNCTION_LEN as u32,
+    };
+    pe.directories[EXCEPTION_DIRECTORY] = directory;
+    let mut image = vec![0; 0x3000];
+    put_u32(&mut image, 0x2000, 0x1000);
+    put_u32(&mut image, 0x2004, 0x1020);
+    put_u32(&mut image, 0x2008, 0x2020);
+    image[0x2020] = 1;
+
+    validate_retained_directory(&image, &pe, EXCEPTION_DIRECTORY, directory).unwrap();
+    put_u32(&mut image, 0x2004, 0x1000);
+    assert!(validate_retained_directory(&image, &pe, EXCEPTION_DIRECTORY, directory).is_err());
+}
+
+#[test]
+fn base_relocation_validator_accepts_empty_and_machine_specific_blocks() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    let mut directory = DataDirectory {
+        virtual_address: 0x1100,
+        size: BASE_RELOCATION_BLOCK_HEADER_SIZE as u32,
+    };
+    put_u32(&mut image, 0x1104, BASE_RELOCATION_BLOCK_HEADER_SIZE as u32);
+    validate_retained_directory(&image, &pe, BASE_RELOCATION_DIRECTORY, directory).unwrap();
+
+    directory.size = (BASE_RELOCATION_BLOCK_HEADER_SIZE + 4) as u32;
+    put_u32(&mut image, 0x1100, 0x1000);
+    put_u32(&mut image, 0x1104, directory.size);
+    image[0x1108..0x110a].copy_from_slice(&((IMAGE_REL_BASED_HIGHLOW << 12) | 0x200).to_le_bytes());
+    validate_retained_directory(&image, &pe, BASE_RELOCATION_DIRECTORY, directory).unwrap();
+
+    image[0x1108..0x110a].copy_from_slice(&((IMAGE_REL_BASED_DIR64 << 12) | 0x200).to_le_bytes());
+    assert!(
+        validate_retained_directory(&image, &pe, BASE_RELOCATION_DIRECTORY, directory).is_err()
+    );
+}
+
+#[test]
+fn delay_import_validator_requires_rva_descriptors_and_valid_thunks() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    let directory = DataDirectory {
+        virtual_address: 0x1100,
+        size: (DELAY_IMPORT_DESCRIPTOR_SIZE * 2) as u32,
+    };
+    put_u32(&mut image, 0x1100, 1);
+    put_u32(&mut image, 0x1104, 0x1180);
+    put_u32(&mut image, 0x1108, 0x1190);
+    put_u32(&mut image, 0x110c, 0x11a0);
+    put_u32(&mut image, 0x1110, 0x11b0);
+    image[0x1180..0x1188].copy_from_slice(b"foo.dll\0");
+    put_u32(&mut image, 0x11b0, 0x11c0);
+    image[0x11c2..0x11c7].copy_from_slice(b"Func\0");
+
+    validate_retained_directory(&image, &pe, DELAY_IMPORT_DIRECTORY, directory).unwrap();
+    put_u32(&mut image, 0x1100, 0);
+    assert!(validate_retained_directory(&image, &pe, DELAY_IMPORT_DIRECTORY, directory).is_err());
 }

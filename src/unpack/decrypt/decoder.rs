@@ -248,40 +248,64 @@ pub(super) struct CustomDecoderNode {
     pub(super) auxiliary: u8,
 }
 
-pub(super) fn custom_decoder_node(
+pub(super) trait CustomDecoderSource {
+    fn len(&self) -> usize;
+    fn byte(&mut self, index: usize) -> u8;
+}
+
+struct SliceDecoderSource<'a>(&'a [u8]);
+
+impl CustomDecoderSource for SliceDecoderSource<'_> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    fn byte(&mut self, index: usize) -> u8 {
+        self.0[index]
+    }
+}
+
+#[inline]
+fn custom_decoder_node_bounded(
     table: &[u8],
     index: usize,
+    nodes: usize,
 ) -> Result<CustomDecoderNode, CustomDecodeError> {
-    let nodes = table.len() / CUSTOM_DECODER_NODE_SIZE;
-    let offset = index
-        .checked_mul(CUSTOM_DECODER_NODE_SIZE)
-        .ok_or(CustomDecodeError::ArithmeticOverflow)?;
-    let end = offset
-        .checked_add(CUSTOM_DECODER_NODE_SIZE)
-        .ok_or(CustomDecodeError::ArithmeticOverflow)?;
-    let bytes = table
-        .get(offset..end)
-        .ok_or(CustomDecodeError::NodeOutOfBounds { index, nodes })?;
+    if index >= nodes {
+        return Err(CustomDecodeError::NodeOutOfBounds { index, nodes });
+    }
+    // `index < table.len() / node_size` proves this multiplication and slice are bounded.
+    let offset = index * CUSTOM_DECODER_NODE_SIZE;
+    let bytes = &table[offset..offset + CUSTOM_DECODER_NODE_SIZE];
     Ok(CustomDecoderNode {
         tag: u16::from_le_bytes([bytes[0], bytes[1]]),
         auxiliary: bytes[2],
     })
 }
 
-pub(super) fn custom_decoder_bit(
-    source: &[u8],
-    bit_offset: usize,
-    total_bits: usize,
-) -> Result<usize, CustomDecodeError> {
-    if bit_offset >= total_bits {
-        return Err(CustomDecodeError::SourceExhausted { bit_offset });
-    }
-    Ok(((source[bit_offset / 8] >> (bit_offset % 8)) & 1) as usize)
-}
-
 pub(super) fn custom_decoder_symbol(
     table: &[u8],
     source: &[u8],
+    bit_offset: usize,
+    total_bits: usize,
+) -> Result<(u16, usize), CustomDecodeError> {
+    let mut source = SliceDecoderSource(source);
+    custom_decoder_symbol_with_nodes(
+        table,
+        table.len() / CUSTOM_DECODER_NODE_SIZE,
+        &mut source,
+        bit_offset,
+        total_bits,
+    )
+}
+
+#[inline]
+fn custom_decoder_symbol_with_nodes(
+    table: &[u8],
+    nodes: usize,
+    source: &mut impl CustomDecoderSource,
     bit_offset: usize,
     total_bits: usize,
 ) -> Result<(u16, usize), CustomDecodeError> {
@@ -291,10 +315,14 @@ pub(super) fn custom_decoder_symbol(
 
     let source_byte = bit_offset / 8;
     let shift = bit_offset % 8;
-    let window = u16::from(source[source_byte])
-        | (u16::from(source.get(source_byte + 1).copied().unwrap_or(0)) << 8);
+    let window = u16::from(source.byte(source_byte))
+        | (u16::from(if source_byte + 1 < source.len() {
+            source.byte(source_byte + 1)
+        } else {
+            0
+        }) << 8);
     let root_index = usize::from(((window >> shift) & 0xff) as u8);
-    let root = custom_decoder_node(table, root_index)?;
+    let root = custom_decoder_node_bounded(table, root_index, nodes)?;
 
     if root.tag & 0x8000 != 0 {
         let bits = usize::from(root.auxiliary);
@@ -323,16 +351,56 @@ pub(super) fn custom_decoder_symbol(
         let branch_offset = bit_offset
             .checked_add(bits)
             .ok_or(CustomDecodeError::ArithmeticOverflow)?;
-        let branch = custom_decoder_bit(source, branch_offset, total_bits)?;
+        if branch_offset >= total_bits {
+            return Err(CustomDecodeError::SourceExhausted {
+                bit_offset: branch_offset,
+            });
+        }
+        let branch = usize::from((source.byte(branch_offset / 8) >> (branch_offset % 8)) & 1);
         bits += 1;
-        let base = usize::from(node.tag & 0x7fff);
-        let child = base
-            .checked_add(branch)
-            .ok_or(CustomDecodeError::ArithmeticOverflow)?;
-        node = custom_decoder_node(table, child)?;
+        let child = usize::from(node.tag & 0x7fff) + branch;
+        node = custom_decoder_node_bounded(table, child, nodes)?;
         if node.tag & 0x8000 != 0 {
             return Ok((node.tag & 0x7fff, bits));
         }
+    }
+}
+
+/// Returns `false` only when the first decoder token would make a full decode fail.
+/// An incomplete caller prefix is accepted conservatively to preserve compatibility.
+pub(crate) fn custom_decoder_prefix_is_viable(
+    table: &[u8],
+    source_prefix: &[u8],
+    source_len: usize,
+    history_len: usize,
+    destination_len: usize,
+    allow_zero_width_controls: bool,
+) -> bool {
+    if table.len() / CUSTOM_DECODER_NODE_SIZE < CUSTOM_DECODER_ROOT_NODES
+        || source_len == 0
+        || destination_len == 0
+    {
+        return false;
+    }
+    let required_prefix = source_len.min(CUSTOM_DECODER_MAX_CODE_BITS.div_ceil(8));
+    if source_prefix.len() < required_prefix {
+        return true;
+    }
+    let Some(total_bits) = source_len.checked_mul(8) else {
+        return false;
+    };
+    let Ok((symbol, _)) = custom_decoder_symbol(table, source_prefix, 0, total_bits) else {
+        return false;
+    };
+    let argument = usize::from(symbol & 0xff);
+    match symbol & 0x300 {
+        0 => true,
+        0x100 => argument != 0 || allow_zero_width_controls,
+        0x200 => {
+            matches!(argument, 1 | 2 | 4) && argument <= destination_len && argument <= history_len
+        }
+        0x300 => argument == 0 && allow_zero_width_controls,
+        _ => unreachable!("token class is masked to two bits"),
     }
 }
 
@@ -343,11 +411,28 @@ pub(crate) fn decode_custom_stream_with_history_mode(
     destination: &mut [u8],
     allow_zero_width_controls: bool,
 ) -> Result<CustomDecodeStats, CustomDecodeError> {
+    let mut source = SliceDecoderSource(source);
+    decode_custom_stream_with_history_source_mode(
+        table,
+        &mut source,
+        history,
+        destination,
+        allow_zero_width_controls,
+    )
+}
+
+pub(super) fn decode_custom_stream_with_history_source_mode(
+    table: &[u8],
+    source: &mut impl CustomDecoderSource,
+    history: &[u8],
+    destination: &mut [u8],
+    allow_zero_width_controls: bool,
+) -> Result<CustomDecodeStats, CustomDecodeError> {
     let nodes = table.len() / CUSTOM_DECODER_NODE_SIZE;
     if nodes < CUSTOM_DECODER_ROOT_NODES {
         return Err(CustomDecodeError::TableTooShort { nodes });
     }
-    if source.is_empty() {
+    if source.len() == 0 {
         return Err(CustomDecodeError::EmptySource);
     }
     if destination.is_empty() {
@@ -362,7 +447,8 @@ pub(crate) fn decode_custom_stream_with_history_mode(
     let mut written = 0usize;
     let mut pending = 0usize;
     while written < destination.len() {
-        let (symbol, symbol_bits) = custom_decoder_symbol(table, source, source_bits, total_bits)?;
+        let (symbol, symbol_bits) =
+            custom_decoder_symbol_with_nodes(table, nodes, source, source_bits, total_bits)?;
         source_bits = source_bits
             .checked_add(symbol_bits)
             .ok_or(CustomDecodeError::ArithmeticOverflow)?;
