@@ -819,11 +819,32 @@ fn amd64_helper_thunk_target(
     Ok(Some(target_rva))
 }
 
+pub(crate) fn validate_amd64_exception_directory(mapped: &[u8], pe: &Pe) -> Result<()> {
+    let directory = pe
+        .directories
+        .get(IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+        .copied()
+        .context("PE has no AMD64 Exception Directory slot")?;
+    ensure!(!directory.is_empty(), "AMD64 Exception Directory is empty");
+    let executable_ranges = executable_section_ranges(mapped, pe)?;
+    validate_amd64_exception_directory_with_ranges(mapped, pe, &executable_ranges, None)?;
+    Ok(())
+}
+
 fn amd64_runtime_function_evidence(
     mapped: &[u8],
     pe: &Pe,
     executable_ranges: &[Range<u32>],
     startup_rva: u32,
+) -> Result<Option<u32>> {
+    validate_amd64_exception_directory_with_ranges(mapped, pe, executable_ranges, Some(startup_rva))
+}
+
+fn validate_amd64_exception_directory_with_ranges(
+    mapped: &[u8],
+    pe: &Pe,
+    executable_ranges: &[Range<u32>],
+    startup_rva: Option<u32>,
 ) -> Result<Option<u32>> {
     let Some(directory) = pe.directories.get(IMAGE_DIRECTORY_ENTRY_EXCEPTION).copied() else {
         return Ok(None);
@@ -858,8 +879,11 @@ fn amd64_runtime_function_evidence(
         .context("reading AMD64 Exception Directory from mapped image")?;
 
     let startup_end = startup_rva
-        .checked_add(AMD64_STARTUP_LEN as u32)
-        .context("AMD64 startup range overflows while checking runtime function")?;
+        .map(|rva| {
+            rva.checked_add(AMD64_STARTUP_LEN as u32)
+                .context("AMD64 startup range overflows while checking runtime function")
+        })
+        .transpose()?;
     let mut matching_rva = None;
     for index in 0usize..count {
         let record_rva = range
@@ -917,16 +941,22 @@ fn amd64_runtime_function_evidence(
             )
         })?;
 
-        if begin_rva <= startup_rva && startup_end <= end_rva {
+        if let (Some(startup_rva), Some(startup_end)) = (startup_rva, startup_end)
+            && begin_rva <= startup_rva
+            && startup_end <= end_rva
+        {
             ensure!(
                 matching_rva.replace(record_rva).is_none(),
                 "AMD64 startup at {startup_rva:#x} belongs to multiple runtime functions"
             );
         }
     }
-    matching_rva.map(Some).ok_or_else(|| {
-        anyhow::anyhow!("AMD64 startup at {startup_rva:#x} has no owning runtime function")
-    })
+    match startup_rva {
+        None => Ok(None),
+        Some(startup_rva) => matching_rva.map(Some).ok_or_else(|| {
+            anyhow::anyhow!("AMD64 startup at {startup_rva:#x} has no owning runtime function")
+        }),
+    }
 }
 
 fn decode_amd64_instruction(mapped: &[u8], rva: u32) -> Result<Option<Amd64Instruction>> {

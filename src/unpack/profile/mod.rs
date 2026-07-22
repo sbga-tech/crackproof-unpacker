@@ -29,6 +29,7 @@ mod stage;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use native::amd64::validate_amd64_exception_directory;
 #[cfg(test)]
 pub(crate) use sparse::SparsePageKey;
 pub(crate) use sparse::{decode_sparse_text_pages_in_place, unique_sparse_page_keys};

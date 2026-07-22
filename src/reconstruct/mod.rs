@@ -3,16 +3,19 @@ use std::ops::Range;
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::pe::{self, DataDirectory, Pe, PointerWidth};
+use crate::pe::{self, DataDirectory, Machine, Pe, PointerWidth};
 use crate::unpack::imports::{ImportModule, ImportSymbol, LoaderDiscovery, named_thunk_rva};
-use crate::unpack::profile::OutputEntry;
+use crate::unpack::profile::{OutputEntry, validate_amd64_exception_directory};
 
 const EXPORT_DIRECTORY: usize = 0;
 const IMPORT_DIRECTORY: usize = 1;
+const EXCEPTION_DIRECTORY: usize = 3;
 const SECURITY_DIRECTORY: usize = 4;
+const BASE_RELOCATION_DIRECTORY: usize = 5;
 const IMAGE_IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const IMAGE_EXPORT_DIRECTORY_SIZE: usize = 40;
 const IAT_DIRECTORY: usize = 12;
+const DELAY_IMPORT_DIRECTORY: usize = 13;
 #[cfg(test)]
 mod tests;
 const MAX_IMPORT_MODULES: usize = 4_096;
@@ -24,6 +27,11 @@ const IMPORT_SECTION_CHARACTERISTICS: u32 = 0xc030_0040;
 const SECTION_HEADER_SIZE: usize = 40;
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+const BASE_RELOCATION_BLOCK_HEADER_SIZE: usize = 8;
+const DELAY_IMPORT_DESCRIPTOR_SIZE: usize = 32;
+const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
+const IMAGE_REL_BASED_HIGHLOW: u16 = 3;
+const IMAGE_REL_BASED_DIR64: u16 = 10;
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
 const MAX_SCAN_STARTS: usize = 1 << 27;
 const MAX_SCAN_CANDIDATES: usize = 4_096;
@@ -988,11 +996,165 @@ fn validate_retained_directory(
     )
     .context("retained directory is not section-backed")?;
     match index {
+        EXCEPTION_DIRECTORY => {
+            ensure!(
+                pe.machine_kind() == Machine::Amd64,
+                "nonempty Exception Directory is only supported for AMD64 images"
+            );
+            validate_amd64_exception_directory(mapped, pe)
+        }
+        BASE_RELOCATION_DIRECTORY => validate_base_relocation_directory(mapped, pe, directory),
         6 => validate_debug_directory(mapped, pe, directory),
         9 => validate_tls_directory(mapped, pe, directory),
+        DELAY_IMPORT_DIRECTORY => validate_delay_import_directory(mapped, pe, directory),
         14 => validate_clr_directory(mapped, pe, directory),
         _ => bail!("nonempty unsupported data directory {index}"),
     }
+}
+fn validate_base_relocation_directory(
+    mapped: &[u8],
+    pe: &Pe,
+    directory: DataDirectory,
+) -> Result<()> {
+    let bytes = rva_slice(
+        mapped,
+        pe,
+        directory.virtual_address,
+        usize::try_from(directory.size)?,
+    )
+    .context("Base Relocation Directory is not section-backed")?;
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let header_end = cursor
+            .checked_add(BASE_RELOCATION_BLOCK_HEADER_SIZE)
+            .context("base-relocation block header overflows")?;
+        ensure!(
+            header_end <= bytes.len(),
+            "Base Relocation Directory has a truncated block header"
+        );
+        let page_rva = u32_at(bytes, cursor)?;
+        let block_size = usize::try_from(u32_at(bytes, cursor + 4)?)?;
+        ensure!(
+            page_rva.is_multiple_of(0x1000),
+            "base-relocation block at directory offset {cursor:#x} has unaligned page RVA {page_rva:#x}"
+        );
+        ensure!(
+            block_size >= BASE_RELOCATION_BLOCK_HEADER_SIZE && block_size.is_multiple_of(2),
+            "base-relocation block at directory offset {cursor:#x} has invalid size {block_size:#x}"
+        );
+        let block_end = cursor
+            .checked_add(block_size)
+            .context("base-relocation block range overflows")?;
+        ensure!(
+            block_end <= bytes.len(),
+            "base-relocation block exceeds its directory"
+        );
+        for entry_offset in (header_end..block_end).step_by(2) {
+            let entry = u16::from_le_bytes(
+                bytes[entry_offset..entry_offset + 2]
+                    .try_into()
+                    .expect("bounded base-relocation entry"),
+            );
+            let kind = entry >> 12;
+            if kind == IMAGE_REL_BASED_ABSOLUTE {
+                continue;
+            }
+            let width = match (pe.machine_kind(), kind) {
+                (Machine::I386, IMAGE_REL_BASED_HIGHLOW) => 4,
+                (Machine::Amd64, IMAGE_REL_BASED_DIR64) => 8,
+                (machine, kind) => {
+                    bail!("unsupported base-relocation type {kind} for {machine:?}")
+                }
+            };
+            let target_rva = page_rva
+                .checked_add(u32::from(entry & 0x0fff))
+                .context("base-relocation target RVA overflows")?;
+            pe.section_for_rva_range(target_rva, width)
+                .context("base-relocation target is not section-backed")?;
+            let target = usize::try_from(target_rva)?;
+            mapped
+                .get(target..target + width)
+                .context("base-relocation target exceeds mapped image")?;
+        }
+        cursor = block_end;
+    }
+    Ok(())
+}
+fn validate_delay_import_directory(mapped: &[u8], pe: &Pe, directory: DataDirectory) -> Result<()> {
+    let size = usize::try_from(directory.size)?;
+    ensure!(
+        size.is_multiple_of(DELAY_IMPORT_DESCRIPTOR_SIZE),
+        "Delay Import Directory is not a sequence of descriptors"
+    );
+    let count = size / DELAY_IMPORT_DESCRIPTOR_SIZE;
+    ensure!(
+        count <= MAX_IMPORT_MODULES,
+        "Delay Import Directory exceeds the module cap"
+    );
+    let descriptors = rva_slice(mapped, pe, directory.virtual_address, size)
+        .context("Delay Import Directory is not section-backed")?;
+    let mut budget = ScanBudget::default();
+    let mut terminated = false;
+    for index in 0..count {
+        let offset = index * DELAY_IMPORT_DESCRIPTOR_SIZE;
+        let descriptor = &descriptors[offset..offset + DELAY_IMPORT_DESCRIPTOR_SIZE];
+        if descriptor.iter().all(|byte| *byte == 0) {
+            ensure!(
+                descriptors[offset..].iter().all(|byte| *byte == 0),
+                "Delay Import Directory has data after its terminator"
+            );
+            terminated = true;
+            break;
+        }
+        let attributes = u32_at(descriptor, 0)?;
+        ensure!(
+            attributes == 1,
+            "delay-import descriptor {index} does not use RVA-based fields"
+        );
+        let name_rva = u32_at(descriptor, 4)?;
+        let module_handle_rva = u32_at(descriptor, 8)?;
+        let iat_rva = u32_at(descriptor, 12)?;
+        let int_rva = u32_at(descriptor, 16)?;
+        ensure!(
+            name_rva != 0 && module_handle_rva != 0 && iat_rva != 0 && int_rva != 0,
+            "delay-import descriptor {index} has a null required RVA"
+        );
+        read_ascii(mapped, pe, name_rva, MAX_IMPORT_STRING)
+            .with_context(|| format!("delay-import descriptor {index} has an invalid DLL name"))?;
+        let (symbols, _) = parse_thunks(mapped, pe, int_rva, &mut budget)?.with_context(|| {
+            format!("delay-import descriptor {index} has an invalid name table")
+        })?;
+        let width = pe.pointer_width().bytes();
+        let thunk_bytes = symbols
+            .len()
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(width))
+            .context("delay-import thunk span overflows")?;
+        let validate_span = |rva: u32, len: usize, field: &str| -> Result<()> {
+            ensure!(
+                rva.is_multiple_of(u32::try_from(width)?),
+                "delay-import descriptor {index} has an unaligned {field}"
+            );
+            pe.section_for_rva_range(rva, len).with_context(|| {
+                format!("delay-import descriptor {index} has an invalid {field}")
+            })?;
+            let start = usize::try_from(rva)?;
+            mapped.get(start..start + len).with_context(|| {
+                format!("delay-import descriptor {index} {field} exceeds the mapped image")
+            })?;
+            Ok(())
+        };
+        validate_span(module_handle_rva, width, "module handle cell")?;
+        validate_span(iat_rva, thunk_bytes, "IAT")?;
+        for (field_offset, field_name) in [(20, "bound IAT"), (24, "unload IAT")] {
+            let rva = u32_at(descriptor, field_offset)?;
+            if rva != 0 {
+                validate_span(rva, thunk_bytes, field_name)?;
+            }
+        }
+    }
+    ensure!(terminated, "Delay Import Directory has no null terminator");
+    Ok(())
 }
 
 fn scan_resource_root(mapped: &[u8], pe: &Pe) -> Result<Option<DataDirectory>> {
