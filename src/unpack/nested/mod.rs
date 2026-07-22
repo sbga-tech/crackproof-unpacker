@@ -7,6 +7,9 @@ use anyhow::{Context, Result, ensure};
 use crate::pe::{Machine, Pe};
 use crate::unpack::bootstrap::PackedBootstrap;
 
+#[cfg(test)]
+mod tests;
+
 const A_RECORD_SIZE: usize = 16;
 const MAX_NESTED_STAGE_CONTEXTS: usize = 8;
 pub(crate) const MAX_AL_PROGRAM_BYTES: usize = 96;
@@ -31,6 +34,13 @@ pub(crate) struct NestedRecord {
     pub(crate) destination_length: u32,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum NestedReplay {
+    NoMatch,
+    Unique(Vec<u8>, u32),
+    Ambiguous,
+}
+
 pub(crate) trait NestedRecordReplayer {
     fn begin_graph(&mut self) -> Result<()>;
 
@@ -41,7 +51,45 @@ pub(crate) trait NestedRecordReplayer {
         record: &NestedRecord,
         keys: &[u32],
         byte_maps: &[(usize, Box<[u8; 256]>)],
-    ) -> Result<Option<(Vec<u8>, u32)>>;
+    ) -> Result<NestedReplay>;
+}
+
+fn replay_nested_key_tiers(
+    replayer: &mut impl NestedRecordReplayer,
+    staged_outer: &[u8],
+    bootstrap: PackedBootstrap,
+    record: &NestedRecord,
+    keys: &[u32],
+    direct_key_count: usize,
+    byte_maps: &[(usize, Box<[u8; 256]>)],
+) -> Result<NestedReplay> {
+    ensure!(
+        direct_key_count <= keys.len(),
+        "nested direct-key tier exceeds the complete key set"
+    );
+    if direct_key_count != 0 {
+        match replayer.replay(
+            staged_outer,
+            bootstrap,
+            record,
+            &keys[..direct_key_count],
+            byte_maps,
+        )? {
+            NestedReplay::NoMatch => {}
+            result => return Ok(result),
+        }
+    }
+    if direct_key_count < keys.len() {
+        replayer.replay(
+            staged_outer,
+            bootstrap,
+            record,
+            &keys[direct_key_count..],
+            byte_maps,
+        )
+    } else {
+        Ok(NestedReplay::NoMatch)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -587,6 +635,13 @@ pub(super) fn push_nested_adjacent_scalar_variants(
     Ok(())
 }
 
+/// Scalar values with explicit metadata references precede bounded raw-word fallbacks.
+/// `values[..direct_len]` is independently replayable without the speculative suffix.
+struct NestedScalarCandidates {
+    values: Vec<u32>,
+    direct_len: usize,
+}
+
 fn nested_scalar_candidates(
     staged_outer: &[u8],
     bootstrap: PackedBootstrap,
@@ -595,39 +650,27 @@ fn nested_scalar_candidates(
     output_ranges: &[Range<usize>],
     include_outputs: bool,
     image_base: u64,
-) -> Result<Vec<u32>> {
+) -> Result<NestedScalarCandidates> {
     let mut values = Vec::new();
     let mut seen = HashSet::new();
-    if include_outputs {
-        let mut output_words = 0usize;
-        for range in output_ranges.iter().rev() {
-            let mut previous = None;
-            for bytes in staged_outer[range.clone()].chunks_exact(size_of::<u32>()) {
-                let value = u32::from_le_bytes(bytes.try_into().expect("dword chunk"));
-                push_nested_adjacent_scalar_variants(&mut values, &mut seen, &mut previous, value)?;
-                output_words += 1;
-                if output_words >= MAX_NESTED_CONTEXT_WORDS {
-                    break;
-                }
-            }
-            if output_words >= MAX_NESTED_CONTEXT_WORDS {
-                break;
-            }
-        }
-    }
 
+    let max_scalar_offset = output_ranges
+        .iter()
+        .map(Range::len)
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(size_of::<u32>());
     let mut scalar_offsets = Vec::new();
-    for bytes in std::iter::once(&staged_outer[stage_range.clone()]).chain(
-        include_outputs
-            .then_some(output_ranges.iter().rev())
-            .into_iter()
-            .flatten()
-            .map(|range| &staged_outer[range.clone()]),
-    ) {
+    for bytes in output_ranges
+        .iter()
+        .rev()
+        .map(|range| &staged_outer[range.clone()])
+        .chain(std::iter::once(&staged_outer[stage_range.clone()]))
+    {
         for encoded in bytes.windows(size_of::<u32>()) {
             let offset = u32::from_le_bytes(encoded.try_into().expect("dword window"));
             if offset == 0
-                || offset > 0x1_0000
+                || offset as usize > max_scalar_offset
                 || !offset.is_multiple_of(size_of::<u32>() as u32)
                 || scalar_offsets.contains(&offset)
             {
@@ -645,6 +688,12 @@ fn nested_scalar_candidates(
                 let Some(target_offset) = context.start.checked_add(offset as usize) else {
                     continue;
                 };
+                if target_offset
+                    .checked_add(size_of::<u32>())
+                    .is_none_or(|end| end > context.end)
+                {
+                    continue;
+                }
                 let Some(value) = read_u32_at(staged_outer, target_offset) else {
                     continue;
                 };
@@ -699,17 +748,53 @@ fn nested_scalar_candidates(
             }
         }
     }
-    Ok(values)
+    // Exact offset and pointer relationships are stronger evidence than an arbitrary
+    // dword in prior output. Preserve the latter only as a compatibility fallback.
+    let direct_len = values.len();
+    if include_outputs {
+        let mut output_words = 0usize;
+        for range in output_ranges.iter().rev() {
+            let mut previous = None;
+            for bytes in staged_outer[range.clone()].chunks_exact(size_of::<u32>()) {
+                let value = u32::from_le_bytes(bytes.try_into().expect("dword chunk"));
+                push_nested_adjacent_scalar_variants(&mut values, &mut seen, &mut previous, value)?;
+                output_words += 1;
+                if output_words >= MAX_NESTED_CONTEXT_WORDS {
+                    break;
+                }
+            }
+            if output_words >= MAX_NESTED_CONTEXT_WORDS {
+                break;
+            }
+        }
+    }
+    Ok(NestedScalarCandidates { values, direct_len })
 }
 
-pub(crate) fn nested_apply_dword_transform(payload: &mut [u8], mut key: u32, shift: u32) {
-    for (index, bytes) in payload.chunks_exact_mut(size_of::<u32>()).enumerate() {
+pub(crate) fn nested_transform_dwords_into(
+    source: &[u8],
+    destination: &mut [u8],
+    mut key: u32,
+    shift: u32,
+) {
+    assert_eq!(
+        source.len(),
+        destination.len(),
+        "nested dword transform buffers differ in length"
+    );
+    let transformed_len = source.len() - source.len() % size_of::<u32>();
+    for (index, (source, destination)) in source[..transformed_len]
+        .chunks_exact(size_of::<u32>())
+        .zip(destination[..transformed_len].chunks_exact_mut(size_of::<u32>()))
+        .enumerate()
+    {
         let index = index as u32;
-        let ciphertext = u32::from_le_bytes(bytes.try_into().expect("dword chunk"));
+        let ciphertext = u32::from_le_bytes(source.try_into().expect("dword chunk"));
         let plaintext = (ciphertext ^ key).rotate_right(shift).wrapping_sub(index);
-        bytes.copy_from_slice(&plaintext.to_le_bytes());
+        destination.copy_from_slice(&plaintext.to_le_bytes());
         key = key.wrapping_add(index);
     }
+    destination[transformed_len..].copy_from_slice(&source[transformed_len..]);
 }
 
 fn collect_nested_maps_from_graph(
@@ -749,7 +834,7 @@ fn collect_nested_maps_from_graph(
             } else {
                 std::slice::from_ref(&output_ranges[output_ranges.len() - output_pass])
             };
-            let scalars = nested_scalar_candidates(
+            let scalar_candidates = nested_scalar_candidates(
                 &staged_outer,
                 bootstrap,
                 stage_range.clone(),
@@ -761,20 +846,32 @@ fn collect_nested_maps_from_graph(
             let mut keys = Vec::new();
             let key_capacity = checksum_bases
                 .len()
-                .saturating_mul(scalars.len())
+                .saturating_mul(scalar_candidates.values.len())
                 .min(MAX_NESTED_KEY_CANDIDATES);
             let mut key_set = HashSet::with_capacity(key_capacity);
-            for &base in &checksum_bases {
-                for &scalar in &scalars {
-                    let key = base ^ scalar;
-                    if !key_set.insert(key) {
-                        continue;
+            let mut direct_key_count = 0;
+            for (phase, scalars) in [
+                &scalar_candidates.values[..scalar_candidates.direct_len],
+                &scalar_candidates.values[scalar_candidates.direct_len..],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for &scalar in scalars {
+                    for &base in &checksum_bases {
+                        let key = base ^ scalar;
+                        if !key_set.insert(key) {
+                            continue;
+                        }
+                        ensure!(
+                            keys.len() < MAX_NESTED_KEY_CANDIDATES,
+                            "nested stage produced too many key candidates"
+                        );
+                        keys.push(key);
                     }
-                    ensure!(
-                        keys.len() < MAX_NESTED_KEY_CANDIDATES,
-                        "nested stage produced too many key candidates"
-                    );
-                    keys.push(key);
+                }
+                if phase == 0 {
+                    direct_key_count = keys.len();
                 }
             }
             let ordered_records = records.iter().collect::<Vec<_>>();
@@ -782,9 +879,18 @@ fn collect_nested_maps_from_graph(
                 if processed.contains(&record.descriptor_offset) {
                     continue;
                 }
-                let Some((output, selected_key)) =
-                    replayer.replay(&staged_outer, bootstrap, record, &keys, maps)?
-                else {
+                // A unique output from reference-rooted scalars needs no speculative
+                // raw-word search. Broaden only when the direct tier proves nothing.
+                let replayed = replay_nested_key_tiers(
+                    replayer,
+                    &staged_outer,
+                    bootstrap,
+                    record,
+                    &keys,
+                    direct_key_count,
+                    maps,
+                )?;
+                let NestedReplay::Unique(output, selected_key) = replayed else {
                     continue;
                 };
                 let destination = nested_outer_range(

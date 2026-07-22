@@ -1,3 +1,4 @@
+use std::mem::size_of;
 use std::ops::Range;
 
 use crate::report::{ByteTransform, CandidateRejection, DecryptionDetails};
@@ -6,17 +7,19 @@ use anyhow::{Context, Result, ensure};
 use crate::pe::{Machine, Pe};
 use crate::unpack::bootstrap::{PackedBootstrap, bootstrap_source_file_range, derive_outer_source};
 use crate::unpack::nested::{
-    MAX_NESTED_REPLAY_OUTPUTS, NestedRecord, NestedRecordReplayer, discover_nested_byte_maps,
-    lfsr_al_maps, nested_apply_dword_transform, nested_outer_range,
+    MAX_NESTED_REPLAY_OUTPUTS, NestedRecord, NestedRecordReplayer, NestedReplay,
+    discover_nested_byte_maps, lfsr_al_maps, nested_outer_range, nested_transform_dwords_into,
 };
 
 use super::aes::AES_256_KEY_SIZE;
-use super::decoder::CustomDecodeError;
+use super::decoder::{
+    CustomDecodeError, CustomDecoderSource, decode_custom_stream_with_history_source_mode,
+};
 use super::merged_a_record_destination_ranges;
 use super::{
     ARecord, AesContextMatch, DecoderCandidate, DecryptedImage,
-    aes256_cbc_decrypt_full_blocks_in_place, decode_custom_stream_with_history,
-    decode_custom_stream_with_history_mode, discover_a_record_run, discover_decoder_candidates,
+    aes256_cbc_decrypt_full_blocks_in_place, custom_decoder_prefix_is_viable,
+    decode_custom_stream_with_history, discover_a_record_run, discover_decoder_candidates,
     ensure_source_excludes_security, scan_aes_contexts_in_range,
 };
 
@@ -205,6 +208,95 @@ pub(super) fn f8_transform(bytes: &mut [u8]) {
     }
 }
 
+pub(super) struct NestedTransformedSource<'a> {
+    source: &'a [u8],
+    initial_key: u32,
+    byte_map: Option<&'a [u8; 256]>,
+    cached_indices: [usize; 2],
+    cached_dwords: [u32; 2],
+}
+
+impl<'a> NestedTransformedSource<'a> {
+    pub(super) fn new(source: &'a [u8], initial_key: u32, byte_map: Option<&'a [u8; 256]>) -> Self {
+        Self {
+            source,
+            initial_key,
+            byte_map,
+            cached_indices: [usize::MAX; 2],
+            cached_dwords: [0; 2],
+        }
+    }
+
+    #[inline]
+    fn transformed_dword(&mut self, dword_index: usize) -> u32 {
+        let slot = dword_index & 1;
+        if self.cached_indices[slot] != dword_index {
+            let offset = dword_index * size_of::<u32>();
+            let ciphertext = u32::from_le_bytes(
+                self.source[offset..offset + size_of::<u32>()]
+                    .try_into()
+                    .expect("bounded nested source dword"),
+            );
+            let index = u64::try_from(dword_index).expect("nested dword index fits u64");
+            let key_delta = index * index.saturating_sub(1) / 2;
+            let round_key = self.initial_key.wrapping_add(key_delta as u32);
+            self.cached_dwords[slot] = (ciphertext ^ round_key)
+                .rotate_right(19)
+                .wrapping_sub(index as u32);
+            self.cached_indices[slot] = dword_index;
+        }
+        self.cached_dwords[slot]
+    }
+}
+
+impl CustomDecoderSource for NestedTransformedSource<'_> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.source.len()
+    }
+
+    #[inline]
+    fn byte(&mut self, index: usize) -> u8 {
+        let transformed_len = self.source.len() - self.source.len() % size_of::<u32>();
+        let value = if index < transformed_len {
+            let dword = self.transformed_dword(index / size_of::<u32>());
+            (dword >> ((index % size_of::<u32>()) * 8)) as u8
+        } else {
+            self.source[index]
+        };
+        self.byte_map
+            .map_or(value, |byte_map| byte_map[usize::from(value)])
+    }
+}
+
+#[inline]
+fn nested_decoder_prefix_is_viable(
+    decoder: &DecoderCandidate,
+    transformed_prefix: &[u8],
+    byte_map: Option<&[u8; 256]>,
+    source_len: usize,
+    history_len: usize,
+    destination_len: usize,
+) -> bool {
+    let mut mapped = [0u8; 4];
+    let prefix = if let Some(byte_map) = byte_map {
+        for (destination, &source) in mapped.iter_mut().zip(transformed_prefix) {
+            *destination = byte_map[usize::from(source)];
+        }
+        &mapped[..transformed_prefix.len()]
+    } else {
+        transformed_prefix
+    };
+    custom_decoder_prefix_is_viable(
+        &decoder.table,
+        prefix,
+        source_len,
+        history_len,
+        destination_len,
+        false,
+    )
+}
+
 fn replay_nested_record(
     contexts: &[AesContextMatch],
     staged_outer: &[u8],
@@ -213,7 +305,7 @@ fn replay_nested_record(
     keys: &[u32],
     decoders: &[DecoderCandidate],
     byte_maps: &[(usize, Box<[u8; 256]>)],
-) -> Result<Option<(Vec<u8>, u32)>> {
+) -> Result<NestedReplay> {
     let source_range = nested_outer_range(
         bootstrap,
         staged_outer.len(),
@@ -235,58 +327,134 @@ fn replay_nested_record(
     let mut outputs = Vec::<(Vec<u8>, u32)>::new();
     let mut structured_outputs = Vec::<(Vec<u8>, u32)>::new();
     let mut unstructured_overflow = false;
-    let mut consider_output = |output: Vec<u8>, key: u32| -> Result<()> {
-        if !lfsr_al_maps(&output).is_empty() {
+    let mut consider_output = |output: &[u8], key: u32| -> Result<()> {
+        if !lfsr_al_maps(output).is_empty() {
             if !structured_outputs
                 .iter()
-                .any(|(existing, _)| existing == &output)
+                .any(|(existing, _)| existing.as_slice() == output)
             {
                 ensure!(
                     structured_outputs.len() < MAX_NESTED_REPLAY_OUTPUTS,
                     "nested record replay produced too many structured outputs"
                 );
-                structured_outputs.push((output, key));
+                structured_outputs.push((output.to_vec(), key));
             }
-        } else if !outputs.iter().any(|(existing, _)| existing == &output) {
+        } else if !outputs
+            .iter()
+            .any(|(existing, _)| existing.as_slice() == output)
+        {
             if outputs.len() < MAX_NESTED_REPLAY_OUTPUTS {
-                outputs.push((output, key));
+                outputs.push((output.to_vec(), key));
             } else {
                 unstructured_overflow = true;
             }
         }
         Ok(())
     };
+
+    // Record geometry fixes every trial-buffer size. Allocate once, then overwrite
+    // in place across contexts, keys, maps, and decoders. Custom-coded candidates
+    // transform source dwords lazily as the decoder consumes them.
+    let source = &staged_outer[source_range.clone()];
+    let direct_record = record.encoded_length == record.destination_length;
+    let mut aes_plaintext = vec![0u8; source.len()];
+    let mut transformed = if direct_record {
+        vec![0u8; source.len()]
+    } else {
+        Vec::new()
+    };
+    let mut mapped_payload = if direct_record {
+        vec![0u8; source.len()]
+    } else {
+        Vec::new()
+    };
+    let mut output = vec![0u8; destination_range.len()];
+    let prefix_len = source.len().min(4);
+    let mut transformed_prefix = [0u8; 4];
     for context in contexts {
-        let mut aes_plaintext = staged_outer[source_range.clone()].to_vec();
+        aes_plaintext.copy_from_slice(source);
         aes256_cbc_decrypt_full_blocks_in_place(&mut aes_plaintext, &context.raw_key);
         for &key in keys {
-            for shift in [19] {
-                let mut transformed = aes_plaintext.clone();
-                nested_apply_dword_transform(&mut transformed, key, shift);
-                for map in std::iter::once(None).chain(byte_maps.iter().map(|(_, map)| Some(map))) {
-                    let mut payload = transformed.clone();
-                    if let Some(map) = map {
-                        for byte in &mut payload {
-                            *byte = map[usize::from(*byte)];
+            if direct_record {
+                nested_transform_dwords_into(&aes_plaintext, &mut transformed, key, 19);
+                for byte_map in
+                    std::iter::once(None).chain(byte_maps.iter().map(|(_, map)| Some(map.as_ref())))
+                {
+                    let payload = if let Some(byte_map) = byte_map {
+                        for (destination, &source) in mapped_payload.iter_mut().zip(&transformed) {
+                            *destination = byte_map[usize::from(source)];
                         }
-                    }
-                    if record.encoded_length == record.destination_length {
-                        consider_output(payload, key)?;
+                        mapped_payload.as_slice()
+                    } else {
+                        transformed.as_slice()
+                    };
+                    consider_output(payload, key)?;
+                }
+                continue;
+            }
+
+            nested_transform_dwords_into(
+                &aes_plaintext[..prefix_len],
+                &mut transformed_prefix[..prefix_len],
+                key,
+                19,
+            );
+            if !std::iter::once(None)
+                .chain(byte_maps.iter().map(|(_, map)| Some(map.as_ref())))
+                .any(|byte_map| {
+                    decoders.iter().any(|decoder| {
+                        nested_decoder_prefix_is_viable(
+                            decoder,
+                            &transformed_prefix[..prefix_len],
+                            byte_map,
+                            source.len(),
+                            history.len(),
+                            destination_range.len(),
+                        )
+                    })
+                })
+            {
+                continue;
+            }
+            for byte_map in
+                std::iter::once(None).chain(byte_maps.iter().map(|(_, map)| Some(map.as_ref())))
+            {
+                if !decoders.iter().any(|decoder| {
+                    nested_decoder_prefix_is_viable(
+                        decoder,
+                        &transformed_prefix[..prefix_len],
+                        byte_map,
+                        source.len(),
+                        history.len(),
+                        destination_range.len(),
+                    )
+                }) {
+                    continue;
+                }
+                for decoder in decoders {
+                    if !nested_decoder_prefix_is_viable(
+                        decoder,
+                        &transformed_prefix[..prefix_len],
+                        byte_map,
+                        source.len(),
+                        history.len(),
+                        destination_range.len(),
+                    ) {
                         continue;
                     }
-                    for decoder in decoders {
-                        let mut output = vec![0u8; destination_range.len()];
-                        if decode_custom_stream_with_history_mode(
-                            &decoder.table,
-                            &payload,
-                            history,
-                            &mut output,
-                            false,
-                        )
-                        .is_ok()
-                        {
-                            consider_output(output, key)?;
-                        }
+                    let mut payload = NestedTransformedSource::new(&aes_plaintext, key, byte_map);
+                    // The decoder reads only history and bytes below its current write cursor,
+                    // so failed attempts do not require clearing the reusable destination.
+                    if decode_custom_stream_with_history_source_mode(
+                        &decoder.table,
+                        &mut payload,
+                        history,
+                        &mut output,
+                        false,
+                    )
+                    .is_ok()
+                    {
+                        consider_output(&output, key)?;
                     }
                 }
             }
@@ -306,11 +474,15 @@ fn replay_nested_record(
         );
     }
     if structured_outputs.len() == 1 {
-        Ok(structured_outputs.pop())
-    } else if structured_outputs.is_empty() && !unstructured_overflow && outputs.len() == 1 {
-        Ok(outputs.pop())
+        let (output, key) = structured_outputs.pop().expect("one structured output");
+        Ok(NestedReplay::Unique(output, key))
+    } else if structured_outputs.len() > 1 || unstructured_overflow || outputs.len() > 1 {
+        Ok(NestedReplay::Ambiguous)
+    } else if outputs.len() == 1 {
+        let (output, key) = outputs.pop().expect("one unstructured output");
+        Ok(NestedReplay::Unique(output, key))
     } else {
-        Ok(None)
+        Ok(NestedReplay::NoMatch)
     }
 }
 
@@ -334,7 +506,7 @@ impl NestedRecordReplayer for DecryptionNestedReplayer<'_> {
         record: &NestedRecord,
         keys: &[u32],
         byte_maps: &[(usize, Box<[u8; 256]>)],
-    ) -> Result<Option<(Vec<u8>, u32)>> {
+    ) -> Result<NestedReplay> {
         replay_nested_record(
             &self.contexts,
             staged_outer,

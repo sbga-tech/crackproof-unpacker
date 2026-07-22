@@ -577,14 +577,17 @@ pub(crate) fn amd64_crt_startup_evidence(mapped: &[u8], startup_rva: u32) -> Res
 fn amd64_veneer_starts(mapped: &[u8], executable_ranges: &[Range<u32>]) -> Result<Vec<u32>> {
     let mut starts = Vec::new();
     for range in executable_ranges {
-        let Some(last_rva) = range.end.checked_sub(SEMANTIC_VENEER_LEN as u32) else {
-            continue;
-        };
-        if last_rva < range.start {
-            continue;
-        }
-
-        for entry_rva in range.start..=last_rva {
+        let length = usize::try_from(range.end - range.start)
+            .context("AMD64 executable range length does not fit usize")?;
+        let bytes = mapped_bytes(mapped, range.start, length)?;
+        for (offset, window) in bytes.windows(SEMANTIC_VENEER_LEN).enumerate() {
+            if window[0] != 0xe8 || window[DIRECT_REL32_LEN] != 0xe9 {
+                continue;
+            }
+            let entry_rva = range
+                .start
+                .checked_add(u32::try_from(offset).context("AMD64 veneer offset exceeds u32")?)
+                .context("AMD64 veneer RVA overflows")?;
             let Ok(Some(Amd64Instruction::CallRel32 { .. })) =
                 decode_amd64_instruction(mapped, entry_rva)
             else {
@@ -630,14 +633,19 @@ fn amd64_executable_jumps(
 
     let mut jump_count = 0usize;
     for range in executable_ranges {
-        let Some(last_rva) = range.end.checked_sub(DIRECT_REL32_LEN as u32) else {
-            continue;
-        };
-        if last_rva < range.start {
-            continue;
-        }
-
-        for rva in range.start..=last_rva {
+        let length = usize::try_from(range.end - range.start)
+            .context("AMD64 executable range length does not fit usize")?;
+        let bytes = mapped_bytes(mapped, range.start, length)?;
+        for (offset, window) in bytes.windows(DIRECT_REL32_LEN).enumerate() {
+            if window[0] != 0xe9 {
+                continue;
+            }
+            let rva = range
+                .start
+                .checked_add(
+                    u32::try_from(offset).context("AMD64 executable jump offset exceeds u32")?,
+                )
+                .context("AMD64 executable jump RVA overflows")?;
             let Ok(Some(Amd64Instruction::JumpRel32 { target_rva })) =
                 decode_amd64_instruction(mapped, rva)
             else {
