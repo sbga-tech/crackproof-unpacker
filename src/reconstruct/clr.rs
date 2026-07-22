@@ -445,10 +445,9 @@ fn validate_coded(rows: &[u32; 64], coded: Coded, value: u32, required: bool) ->
 /// Parses the #US heap completely and returns every legal token offset.
 /// Offset zero is its sentinel, never a user-string record.
 fn validate_user_heap(metadata: &Metadata<'_>) -> Result<BTreeSet<usize>> {
-    ensure!(
-        metadata.heaps.user.start < metadata.heaps.user.end,
-        "empty #US heap"
-    );
+    if metadata.heaps.user.start == metadata.heaps.user.end {
+        return Ok(BTreeSet::new());
+    }
     ensure!(
         metadata.bytes[metadata.heaps.user.start] == 0,
         "#US heap lacks zero sentinel"
@@ -653,14 +652,14 @@ fn validate_code_tokens(
                 _ => {}
             }
         }
-        if let Some(ext) = extended {
-            if width == 4 {
-                let token = u32(code, at)?;
-                match ext {
-                    0x06 | 0x07 => validate_token(rows, token, &[6, 10, 43], false)?,
-                    0x15 | 0x16 | 0x1c => validate_token(rows, token, &[1, 2, 27], false)?,
-                    _ => {}
-                }
+        if let Some(ext) = extended
+            && width == 4
+        {
+            let token = u32(code, at)?;
+            match ext {
+                0x06 | 0x07 => validate_token(rows, token, &[6, 10, 43], false)?,
+                0x15 | 0x16 | 0x1c => validate_token(rows, token, &[1, 2, 27], false)?,
+                _ => {}
             }
         }
         at += width;
@@ -904,7 +903,17 @@ fn parse_streams(metadata: &[u8]) -> Result<(Heap, Heap, Heap, Heap, Heap)> {
             .context("metadata version overflow")?,
     )?;
     let count = usize::from(u16(metadata, root + 2)?);
-    ensure!((1..=16).contains(&count), "metadata stream count");
+    let minimum_header_bytes = count
+        .checked_mul(12)
+        .context("metadata stream-header count overflows")?;
+    ensure!(
+        count != 0
+            && root
+                .checked_add(4)
+                .and_then(|start| start.checked_add(minimum_header_bytes))
+                .is_some_and(|end| end <= metadata.len()),
+        "metadata stream count exceeds the bounded root"
+    );
     let mut cursor = root + 4;
     let mut tables = None;
     let mut strings = None;
@@ -931,8 +940,11 @@ fn parse_streams(metadata: &[u8]) -> Result<(Heap, Heap, Heap, Heap, Heap)> {
             .context("unterminated metadata stream name")?;
         let heap = Heap { start: offset, end };
         match bytes(metadata, name_start, name_end - name_start)? {
-            b"#~" => {
-                ensure!(tables.replace(heap).is_none(), "duplicate #~ stream");
+            b"#~" | b"#-" => {
+                ensure!(
+                    tables.replace(heap).is_none(),
+                    "duplicate metadata tables stream"
+                );
             }
             b"#Strings" => {
                 ensure!(strings.replace(heap).is_none(), "duplicate #Strings stream");
@@ -960,12 +972,13 @@ fn parse_streams(metadata: &[u8]) -> Result<(Heap, Heap, Heap, Heap, Heap)> {
         ranges.windows(2).all(|pair| pair[0].end <= pair[1].start),
         "metadata streams overlap"
     );
+    let empty = Heap { start: 0, end: 0 };
     Ok((
-        tables.context("missing #~")?,
-        strings.context("missing #Strings")?,
-        blob.context("missing #Blob")?,
-        guid.context("missing #GUID")?,
-        user.context("missing #US")?,
+        tables.context("missing #~ or #- metadata tables stream")?,
+        strings.unwrap_or(empty),
+        blob.unwrap_or(empty),
+        guid.unwrap_or(empty),
+        user.unwrap_or(empty),
     ))
 }
 
@@ -998,12 +1011,11 @@ pub(crate) fn authenticated_method_defs(
             .context("metadata valid mask")?,
     );
     ensure!(valid >> 45 == 0, "unsupported metadata table present");
-    ensure!(valid & (1u64 << 6) != 0, "MethodDef table absent");
     let mut rows = [0u32; 64];
     let mut cursor = tables.start + 24;
-    for table in 0..45 {
+    for (table, row_count) in rows.iter_mut().enumerate().take(45) {
         if valid & (1u64 << table) != 0 {
-            rows[table] = u32(data, cursor)?;
+            *row_count = u32(data, cursor)?;
             cursor += 4;
         }
     }
@@ -1069,7 +1081,10 @@ pub(crate) fn authenticated_method_defs(
         }
         cursor = table_end;
     }
-    ensure!(cursor == metadata_end, "trailing bytes in #~ stream");
+    ensure!(
+        data[cursor..metadata_end].iter().all(|byte| *byte == 0),
+        "nonzero trailing bytes in metadata tables stream"
+    );
     for (target, values) in lists {
         validate_list_starts(&values, rows[usize::from(target)])?;
     }
@@ -1077,23 +1092,30 @@ pub(crate) fn authenticated_method_defs(
         methods.len() == usize::try_from(rows[6])?,
         "MethodDef count mismatch"
     );
+    let metadata_end = metadata_rva
+        .checked_add(metadata_size)
+        .context("metadata RVA range overflows")?;
     let mut spans = Vec::<Range<usize>>::new();
     for rva in methods {
         if rva == 0 {
             continue;
         }
         let start = usize::try_from(rva)?;
-        ensure!(start < metadata_rva, "MethodDef RVA is not before metadata");
-        let start_rva = u32::try_from(rva)?;
+        let start_rva = rva;
         let end = method_body_checked(mapped, start, Some((&rows, &user_string_starts)))?;
-        ensure!(end <= metadata_rva, "MethodDef body overlaps metadata");
+        ensure!(
+            end <= metadata_rva || start >= metadata_end,
+            "MethodDef body overlaps CLR metadata"
+        );
         validate_method_body_section(pe, start_rva, end)?;
         spans.push(start..end);
     }
-    spans.sort_by_key(|span| span.start);
+    spans.sort_by_key(|span| (span.start, span.end));
     ensure!(
-        spans.windows(2).all(|pair| pair[0].end <= pair[1].start),
-        "MethodDef bodies overlap"
+        spans
+            .windows(2)
+            .all(|pair| pair[0] == pair[1] || pair[0].end <= pair[1].start),
+        "MethodDef bodies overlap without sharing an exact body"
     );
     Ok(())
 }
@@ -1143,6 +1165,23 @@ mod tests {
         assert!(compressed(&[0xe0], 0, 1).is_err());
         assert!(compressed(&[0x80], 0, 1).is_err());
         assert_eq!(compressed(&[0x7f], 0, 1).unwrap(), (127, 1));
+    }
+
+    #[test]
+    fn accepts_unoptimized_tables_without_optional_heaps_or_methods() {
+        let mut metadata = vec![0; 64];
+        metadata[..4].copy_from_slice(b"BSJB");
+        metadata[12..16].copy_from_slice(&4u32.to_le_bytes());
+        metadata[16..20].copy_from_slice(b"v1\0\0");
+        metadata[22..24].copy_from_slice(&1u16.to_le_bytes());
+        metadata[24..28].copy_from_slice(&40u32.to_le_bytes());
+        metadata[28..32].copy_from_slice(&24u32.to_le_bytes());
+        metadata[32..35].copy_from_slice(b"#-\0");
+        let mut image = vec![0; 0x2000];
+        image[0x1100..0x1140].copy_from_slice(&metadata);
+
+        authenticated_method_defs(&image, &method_test_pe(0x6000_0020), 0x1100, 64)
+            .expect("minimal unoptimized metadata");
     }
     #[test]
     fn accepts_complete_tiny_method_and_branch_boundary() {

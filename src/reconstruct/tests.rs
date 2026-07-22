@@ -668,6 +668,37 @@ fn unwind_info_validates_chain_handlers_and_slot_encoding() {
 }
 
 #[test]
+fn unwind_info_v2_validates_epilogues_and_spare_slots() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.sections[0].characteristics = 0xe000_0020;
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1100, 0x1200);
+    put_u32(&mut image, 0x1104, 0x1210);
+    put_u32(&mut image, 0x1108, 0x1300);
+    let directory = DataDirectory {
+        virtual_address: 0x1100,
+        size: 12,
+    };
+
+    image[0x1300..0x130a].copy_from_slice(&[2, 1, 3, 0, 2, 0x16, 0, 0x06, 1, 0x70]);
+    validate_retained_directory(&image, &pe, 3, directory)
+        .expect("valid UNWIND_INFO v2 terminal epilogue");
+
+    image[0x1300] = 1;
+    assert!(validate_retained_directory(&image, &pe, 3, directory).is_err());
+    image[0x1300] = 2;
+    image[0x1304] = 0;
+    assert!(validate_retained_directory(&image, &pe, 3, directory).is_err());
+
+    image[0x1300..0x130a].copy_from_slice(&[2, 1, 3, 0, 1, 0x07, 0, 0, 0, 0]);
+    validate_retained_directory(&image, &pe, 3, directory)
+        .expect("bounded UNWIND_INFO v2 UWOP_SPARE");
+    image[0x1302] = 2;
+    assert!(validate_retained_directory(&image, &pe, 3, directory).is_err());
+}
+
+#[test]
 fn delay_import_validates_paired_tables_and_terminators() {
     let pe = test_pe();
     let mut image = vec![0; 0x2000];

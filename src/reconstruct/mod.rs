@@ -1098,6 +1098,52 @@ fn validate_runtime_function(
     Ok((begin, end, contract))
 }
 
+fn validate_v2_epilogue_codes(codes: &[u8], function_size: u32) -> Result<usize> {
+    const UWOP_EPILOG: u8 = 6;
+    if codes.is_empty() || codes[1] & 0x0f != UWOP_EPILOG {
+        return Ok(0);
+    }
+    let epilogue_size = u32::from(codes[0]);
+    let first_info = codes[1] >> 4;
+    ensure!(
+        epilogue_size != 0 && epilogue_size <= function_size,
+        "UNWIND_INFO v2 has an invalid epilogue size"
+    );
+    ensure!(
+        first_info <= 1,
+        "UNWIND_INFO v2 first UWOP_EPILOG has reserved OpInfo bits"
+    );
+    let single_at_end = first_info == 1;
+    let code_slots = codes.len() / 2;
+    let mut slot = 1usize;
+    while slot < code_slots {
+        let code_offset = codes[slot * 2];
+        let operation = codes[slot * 2 + 1] & 0x0f;
+        let info = codes[slot * 2 + 1] >> 4;
+        if operation != UWOP_EPILOG {
+            break;
+        }
+        let end_offset = u32::from(code_offset) | (u32::from(info) << 8);
+        slot += 1;
+        if end_offset == 0 {
+            break;
+        }
+        ensure!(
+            !single_at_end,
+            "UNWIND_INFO v2 single terminal epilogue has an additional descriptor"
+        );
+        ensure!(
+            (epilogue_size..=function_size).contains(&end_offset),
+            "UNWIND_INFO v2 epilogue offset is outside the runtime function"
+        );
+    }
+    ensure!(
+        slot.is_multiple_of(2),
+        "UNWIND_INFO v2 epilogue descriptors lack an alignment record"
+    );
+    Ok(slot)
+}
+
 fn validate_unwind_info(
     mapped: &[u8],
     pe: &Pe,
@@ -1122,7 +1168,10 @@ fn validate_unwind_info(
     let code_slots = usize::from(header[2]);
     let frame_register = header[3] & 0x0f;
     let frame_offset = header[3] >> 4;
-    ensure!(version == 1, "unsupported UNWIND_INFO version {version}");
+    ensure!(
+        matches!(version, 1 | 2),
+        "unsupported UNWIND_INFO version {version}"
+    );
     ensure!(flags & !0x07 == 0, "reserved UNWIND_INFO flags are set");
     ensure!(
         flags & UNW_FLAG_CHAININFO == 0 || flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) == 0,
@@ -1153,7 +1202,11 @@ fn validate_unwind_info(
         rva_slice(mapped, pe, codes_rva, codes_len)
             .context("UNWIND_INFO code slots are not section-backed")?
     };
-    let mut slot = 0usize;
+    let mut slot = if version == 2 {
+        validate_v2_epilogue_codes(codes, function_size)?
+    } else {
+        0
+    };
     let mut previous_offset = None;
     let mut fixed_stack_allocation = 0u64;
     while slot < code_slots {
@@ -1228,6 +1281,12 @@ fn validate_unwind_info(
                     "UNWIND_INFO nonvolatile save is truncated"
                 );
                 slots
+            }
+            6 => bail!("UWOP_EPILOG is not a leading UNWIND_INFO v2 descriptor"),
+            7 => {
+                ensure!(version == 2, "UWOP_SPARE is only valid in UNWIND_INFO v2");
+                ensure!(slot + 3 <= code_slots, "UWOP_SPARE is truncated");
+                3
             }
             8 | 9 => {
                 ensure!(

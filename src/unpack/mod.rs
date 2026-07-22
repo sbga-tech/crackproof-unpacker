@@ -2,10 +2,7 @@ use anyhow::{Context, Result, ensure};
 
 use crate::pe::Pe;
 use crate::reconstruct::{self, ReconstructionInput};
-use crate::report::{
-    AnalysisReport, AnalysisStep, GeneratedSemanticClrContainer, ImportSource, ImportSummary,
-    ManagedSemanticClrSource, ProtectorInfo,
-};
+use crate::report::{AnalysisReport, AnalysisStep, ImportSource, ImportSummary, ProtectorInfo};
 use crate::unpack::profile::OutputEntry;
 
 mod bootstrap;
@@ -131,42 +128,28 @@ fn unpack_recording(packed: &[u8], report: &mut AnalysisReport) -> Result<Vec<u8
         module_count: discovery.modules.len(),
         function_count: discovery.function_count,
     });
-    let output = finish_stage(
-        report,
-        AnalysisStep::PeRebuild,
-        (|| {
-            if matches!(output_entry, OutputEntry::Managed { .. }) {
-                reconstruct::managed::rebuild_semantic_clr(&image, &decrypted_pe, &discovery)
-            } else {
-                reconstruct::rebuild(ReconstructionInput {
-                    mapped: image,
-                    decrypted_pe,
-                    output_entry,
-                    discovery,
-                })
-            }
-        })(),
-    )?;
-    if matches!(output_entry, OutputEntry::Managed { .. }) {
-        report.generated_semantic_clr_container = Some(GeneratedSemanticClrContainer {
-            generated_architecture: "PE32/I386",
-            entry_rva: 0x5abf80,
-            import_rva: 0x5abf00,
-            iat_rva: 0x2000,
-            reloc_rva: 0x5ae000,
-            cor20_rva: 0x2008,
-            cor20_size: 0x48,
-            metadata_rva: 0x259e0c,
-        });
-        report.managed_semantic_clr_source = Some(ManagedSemanticClrSource {
-            source_architecture: "PE32+/AMD64",
-            source_pe_entry_rva: 0x1b5c,
-            source_import_rva: 0x1b9c,
-            source_iat_rva: 0x1bc4,
-            source_cor20_rva: 0x2008,
-            source_metadata_rva: 0x259e0c,
-        });
-    }
+    let managed = matches!(output_entry, OutputEntry::Managed { .. });
+    let mut generated_semantic_clr_container = None;
+    let mut managed_semantic_clr_source = None;
+    let rebuilt = if managed {
+        reconstruct::managed::rebuild_semantic_clr(&image, &decrypted_pe, &discovery).map(
+            |rebuilt| {
+                generated_semantic_clr_container = Some(rebuilt.generated);
+                managed_semantic_clr_source = Some(rebuilt.source);
+                rebuilt.output
+            },
+        )
+    } else {
+        reconstruct::rebuild(ReconstructionInput {
+            mapped: image,
+            decrypted_pe,
+            output_entry,
+            discovery,
+        })
+    };
+    let output = finish_stage(report, AnalysisStep::PeRebuild, rebuilt)?;
+    report.generated_semantic_clr_container = generated_semantic_clr_container;
+    report.managed_semantic_clr_source = managed_semantic_clr_source;
     report.finish(output.len());
     Ok(output)
 }
