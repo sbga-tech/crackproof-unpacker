@@ -106,6 +106,31 @@ pub struct ImportSummary {
     pub function_count: usize,
 }
 
+/// Explicit label for generated semantic CLR output; never original-bootstrap provenance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GeneratedSemanticClrContainer {
+    pub generated_architecture: &'static str,
+    pub entry_rva: u32,
+    pub import_rva: u32,
+    pub iat_rva: u32,
+    pub reloc_rva: u32,
+    pub cor20_rva: u32,
+    pub cor20_size: u32,
+    pub metadata_rva: u32,
+}
+
+/// Authenticated attributes of the protected source map.  This deliberately
+/// remains separate from the generated PE32 container it produces.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedSemanticClrSource {
+    pub source_architecture: &'static str,
+    pub source_pe_entry_rva: u32,
+    pub source_import_rva: u32,
+    pub source_iat_rva: u32,
+    pub source_cor20_rva: u32,
+    pub source_metadata_rva: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AnalysisError {
     pub step: AnalysisStep,
@@ -122,6 +147,8 @@ pub struct AnalysisReport {
     pub decryption: Option<DecryptionDetails>,
     pub recovered_program: Option<RecoveredProgram>,
     pub imports: Option<ImportSummary>,
+    pub generated_semantic_clr_container: Option<GeneratedSemanticClrContainer>,
+    pub managed_semantic_clr_source: Option<ManagedSemanticClrSource>,
     pub rebuilt_file_size: Option<usize>,
     pub error: Option<AnalysisError>,
 }
@@ -136,6 +163,8 @@ impl Default for AnalysisReport {
             decryption: None,
             recovered_program: None,
             imports: None,
+            generated_semantic_clr_container: None,
+            managed_semantic_clr_source: None,
             rebuilt_file_size: None,
             error: None,
         }
@@ -240,6 +269,8 @@ mod tests {
                 module_count: 12,
                 function_count: 13,
             }),
+            generated_semantic_clr_container: None,
+            managed_semantic_clr_source: None,
             rebuilt_file_size: Some(14),
             error: Some(AnalysisError {
                 step: AnalysisStep::PayloadDecryption,
@@ -261,6 +292,8 @@ mod tests {
                 "decryption",
                 "recovered_program",
                 "imports",
+                "generated_semantic_clr_container",
+                "managed_semantic_clr_source",
                 "rebuilt_file_size",
                 "error",
             ],
@@ -339,5 +372,50 @@ mod tests {
         ] {
             assert_no_key(&json, old_key);
         }
+    }
+    #[test]
+    fn serializes_generated_container_separately_from_authenticated_source() {
+        let report = AnalysisReport {
+            generated_semantic_clr_container: Some(GeneratedSemanticClrContainer {
+                generated_architecture: "PE32/I386",
+                entry_rva: 0x5abf80,
+                import_rva: 0x5abf00,
+                iat_rva: 0x2000,
+                reloc_rva: 0x5ae000,
+                cor20_rva: 0x2008,
+                cor20_size: 0x48,
+                metadata_rva: 0x259e0c,
+            }),
+            managed_semantic_clr_source: Some(ManagedSemanticClrSource {
+                source_architecture: "PE32+/AMD64",
+                source_pe_entry_rva: 0x1b5c,
+                source_import_rva: 0x1b9c,
+                source_iat_rva: 0x1bc4,
+                source_cor20_rva: 0x2008,
+                source_metadata_rva: 0x259e0c,
+            }),
+            ..AnalysisReport::default()
+        };
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(
+            json["generated_semantic_clr_container"]["generated_architecture"],
+            "PE32/I386"
+        );
+        assert_eq!(
+            json["managed_semantic_clr_source"]["source_architecture"],
+            "PE32+/AMD64"
+        );
+        assert_eq!(
+            json["generated_semantic_clr_container"]["entry_rva"],
+            0x5abf80
+        );
+        assert_eq!(
+            json["managed_semantic_clr_source"]["source_pe_entry_rva"],
+            0x1b5c
+        );
+        assert_eq!(
+            json["managed_semantic_clr_source"]["source_iat_rva"],
+            0x1bc4
+        );
     }
 }

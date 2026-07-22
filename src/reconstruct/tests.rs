@@ -40,6 +40,10 @@ fn put_u32(image: &mut [u8], rva: usize, value: u32) {
     image[rva..rva + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn put_u64(image: &mut [u8], rva: usize, value: u64) {
+    image[rva..rva + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 fn standard_import(image: &mut [u8], start: usize, suffix: u8) {
     put_u32(image, start, (start + 0x40) as u32);
     put_u32(image, start + 12, (start + 0x60) as u32);
@@ -282,6 +286,482 @@ fn retained_directory_validators_reject_unsupported_and_malformed_metadata() {
 }
 
 #[test]
+fn exception_and_relocation_directories_require_valid_native_structure() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.sections[0].characteristics = 0xe000_0020;
+    let mut image = vec![0; 0x2000];
+    image[0x1300] = 1; // UNWIND_INFO version 1, no flags or unwind codes.
+    put_u32(&mut image, 0x1100, 0x1200);
+    put_u32(&mut image, 0x1104, 0x1204);
+    put_u32(&mut image, 0x1108, 0x1300);
+    validate_retained_directory(
+        &image,
+        &pe,
+        3,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 12,
+        },
+    )
+    .expect("valid AMD64 runtime function");
+    put_u32(&mut image, 0x1104, 0x1200);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1104, 0x1204);
+    put_u32(&mut image, 0x1400, 0x1000);
+    put_u32(&mut image, 0x1404, 12);
+    image[0x1408..0x140a].copy_from_slice(&0xa200u16.to_le_bytes());
+    image[0x140a..0x140c].copy_from_slice(&0u16.to_le_bytes());
+    validate_retained_directory(
+        &image,
+        &pe,
+        5,
+        DataDirectory {
+            virtual_address: 0x1400,
+            size: 12,
+        },
+    )
+    .expect("valid DIR64 relocation block");
+    put_u32(&mut image, 0x1400, 0x1001);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            5,
+            DataDirectory {
+                virtual_address: 0x1400,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1404, 10);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            5,
+            DataDirectory {
+                virtual_address: 0x1400,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn native_directory_alignment_and_unwind_contracts_fail_closed() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.sections[0].characteristics = 0xe000_0020;
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1100, 0x1200);
+    put_u32(&mut image, 0x1104, 0x1210);
+    put_u32(&mut image, 0x1108, 0x1300);
+    image[0x1300..0x1304].copy_from_slice(&[1, 6, 5, 5]);
+    image[0x1304..0x130e].copy_from_slice(&[
+        6, 0x30, // UWOP_PUSH_NONVOL RBX
+        5, 0x02, // UWOP_ALLOC_SMALL
+        4, 0x03, // UWOP_SET_FPREG
+        3, 0x68, // UWOP_SAVE_XMM128 XMM6
+        0, 0,
+    ]);
+    validate_retained_directory(
+        &image,
+        &pe,
+        3,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 12,
+        },
+    )
+    .expect("valid aligned nonvolatile UNWIND_INFO");
+    image[0x1304] = 0;
+    image[0x1306] = 0;
+    image[0x1308] = 0;
+    image[0x130a] = 0;
+    validate_retained_directory(
+        &image,
+        &pe,
+        3,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 12,
+        },
+    )
+    .expect("zero-offset unwind slots remain bounded and ordered");
+    image[0x1304..0x130c].copy_from_slice(&[6, 0x30, 5, 0x02, 4, 0x03, 3, 0x68]);
+
+    image[0x1305] = 0x40;
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    image[0x1305] = 0x30;
+    image[0x130b] = 0x08;
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    image[0x130b] = 0x68;
+    image[0x1309] = 0x13;
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    image[0x1309] = 0x03;
+    image[0x1301] = 2;
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    image[0x1301] = 6;
+    put_u32(&mut image, 0x1108, 0x1302);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1108, 0x1300);
+    put_u32(&mut image, 0x110c, 0x1100);
+    put_u32(&mut image, 0x1110, 0x1104);
+    put_u32(&mut image, 0x1114, 0x1300);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 24
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn relocation_blocks_require_dword_layout_and_owned_pages() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1400, 0x1000);
+    put_u32(&mut image, 0x1404, 12);
+    validate_base_relocation_directory(
+        &image,
+        &pe,
+        DataDirectory {
+            virtual_address: 0x1400,
+            size: 12,
+        },
+    )
+    .expect("valid DWORD-aligned relocation block");
+
+    put_u32(&mut image, 0x1404, 10);
+    assert!(
+        validate_base_relocation_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1400,
+                size: 10
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1404, 12);
+    assert!(
+        validate_base_relocation_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1402,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1400, 0x2000);
+    assert!(
+        validate_base_relocation_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1400,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn unwind_info_validates_chain_handlers_and_slot_encoding() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.sections[0].characteristics = 0xe000_0020;
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1100, 0x1200);
+    put_u32(&mut image, 0x1104, 0x1210);
+    put_u32(&mut image, 0x1108, 0x1300);
+    image[0x1300] = 0x21; // Version 1 with CHAININFO.
+    put_u32(&mut image, 0x1304, 0x1220);
+    put_u32(&mut image, 0x1308, 0x1230);
+    put_u32(&mut image, 0x130c, 0x1320);
+    image[0x1320] = 1;
+    validate_retained_directory(
+        &image,
+        &pe,
+        3,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 12,
+        },
+    )
+    .expect("valid chained UNWIND_INFO");
+
+    image[0x1300..0x1314].fill(0);
+    image[0x1300..0x1306].copy_from_slice(&[0x21, 8, 1, 0, 8, 0x02]);
+    put_u32(&mut image, 0x1308, 0x1220);
+    put_u32(&mut image, 0x130c, 0x1230);
+    put_u32(&mut image, 0x1310, 0x1320);
+    image[0x1320..0x1326].copy_from_slice(&[1, 8, 1, 0, 8, 0x12]);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    image[0x1300..0x1314].fill(0);
+    image[0x1300] = 0x21;
+    put_u32(&mut image, 0x1304, 0x1220);
+    put_u32(&mut image, 0x1308, 0x1230);
+    put_u32(&mut image, 0x130c, 0x1320);
+    image[0x1320..0x1326].fill(0);
+    image[0x1320] = 1;
+
+    put_u32(&mut image, 0x130c, 0x1300);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x130c, 0x1320);
+    image[0x1300] = 0x09; // Version 1 with EHANDLER.
+    put_u32(&mut image, 0x1304, 0x1200);
+    validate_retained_directory(
+        &image,
+        &pe,
+        3,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 12,
+        },
+    )
+    .expect("valid exception-handler UNWIND_INFO");
+    put_u32(&mut image, 0x1304, 0);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1304, 0x1200);
+    image[0x1300] = 0x81; // Version 1 with a reserved flag bit.
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+
+    image[0x1300..0x1304].copy_from_slice(&[1, 1, 1, 0]);
+    image[0x1304..0x1306].copy_from_slice(&[1, 0x0b]);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn delay_import_validates_paired_tables_and_terminators() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1100, 1);
+    put_u32(&mut image, 0x1104, 0x1200);
+    put_u32(&mut image, 0x1108, 0x1240);
+    put_u32(&mut image, 0x110c, 0x1250);
+    put_u32(&mut image, 0x1110, 0x1260);
+    put_u32(&mut image, 0x1114, 0x1270);
+    put_u32(&mut image, 0x1118, 0x1280);
+    image[0x1200..0x120a].copy_from_slice(b"delay.dll\0");
+    put_u32(&mut image, 0x1250, 0x1300);
+    put_u32(&mut image, 0x1260, 0x1300);
+    put_u32(&mut image, 0x1270, 0x7654_3210);
+    put_u32(&mut image, 0x1280, 0x1300);
+    image[0x1302..0x1307].copy_from_slice(b"Func\0");
+    validate_retained_directory(
+        &image,
+        &pe,
+        13,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 64,
+        },
+    )
+    .expect("valid delay-import descriptor");
+
+    put_u32(&mut image, 0x1274, 1);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            13,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 64
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1274, 0);
+
+    put_u32(&mut image, 0x1264, 0x1300);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            13,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 64
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1264, 0);
+    put_u32(&mut image, 0x1100, 2);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            13,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 64
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn delay_import_honors_va_descriptor_and_thunk_semantics() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1104, 0x401200);
+    put_u32(&mut image, 0x1108, 0x401240);
+    put_u32(&mut image, 0x110c, 0x401250);
+    put_u32(&mut image, 0x1110, 0x401260);
+    image[0x1200..0x120a].copy_from_slice(b"delay.dll\0");
+    put_u32(&mut image, 0x1250, 0x401300);
+    put_u32(&mut image, 0x1260, 0x401300);
+    image[0x1302..0x1307].copy_from_slice(b"Func\0");
+    validate_retained_directory(
+        &image,
+        &pe,
+        13,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 64,
+        },
+    )
+    .expect("valid VA-mode delay-import descriptor");
+}
+#[test]
 fn export_forwarder_after_initial_closure_extends_directory_size() {
     let pe = test_pe();
     let mut image = vec![0; 0x2000];
@@ -322,6 +802,66 @@ fn tls_callback_array_must_terminate() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn tls_raw_data_requires_both_endpoints() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1100, 0x401100);
+    assert!(
+        validate_tls_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 24
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn tls_validates_characteristics_and_pe32_plus_index_width() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1114, 1);
+    assert!(
+        validate_tls_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 24
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1114, 0x0010_0000);
+    validate_tls_directory(
+        &image,
+        &pe,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 24,
+        },
+    )
+    .expect("TLS alignment characteristics are legal");
+
+    let mut pe64 = test_pe();
+    pe64.machine = Machine::Amd64;
+    let mut image64 = vec![0; 0x2000];
+    put_u64(&mut image64, 0x1110, 0x401ffc);
+    validate_tls_directory(
+        &image64,
+        &pe64,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 40,
+        },
+    )
+    .expect("PE32+ TLS index needs only its writable DWORD");
 }
 
 #[test]

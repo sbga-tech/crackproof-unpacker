@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::pe::{self, DataDirectory, Pe, PointerWidth};
 use crate::unpack::imports::{ImportModule, ImportSymbol, LoaderDiscovery, named_thunk_rva};
 use crate::unpack::profile::OutputEntry;
+pub(crate) mod managed;
 
 const EXPORT_DIRECTORY: usize = 0;
 const IMPORT_DIRECTORY: usize = 1;
@@ -13,6 +14,7 @@ const SECURITY_DIRECTORY: usize = 4;
 const IMAGE_IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const IMAGE_EXPORT_DIRECTORY_SIZE: usize = 40;
 const IAT_DIRECTORY: usize = 12;
+mod clr;
 #[cfg(test)]
 mod tests;
 const MAX_IMPORT_MODULES: usize = 4_096;
@@ -324,9 +326,10 @@ fn validate_loader_graph(pe: &Pe, discovery: &LoaderDiscovery) -> Result<()> {
     let mut ranges = Vec::with_capacity(graph.modules.len());
     for module in &graph.modules {
         let span = iat_module_span(pe, module)?;
+        let alignment = u32::try_from(pe.pointer_width().bytes())?;
         ensure!(
-            module.destination_rva.is_multiple_of(4),
-            "IAT is not DWORD aligned"
+            module.destination_rva.is_multiple_of(alignment),
+            "IAT is not pointer-width aligned"
         );
         ensure!(span.end <= pe.size_of_image, "IAT exceeds mapped image");
         pe.section_for_rva_range(span.start, usize::try_from(span.end - span.start)?)
@@ -988,11 +991,603 @@ fn validate_retained_directory(
     )
     .context("retained directory is not section-backed")?;
     match index {
+        3 => validate_exception_directory(mapped, pe, directory),
+        5 => validate_base_relocation_directory(mapped, pe, directory),
+        13 => validate_delay_import_directory(mapped, pe, directory),
         6 => validate_debug_directory(mapped, pe, directory),
         9 => validate_tls_directory(mapped, pe, directory),
         14 => validate_clr_directory(mapped, pe, directory),
         _ => bail!("nonempty unsupported data directory {index}"),
     }
+}
+
+const MAX_UNWIND_CHAIN_DEPTH: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UnwindContract {
+    frame_register: u8,
+    frame_offset: u8,
+    fixed_stack_allocation: u64,
+}
+
+fn nonvolatile_gpr(register: u8) -> bool {
+    matches!(register, 3 | 5 | 6 | 7 | 12..=15)
+}
+
+fn saved_gpr(register: u8) -> bool {
+    register != 4
+}
+
+fn valid_frame_gpr(register: u8) -> bool {
+    nonvolatile_gpr(register) || matches!(register, 10 | 11)
+}
+
+fn validate_exception_directory(mapped: &[u8], pe: &Pe, directory: DataDirectory) -> Result<()> {
+    ensure!(
+        pe.pointer_width() == PointerWidth::U64,
+        "exception directory is only retained for PE32+"
+    );
+    ensure!(
+        directory.virtual_address.is_multiple_of(4),
+        "exception directory is not DWORD-aligned"
+    );
+    ensure!(
+        directory.size.is_multiple_of(12),
+        "exception directory has partial runtime-function entry"
+    );
+    let mut previous_begin = None;
+    for offset in (0..directory.size).step_by(12) {
+        let record = directory
+            .virtual_address
+            .checked_add(offset)
+            .context("runtime-function RVA overflow")?;
+        let (begin, _, _) = validate_runtime_function(mapped, pe, record, &mut BTreeSet::new(), 0)?;
+        ensure!(
+            previous_begin.is_none_or(|previous| begin > previous),
+            "runtime-function entries are not strictly sorted"
+        );
+        previous_begin = Some(begin);
+    }
+    Ok(())
+}
+
+fn validate_runtime_function(
+    mapped: &[u8],
+    pe: &Pe,
+    record_rva: u32,
+    unwind_path: &mut BTreeSet<u32>,
+    depth: usize,
+) -> Result<(u32, u32, UnwindContract)> {
+    ensure!(
+        depth < MAX_UNWIND_CHAIN_DEPTH,
+        "runtime-function chain exceeds {MAX_UNWIND_CHAIN_DEPTH} records"
+    );
+    ensure!(
+        record_rva.is_multiple_of(4),
+        "runtime-function record is not DWORD-aligned"
+    );
+    let bytes = rva_slice(mapped, pe, record_rva, 12)
+        .context("runtime-function record is not section-backed")?;
+    let begin = u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes"));
+    let end = u32::from_le_bytes(bytes[4..8].try_into().expect("four bytes"));
+    let unwind = u32::from_le_bytes(bytes[8..12].try_into().expect("four bytes"));
+    ensure!(
+        begin < end && end <= pe.size_of_image,
+        "runtime-function bounds are invalid"
+    );
+    let code = pe.section_for_rva_range(begin, usize::try_from(end - begin)?)?;
+    ensure!(
+        code.characteristics & 0x2000_0000 != 0,
+        "runtime-function code range is not executable"
+    );
+    ensure!(
+        unwind_path.insert(unwind),
+        "runtime-function chain contains an UNWIND_INFO cycle"
+    );
+    let result = validate_unwind_info(mapped, pe, unwind, end - begin, unwind_path, depth);
+    unwind_path.remove(&unwind);
+    let contract = result?;
+    Ok((begin, end, contract))
+}
+
+fn validate_unwind_info(
+    mapped: &[u8],
+    pe: &Pe,
+    unwind_rva: u32,
+    function_size: u32,
+    unwind_path: &mut BTreeSet<u32>,
+    depth: usize,
+) -> Result<UnwindContract> {
+    const UNW_FLAG_EHANDLER: u8 = 1;
+    const UNW_FLAG_UHANDLER: u8 = 2;
+    const UNW_FLAG_CHAININFO: u8 = 4;
+
+    ensure!(
+        unwind_rva.is_multiple_of(4),
+        "UNWIND_INFO is not DWORD-aligned"
+    );
+    let header =
+        rva_slice(mapped, pe, unwind_rva, 4).context("UNWIND_INFO header is not section-backed")?;
+    let version = header[0] & 7;
+    let flags = header[0] >> 3;
+    let prolog_size = header[1];
+    let code_slots = usize::from(header[2]);
+    let frame_register = header[3] & 0x0f;
+    let frame_offset = header[3] >> 4;
+    ensure!(version == 1, "unsupported UNWIND_INFO version {version}");
+    ensure!(flags & !0x07 == 0, "reserved UNWIND_INFO flags are set");
+    ensure!(
+        flags & UNW_FLAG_CHAININFO == 0 || flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) == 0,
+        "UNWIND_INFO CHAININFO conflicts with a handler"
+    );
+    ensure!(
+        u32::from(prolog_size) <= function_size,
+        "UNWIND_INFO prolog exceeds its runtime-function span"
+    );
+    ensure!(
+        frame_register == 0 || valid_frame_gpr(frame_register),
+        "UNWIND_INFO at {unwind_rva:#x} frame register {frame_register} is invalid"
+    );
+    ensure!(
+        frame_register != 0 || frame_offset == 0,
+        "UNWIND_INFO has a frame offset without a frame register"
+    );
+
+    let codes_rva = unwind_rva
+        .checked_add(4)
+        .context("UNWIND_INFO code RVA overflows")?;
+    let codes_len = code_slots
+        .checked_mul(2)
+        .context("UNWIND_INFO code length overflows")?;
+    let codes = if code_slots == 0 {
+        &[]
+    } else {
+        rva_slice(mapped, pe, codes_rva, codes_len)
+            .context("UNWIND_INFO code slots are not section-backed")?
+    };
+    let mut slot = 0usize;
+    let mut previous_offset = None;
+    let mut fixed_stack_allocation = 0u64;
+    while slot < code_slots {
+        let code_offset = codes[slot * 2];
+        let operation = codes[slot * 2 + 1] & 0x0f;
+        let info = codes[slot * 2 + 1] >> 4;
+        ensure!(
+            code_offset <= prolog_size
+                && previous_offset.is_none_or(|previous| code_offset <= previous),
+            "UNWIND_INFO at {unwind_rva:#x} slot {slot} operation {operation} has code offset {code_offset} outside or out of order in prolog {prolog_size} after {previous_offset:?}"
+        );
+        previous_offset = Some(code_offset);
+        let slots = match operation {
+            0 => {
+                ensure!(
+                    saved_gpr(info),
+                    "UNWIND_INFO at {unwind_rva:#x} slot {slot} UWOP_PUSH_NONVOL register {info} is invalid"
+                );
+                1
+            }
+            1 => match info {
+                0 => {
+                    ensure!(slot + 2 <= code_slots, "UWOP_ALLOC_LARGE is truncated");
+                    let units = u16::from_le_bytes(
+                        codes[slot * 2 + 2..slot * 2 + 4]
+                            .try_into()
+                            .expect("two bytes"),
+                    );
+                    ensure!(units != 0, "UWOP_ALLOC_LARGE has a zero allocation");
+                    fixed_stack_allocation = fixed_stack_allocation
+                        .checked_add(u64::from(units) * 8)
+                        .context("UNWIND_INFO fixed-stack allocation overflows")?;
+                    2
+                }
+                1 => {
+                    ensure!(slot + 3 <= code_slots, "UWOP_ALLOC_LARGE is truncated");
+                    let size = u32::from_le_bytes(
+                        codes[slot * 2 + 2..slot * 2 + 6]
+                            .try_into()
+                            .expect("four bytes"),
+                    );
+                    ensure!(
+                        size != 0 && size.is_multiple_of(8),
+                        "UWOP_ALLOC_LARGE has an invalid allocation"
+                    );
+                    fixed_stack_allocation = fixed_stack_allocation
+                        .checked_add(u64::from(size))
+                        .context("UNWIND_INFO fixed-stack allocation overflows")?;
+                    3
+                }
+                _ => bail!("UWOP_ALLOC_LARGE has a reserved OpInfo"),
+            },
+            2 => {
+                fixed_stack_allocation = fixed_stack_allocation
+                    .checked_add(u64::from(info) * 8 + 8)
+                    .context("UNWIND_INFO fixed-stack allocation overflows")?;
+                1
+            }
+            3 => {
+                ensure!(frame_register != 0, "UWOP_SET_FPREG has no frame register");
+                ensure!(
+                    info == 0 || info == frame_register || info == frame_offset,
+                    "UNWIND_INFO at {unwind_rva:#x} slot {slot} UWOP_SET_FPREG has invalid OpInfo {info}"
+                );
+                1
+            }
+            4 | 5 => {
+                ensure!(saved_gpr(info), "UNWIND_INFO saved register is invalid");
+                let slots = if operation == 4 { 2 } else { 3 };
+                ensure!(
+                    slot + slots <= code_slots,
+                    "UNWIND_INFO nonvolatile save is truncated"
+                );
+                slots
+            }
+            8 | 9 => {
+                ensure!(
+                    (6..=15).contains(&info),
+                    "UNWIND_INFO XMM register is not nonvolatile"
+                );
+                let slots = if operation == 8 { 2 } else { 3 };
+                ensure!(
+                    slot + slots <= code_slots,
+                    "UNWIND_INFO XMM save is truncated"
+                );
+                slots
+            }
+            10 => {
+                ensure!(info <= 1, "UWOP_PUSH_MACHFRAME has an invalid OpInfo");
+                1
+            }
+            _ => bail!("reserved UNWIND_INFO operation {operation}"),
+        };
+        slot = slot
+            .checked_add(slots)
+            .context("UNWIND_INFO slot cursor overflows")?;
+    }
+    let contract = UnwindContract {
+        frame_register,
+        frame_offset,
+        fixed_stack_allocation,
+    };
+    let trailer_offset = align(
+        4usize
+            .checked_add(codes_len)
+            .context("UNWIND_INFO trailer offset overflows")?,
+        4,
+    )?;
+    let trailer_rva = unwind_rva
+        .checked_add(u32::try_from(trailer_offset)?)
+        .context("UNWIND_INFO trailer RVA overflows")?;
+    if flags & UNW_FLAG_CHAININFO != 0 {
+        let (_, _, primary) =
+            validate_runtime_function(mapped, pe, trailer_rva, unwind_path, depth + 1)?;
+        ensure!(
+            contract.frame_register == primary.frame_register
+                && contract.frame_offset == primary.frame_offset,
+            "UNWIND_INFO CHAININFO at {unwind_rva:#x} frame contract differs from primary {primary:?}"
+        );
+        ensure!(
+            contract.fixed_stack_allocation == 0
+                || contract.fixed_stack_allocation == primary.fixed_stack_allocation,
+            "UNWIND_INFO CHAININFO at {unwind_rva:#x} fixed-stack allocation differs from primary {primary:?}"
+        );
+        Ok(primary)
+    } else {
+        if flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 {
+            let handler = u32::from_le_bytes(
+                rva_slice(mapped, pe, trailer_rva, 4)
+                    .context("UNWIND_INFO handler RVA is not section-backed")?
+                    .try_into()
+                    .expect("four bytes"),
+            );
+            ensure!(handler != 0, "UNWIND_INFO handler RVA is null");
+            let section = pe.section_for_rva_range(handler, 1)?;
+            ensure!(
+                section.characteristics & 0x2000_0000 != 0,
+                "UNWIND_INFO handler is not executable"
+            );
+        }
+        Ok(contract)
+    }
+}
+
+fn validate_base_relocation_directory(
+    mapped: &[u8],
+    pe: &Pe,
+    directory: DataDirectory,
+) -> Result<()> {
+    ensure!(
+        directory.virtual_address.is_multiple_of(4),
+        "relocation directory is not DWORD-aligned"
+    );
+    let end = directory
+        .virtual_address
+        .checked_add(directory.size)
+        .context("relocation directory overflow")?;
+    let mut cursor = directory.virtual_address;
+    while cursor < end {
+        ensure!(
+            cursor.is_multiple_of(4),
+            "relocation block is not DWORD-aligned"
+        );
+        let header =
+            rva_slice(mapped, pe, cursor, 8).context("relocation header is not section-backed")?;
+        let page = u32::from_le_bytes(header[0..4].try_into().expect("four bytes"));
+        let block_size = u32::from_le_bytes(header[4..8].try_into().expect("four bytes"));
+        ensure!(
+            block_size >= 8 && block_size.is_multiple_of(4),
+            "relocation block size is invalid"
+        );
+        let next = cursor
+            .checked_add(block_size)
+            .context("relocation block overflow")?;
+        ensure!(next <= end, "relocation block exceeds directory");
+        // Linkers emit this eight-byte no-op block for an otherwise empty
+        // relocation directory. It has no PageRVA or entries to retain.
+        if page == 0 && block_size == 8 {
+            cursor = next;
+            continue;
+        }
+        ensure!(
+            page.is_multiple_of(0x1000),
+            "relocation PageRVA is not page-aligned"
+        );
+        ensure!(page < pe.size_of_image, "relocation PageRVA exceeds image");
+        pe.section_containing_rva(page)
+            .with_context(|| format!("relocation PageRVA {page:#x} is not section-backed"))?;
+        for entry_offset in (8..block_size).step_by(2) {
+            let entry = rva_slice(
+                mapped,
+                pe,
+                cursor
+                    .checked_add(entry_offset)
+                    .context("relocation entry overflow")?,
+                2,
+            )
+            .context("relocation entry is not section-backed")?;
+            let word = u16::from_le_bytes(entry.try_into().expect("two bytes"));
+            let kind = word >> 12;
+            let target = page
+                .checked_add(u32::from(word & 0x0fff))
+                .context("relocation target overflow")?;
+            let width = match kind {
+                0 => continue,
+                3 => 4,
+                10 if pe.pointer_width() == PointerWidth::U64 => 8,
+                _ => bail!("unsupported relocation kind {kind}"),
+            };
+            let target_end = target
+                .checked_add(width)
+                .context("relocation target end overflows")?;
+            ensure!(
+                target_end <= pe.size_of_image,
+                "relocation target exceeds image"
+            );
+            rva_slice(mapped, pe, target, usize::try_from(width)?)
+                .context("relocation target is not section-backed")?;
+        }
+        cursor = next;
+    }
+    ensure!(cursor == end, "relocation directory trailing bytes");
+    Ok(())
+}
+
+fn validate_delay_import_directory(mapped: &[u8], pe: &Pe, directory: DataDirectory) -> Result<()> {
+    ensure!(
+        directory.size.is_multiple_of(32),
+        "delay-import directory is not descriptor aligned"
+    );
+    let end = directory
+        .virtual_address
+        .checked_add(directory.size)
+        .context("delay-import directory overflow")?;
+    let mut cursor = directory.virtual_address;
+    while cursor < end {
+        let descriptor = rva_slice(mapped, pe, cursor, 32)
+            .context("delay-import descriptor is not section-backed")?;
+        if descriptor.iter().all(|byte| *byte == 0) {
+            ensure!(
+                rva_slice(mapped, pe, cursor, usize::try_from(end - cursor)?)
+                    .context("delay-import terminator is not section-backed")?
+                    .iter()
+                    .all(|byte| *byte == 0),
+                "delay-import bytes follow the terminator"
+            );
+            return Ok(());
+        }
+        let attributes = u32::from_le_bytes(descriptor[0..4].try_into().expect("four bytes"));
+        ensure!(
+            attributes == 0 || attributes == 1,
+            "delay-import attributes do not select exact RVA or VA semantics"
+        );
+        let rva_mode = attributes == 1;
+        let field = |offset: usize| {
+            u32::from_le_bytes(
+                descriptor[offset..offset + 4]
+                    .try_into()
+                    .expect("four bytes"),
+            )
+        };
+        let name = delay_descriptor_rva(pe, field(4), rva_mode, "DLL name")?
+            .context("delay-import DLL name is null")?;
+        let dll = read_ascii(mapped, pe, name, MAX_IMPORT_STRING)
+            .context("delay-import DLL name is invalid or unterminated")?;
+        ensure!(!dll.is_empty(), "delay-import DLL name is empty");
+
+        let module_handle = delay_descriptor_rva(pe, field(8), rva_mode, "module handle")?
+            .context("delay-import module handle is null")?;
+        let iat = delay_descriptor_rva(pe, field(12), rva_mode, "IAT")?
+            .context("delay-import IAT is null")?;
+        let int = delay_descriptor_rva(pe, field(16), rva_mode, "INT")?
+            .context("delay-import INT is null")?;
+        let bound = delay_descriptor_rva(pe, field(20), rva_mode, "bound IAT")?;
+        let unload = delay_descriptor_rva(pe, field(24), rva_mode, "unload IAT")?;
+        let width = u32::try_from(pe.pointer_width().bytes())?;
+        for (label, rva) in [("module handle", module_handle), ("IAT", iat)] {
+            ensure!(
+                rva.is_multiple_of(width),
+                "delay-import {label} is not pointer aligned"
+            );
+            validate_delay_writable_cell(pe, rva, width, label)?;
+        }
+        for (label, rva) in [
+            ("INT", Some(int)),
+            ("bound IAT", bound),
+            ("unload IAT", unload),
+        ] {
+            if let Some(rva) = rva {
+                ensure!(
+                    rva.is_multiple_of(width),
+                    "delay-import {label} is not pointer aligned"
+                );
+                rva_slice(mapped, pe, rva, usize::try_from(width)?)
+                    .with_context(|| format!("delay-import {label} is not section-backed"))?;
+            }
+        }
+        validate_delay_import_tables(mapped, pe, int, iat, bound, unload, rva_mode)?;
+        cursor = cursor
+            .checked_add(32)
+            .context("delay-import descriptor overflow")?;
+    }
+    bail!("delay-import descriptor array has no terminator")
+}
+
+fn delay_descriptor_rva(pe: &Pe, value: u32, rva_mode: bool, label: &str) -> Result<Option<u32>> {
+    if value == 0 {
+        return Ok(None);
+    }
+    let rva = if rva_mode {
+        value
+    } else {
+        va_to_rva(pe, u64::from(value))?
+            .with_context(|| format!("delay-import {label} VA is null"))?
+    };
+    ensure!(rva < pe.size_of_image, "delay-import {label} exceeds image");
+    Ok(Some(rva))
+}
+
+fn validate_delay_writable_cell(pe: &Pe, rva: u32, width: u32, label: &str) -> Result<()> {
+    let section = pe
+        .section_for_rva_range(rva, usize::try_from(width)?)
+        .with_context(|| format!("delay-import {label} is not section-backed"))?;
+    ensure!(
+        section.characteristics & 0x8000_0000 != 0,
+        "delay-import {label} is not writable"
+    );
+    Ok(())
+}
+
+fn delay_table_cell_rva(base: u32, index: usize, width: u32, label: &str) -> Result<u32> {
+    base.checked_add(
+        u32::try_from(index)?
+            .checked_mul(width)
+            .context("delay-import table offset overflows")?,
+    )
+    .with_context(|| format!("delay-import {label} cell RVA overflows"))
+}
+
+fn delay_table_value(mapped: &[u8], pe: &Pe, rva: u32, label: &str) -> Result<u64> {
+    let bytes = rva_slice(mapped, pe, rva, pe.pointer_width().bytes())
+        .with_context(|| format!("delay-import {label} cell is not section-backed"))?;
+    Ok(match pe.pointer_width() {
+        PointerWidth::U32 => u64::from(u32::from_le_bytes(bytes.try_into().expect("four bytes"))),
+        PointerWidth::U64 => u64::from_le_bytes(bytes.try_into().expect("eight bytes")),
+    })
+}
+
+fn validate_delay_thunk(
+    mapped: &[u8],
+    pe: &Pe,
+    value: u64,
+    rva_mode: bool,
+    label: &str,
+) -> Result<()> {
+    let flag = ordinal_flag(pe.pointer_width());
+    if value & flag != 0 {
+        ensure!(
+            value & !(flag | 0xffff) == 0 && value & 0xffff != 0,
+            "delay-import {label} has an invalid ordinal thunk"
+        );
+        return Ok(());
+    }
+    let name_rva = if rva_mode {
+        named_thunk_rva(pe.pointer_width(), value)
+            .with_context(|| format!("delay-import {label} name RVA is invalid"))?
+    } else {
+        va_to_rva(pe, value)?.with_context(|| format!("delay-import {label} name VA is null"))?
+    };
+    ensure!(
+        name_rva.is_multiple_of(2),
+        "delay-import {label} hint/name is not aligned"
+    );
+    rva_slice(mapped, pe, name_rva, 2)
+        .with_context(|| format!("delay-import {label} hint is not section-backed"))?;
+    read_ascii(
+        mapped,
+        pe,
+        name_rva
+            .checked_add(2)
+            .context("delay-import hint/name RVA overflows")?,
+        MAX_IMPORT_STRING,
+    )
+    .with_context(|| format!("delay-import {label} name is invalid or unterminated"))?;
+    Ok(())
+}
+
+fn validate_delay_import_tables(
+    mapped: &[u8],
+    pe: &Pe,
+    int: u32,
+    iat: u32,
+    bound: Option<u32>,
+    unload: Option<u32>,
+    rva_mode: bool,
+) -> Result<()> {
+    let width = u32::try_from(pe.pointer_width().bytes())?;
+    for index in 0..=MAX_IMPORT_THUNKS {
+        let int_rva = delay_table_cell_rva(int, index, width, "INT")?;
+        let iat_rva = delay_table_cell_rva(iat, index, width, "IAT")?;
+        let int_value = delay_table_value(mapped, pe, int_rva, "INT")?;
+        validate_delay_writable_cell(pe, iat_rva, width, "IAT")?;
+        let iat_value = delay_table_value(mapped, pe, iat_rva, "IAT")?;
+        let bound_value = bound
+            .map(|base| {
+                let rva = delay_table_cell_rva(base, index, width, "bound IAT")?;
+                delay_table_value(mapped, pe, rva, "bound IAT")
+            })
+            .transpose()?;
+        let unload_value = unload
+            .map(|base| {
+                let rva = delay_table_cell_rva(base, index, width, "unload IAT")?;
+                delay_table_value(mapped, pe, rva, "unload IAT")
+            })
+            .transpose()?;
+        if int_value == 0 {
+            ensure!(
+                iat_value == 0,
+                "delay-import IAT and INT terminators differ"
+            );
+            ensure!(
+                unload_value.is_none_or(|value| value == 0),
+                "delay-import unload IAT terminator differs from INT"
+            );
+            ensure!(
+                bound_value.is_none_or(|value| value == 0),
+                "delay-import bound IAT terminator differs from INT"
+            );
+            return Ok(());
+        }
+        ensure!(iat_value != 0, "delay-import IAT ends before INT");
+        validate_delay_thunk(mapped, pe, int_value, rva_mode, "INT")?;
+        // A bound IAT and a delay-loaded IAT may already hold resolved external
+        // function VAs. Their format-defined invariant is the paired terminator,
+        // not import-name encoding; reading each cell still bounds ownership.
+        let _ = bound_value;
+        if let Some(value) = unload_value {
+            ensure!(value != 0, "delay-import unload IAT ends before INT");
+            validate_delay_thunk(mapped, pe, value, rva_mode, "unload IAT")?;
+        }
+    }
+    bail!("delay-import thunk array exceeds {MAX_IMPORT_THUNKS} entries")
 }
 
 fn scan_resource_root(mapped: &[u8], pe: &Pe) -> Result<Option<DataDirectory>> {
@@ -1166,11 +1761,35 @@ fn validate_tls_directory(mapped: &[u8], pe: &Pe, directory: DataDirectory) -> R
     };
     let start = va_to_rva(pe, read(0))?;
     let end = va_to_rva(pe, read(width))?;
-    if let (Some(start), Some(end)) = (start, end) {
-        ensure!(end >= start, "TLS raw-data range is inverted");
-        rva_slice(mapped, pe, start, usize::try_from(end - start)?)
-            .context("TLS raw-data range is invalid")?;
+    match (start, end) {
+        (None, None) => {}
+        (Some(start), Some(end)) => {
+            ensure!(end >= start, "TLS raw-data range is inverted");
+            rva_slice(mapped, pe, start, usize::try_from(end - start)?)
+                .context("TLS raw-data range is invalid")?;
+        }
+        _ => bail!("TLS raw-data range has a partial null endpoint"),
     }
+    if let Some(index) = va_to_rva(pe, read(width * 2))? {
+        let section = pe.section_for_rva_range(index, 4)?;
+        ensure!(
+            section.characteristics & 0x8000_0000 != 0,
+            "TLS AddressOfIndex is not writable"
+        );
+    }
+    let characteristics_offset = width
+        .checked_mul(4)
+        .and_then(|offset| offset.checked_add(4))
+        .context("TLS Characteristics offset overflows")?;
+    let characteristics = u32::from_le_bytes(
+        bytes[characteristics_offset..characteristics_offset + 4]
+            .try_into()
+            .expect("four bytes"),
+    );
+    ensure!(
+        characteristics & !0x00f0_0000 == 0,
+        "TLS Characteristics contains reserved bits"
+    );
     if let Some(callbacks) = va_to_rva(pe, read(width * 3))? {
         for index in 0..4096usize {
             let cell = callbacks
@@ -1187,7 +1806,11 @@ fn validate_tls_directory(mapped: &[u8], pe: &Pe, directory: DataDirectory) -> R
                 return Ok(());
             }
             let target = va_to_rva(pe, value)?.context("TLS callback is unexpectedly null")?;
-            pe.section_for_rva_range(target, 1)?;
+            let section = pe.section_for_rva_range(target, 1)?;
+            ensure!(
+                section.characteristics & 0x2000_0000 != 0,
+                "TLS callback is not executable"
+            );
         }
         bail!("TLS callback array has no terminator")
     }
