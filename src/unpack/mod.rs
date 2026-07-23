@@ -81,7 +81,7 @@ fn unpack_recording(packed: &[u8], report: &mut AnalysisReport) -> Result<Vec<u8
     }
     let decrypt::DecryptedImage {
         mut image,
-        destination_ranges: _destination_ranges,
+        destination_ranges,
         decryption_details,
     } = finish_stage(report, AnalysisStep::PayloadDecryption, decryption)?;
     report.decryption = Some(decryption_details);
@@ -145,6 +145,7 @@ fn unpack_recording(packed: &[u8], report: &mut AnalysisReport) -> Result<Vec<u8
             decrypted_pe,
             output_entry,
             discovery,
+            destination_ranges,
         })
     };
     let output = finish_stage(report, AnalysisStep::PeRebuild, rebuilt)?;

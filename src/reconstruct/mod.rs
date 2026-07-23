@@ -17,6 +17,7 @@ const IMAGE_IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const IMAGE_EXPORT_DIRECTORY_SIZE: usize = 40;
 const IAT_DIRECTORY: usize = 12;
 mod clr;
+mod pogo;
 const DELAY_IMPORT_DIRECTORY: usize = 13;
 #[cfg(test)]
 mod tests;
@@ -25,7 +26,7 @@ const MAX_IMPORT_THUNKS: usize = 1_000_000;
 const MAX_IMPORT_STRING: usize = 4_096;
 const MAX_EXPORT_ENTRIES: usize = 1_000_000;
 const MAX_EXPORT_STRING: usize = 4_096;
-const IMPORT_SECTION_CHARACTERISTICS: u32 = 0xc030_0040;
+const IMPORT_SECTION_CHARACTERISTICS: u32 = 0x4000_0040;
 const SECTION_HEADER_SIZE: usize = 40;
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
@@ -35,18 +36,20 @@ const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
 const IMAGE_REL_BASED_HIGHLOW: u16 = 3;
 const IMAGE_REL_BASED_DIR64: u16 = 10;
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const MAX_SCAN_STARTS: usize = 1 << 27;
 const MAX_SCAN_CANDIDATES: usize = 4_096;
 const MAX_SCAN_NESTED_WORK: usize = 16_000_000;
 
 /// The immutable handoff from packer-specific recovery to PE serialization.
-/// Import and export directory headers are never reconstruction authority;
-/// other directory headers are retained only after dedicated validation.
+/// Authenticated A-record destinations and POGO contributions take precedence;
+/// header values and structural scans are bounded fallback evidence.
 pub(crate) struct ReconstructionInput {
     pub(crate) mapped: Vec<u8>,
     pub(crate) decrypted_pe: Pe,
     pub(crate) output_entry: OutputEntry,
     pub(crate) discovery: LoaderDiscovery,
+    pub(crate) destination_ranges: Vec<Range<u32>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,15 +108,17 @@ impl ScanBudget {
 
 /// Rebuilds a disk PE from the recovered mapped image.
 ///
-/// Directory locations are recovered from section bytes, not inherited from
-/// either the packed or provisional header. The canonical CrackProof loader
-/// graph is normalized into a fresh standard import table in a new section.
+/// Authenticated GCTL contributions recover original section and directory
+/// placement first, including in-place standard imports. When that linker
+/// metadata is absent or uses an unsupported contribution family, bounded
+/// structural recovery emits the loader graph into a normalized import section.
 pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
     let ReconstructionInput {
         mut mapped,
         decrypted_pe,
         output_entry,
         discovery,
+        destination_ranges,
     } = input;
     ensure!(
         mapped.len() == usize::try_from(decrypted_pe.size_of_image)?,
@@ -125,6 +130,11 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
     );
     validate_entry_evidence(&mapped, &decrypted_pe, output_entry)?;
     validate_loader_graph(&decrypted_pe, &discovery)?;
+    if let Some(recovery) = pogo::recover(&mapped, &decrypted_pe, &discovery, &destination_ranges)
+        .context("recovering native layout from authenticated POGO metadata")?
+    {
+        return rebuild_pogo(recovery, output_entry, &discovery);
+    }
     let iat_directory = iat_directory(&decrypted_pe, &discovery)?;
 
     // A standard bootstrap import table may be present in the provisional image.
@@ -149,7 +159,13 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
         .checked_add(import_virtual_size)
         .context("final SizeOfImage overflows")?;
 
-    clear_iat_cells(&mut mapped, &decrypted_pe, &discovery)?;
+    initialize_iat_cells(
+        &mut mapped,
+        &decrypted_pe,
+        &discovery,
+        import_rva,
+        &emission.bytes,
+    )?;
     let mut output = serialize_sections(
         &mapped,
         &decrypted_pe,
@@ -245,6 +261,98 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
             );
         }
     }
+    Ok(output)
+}
+
+fn rebuild_pogo(
+    recovery: pogo::PogoRecovery,
+    output_entry: OutputEntry,
+    discovery: &LoaderDiscovery,
+) -> Result<Vec<u8>> {
+    let pogo::PogoRecovery {
+        mapped,
+        pe,
+        directories,
+    } = recovery;
+    validate_entry_evidence(&mapped, &pe, output_entry)?;
+    let import_directory = directories
+        .iter()
+        .find(|(index, _)| *index == IMPORT_DIRECTORY)
+        .map(|(_, directory)| *directory)
+        .context("POGO recovery omitted Import Directory")?;
+    let iat_directory = directories
+        .iter()
+        .find(|(index, _)| *index == IAT_DIRECTORY)
+        .map(|(_, directory)| *directory)
+        .context("POGO recovery omitted IAT Directory")?;
+
+    let mut output =
+        serialize_recovered_sections(&mapped, &pe, output_entry.entry_rva(), &directories)?;
+    let parsed = Pe::parse(&output).context("parsing POGO-reconstructed PE")?;
+    pe::write_u32(&mut output, parsed.checksum_offset, 0)?;
+    let checksum = pe::pe_checksum(&output, parsed.checksum_offset)?;
+    pe::write_u32(&mut output, parsed.checksum_offset, checksum)?;
+
+    let final_pe = Pe::parse(&output).context("reparsing checksummed POGO PE")?;
+    let final_mapped = final_pe
+        .map_image(&output)
+        .context("mapping POGO-reconstructed PE")?;
+    verify_trimmed_section_mapping(&mapped, &final_mapped, &pe, &directories)?;
+    ensure!(
+        final_pe.section_count == pe.section_count
+            && final_pe.file_alignment == pe.file_alignment
+            && final_pe.size_of_image == pe.size_of_image,
+        "serialized POGO geometry differs from authenticated layout"
+    );
+    ensure!(
+        final_pe
+            .sections
+            .iter()
+            .zip(&pe.sections)
+            .all(
+                |(actual, expected)| actual.name_bytes == expected.name_bytes
+                    && actual.virtual_address == expected.virtual_address
+                    && actual.virtual_size == expected.virtual_size
+                    && actual.characteristics == expected.characteristics
+            ),
+        "serialized POGO section layout differs from authenticated contributions"
+    );
+    let final_import = select_import_candidate(scan_import_candidates(&final_mapped, &final_pe)?)?
+        .context("POGO-reconstructed image has no standard import graph")?;
+    ensure!(
+        final_import.graph == canonical_import_graph(discovery)?,
+        "POGO-reconstructed import graph differs from loader graph"
+    );
+    ensure!(
+        final_import.start == import_directory.virtual_address,
+        "POGO-reconstructed import graph starts at an unexpected RVA"
+    );
+    ensure!(
+        final_pe.directory(IAT_DIRECTORY)? == iat_directory,
+        "POGO-reconstructed IAT Directory differs from authenticated contribution"
+    );
+    for (index, directory) in &directories {
+        ensure!(
+            final_pe.directory(*index)? == *directory,
+            "POGO-reconstructed directory {index} differs from authenticated metadata"
+        );
+    }
+    let aggregates = pogo_section_aggregate_sizes(
+        final_pe.sections.iter().map(|section| {
+            Ok((
+                section.raw_size,
+                section.virtual_size,
+                section.characteristics,
+            ))
+        }),
+        final_pe.file_alignment,
+    )?;
+    ensure!(
+        u32_at(&output, final_pe.size_of_code_offset())? == aggregates.0
+            && u32_at(&output, final_pe.size_of_initialized_data_offset())? == aggregates.1
+            && u32_at(&output, final_pe.size_of_uninitialized_data_offset())? == aggregates.2,
+        "POGO-reconstructed aggregate section sizes are inconsistent"
+    );
     Ok(output)
 }
 
@@ -431,20 +539,42 @@ fn canonical_import_graph(discovery: &LoaderDiscovery) -> Result<ImportGraph> {
     })
 }
 
-fn clear_iat_cells(mapped: &mut [u8], pe: &Pe, discovery: &LoaderDiscovery) -> Result<()> {
+fn initialize_iat_cells(
+    mapped: &mut [u8],
+    pe: &Pe,
+    discovery: &LoaderDiscovery,
+    import_rva: u32,
+    imports: &[u8],
+) -> Result<()> {
     let width = pe.pointer_width().bytes();
-    for module in &discovery.modules {
+    for (index, module) in discovery.modules.iter().enumerate() {
+        let descriptor = index
+            .checked_mul(IMAGE_IMPORT_DESCRIPTOR_SIZE)
+            .context("import descriptor offset overflows")?;
+        let lookup_rva = u32_at(imports, descriptor)?;
+        ensure!(
+            u32_at(imports, descriptor + 16)? == module.destination_rva,
+            "emitted import descriptor FirstThunk differs from loader graph"
+        );
+        let lookup_offset = lookup_rva
+            .checked_sub(import_rva)
+            .context("emitted import lookup table precedes import section")?;
         let bytes = (module.symbols.len() + 1)
             .checked_mul(width)
-            .context("IAT clearing length overflows")?;
+            .context("IAT initialization length overflows")?;
+        let lookup = imports
+            .get(usize::try_from(lookup_offset)?..)
+            .and_then(|source| source.get(..bytes))
+            .context("emitted import lookup table exceeds import section")?;
+        ensure!(
+            lookup[lookup.len() - width..].iter().all(|byte| *byte == 0),
+            "emitted import lookup table lacks a null terminator"
+        );
         let start = usize::try_from(module.destination_rva)?;
-        let end = start
-            .checked_add(bytes)
-            .context("IAT clearing range overflows")?;
-        mapped
-            .get_mut(start..end)
-            .context("IAT clearing range exceeds mapped image")?
-            .fill(0);
+        let destination = mapped
+            .get_mut(start..start.checked_add(bytes).context("IAT end overflows")?)
+            .context("IAT initialization range exceeds mapped image")?;
+        destination.copy_from_slice(lookup);
     }
     Ok(())
 }
@@ -662,6 +792,123 @@ fn require_raw_rva_range(pe: &Pe, required: &mut [u32], range: Range<u32>) -> Re
     Ok(())
 }
 
+fn serialize_recovered_sections(
+    mapped: &[u8],
+    pe: &Pe,
+    entry_rva: u32,
+    directories: &[(usize, DataDirectory)],
+) -> Result<Vec<u8>> {
+    let section_table_end = pe
+        .sections
+        .last()
+        .context("recovered PE has no sections")?
+        .header_offset
+        .checked_add(SECTION_HEADER_SIZE)
+        .context("recovered section table end overflows")?;
+    ensure!(
+        section_table_end <= usize::try_from(pe.size_of_headers)?,
+        "recovered section table exceeds SizeOfHeaders"
+    );
+    let mut output = vec![0; usize::try_from(pe.size_of_headers)?];
+    let header_len = output.len();
+    output.copy_from_slice(
+        mapped
+            .get(..header_len)
+            .context("mapped image lacks recovered headers")?,
+    );
+    pe::write_u32(&mut output, pe.coff_symbol_table_offset(), 0)?;
+    output
+        .get_mut(0x28..0x3c)
+        .context("DOS reserved fields exceed recovered headers")?
+        .fill(0);
+    pe::write_u32(&mut output, pe.coff_symbol_table_offset() + 4, 0)?;
+    pe::write_u32(&mut output, pe.win32_version_value_offset(), 0)?;
+    pe::write_u32(&mut output, pe.loader_flags_offset(), 0)?;
+    output
+        .get_mut(section_table_end..)
+        .context("recovered section table exceeds header buffer")?
+        .fill(0);
+    output[pe.opt - 18..pe.opt - 16]
+        .copy_from_slice(&u16::try_from(pe.section_count)?.to_le_bytes());
+    pe::write_u32(&mut output, pe.entry_rva_offset(), entry_rva)?;
+    pe::write_u32(&mut output, pe.opt + 32, pe.section_alignment)?;
+    pe::write_u32(&mut output, pe.opt + 36, pe.file_alignment)?;
+    pe::write_u32(&mut output, pe.size_of_image_offset(), pe.size_of_image)?;
+    pe::write_u32(&mut output, pe.opt + 60, pe.size_of_headers)?;
+    for index in 0..pe.directories.len() {
+        write_directory(
+            &mut output,
+            pe,
+            index,
+            DataDirectory {
+                virtual_address: 0,
+                size: 0,
+            },
+        )?;
+    }
+    for &(index, directory) in directories {
+        write_directory(&mut output, pe, index, directory)?;
+    }
+
+    let raw_layout = compact_raw_layout(mapped, pe, directories)?;
+    for (section, layout) in pe.sections.iter().zip(&raw_layout) {
+        let payload = mapped
+            .get(
+                usize::try_from(layout.virtual_range.start)?
+                    ..usize::try_from(layout.virtual_range.end)?,
+            )
+            .context("recovered section range exceeds mapped image")?;
+        write_section_header(
+            &mut output,
+            section.header_offset,
+            &section.name_bytes,
+            section.virtual_size,
+            section.virtual_address,
+            layout.raw_size,
+            if layout.raw_size == 0 {
+                0
+            } else {
+                layout.raw_pointer
+            },
+            section.characteristics,
+        )?;
+        append_payload(
+            &mut output,
+            layout.raw_pointer,
+            layout.raw_size,
+            &payload[..payload.len().min(usize::try_from(layout.raw_size)?)],
+        )?;
+    }
+    let aggregates = pogo_section_aggregate_sizes(
+        pe.sections
+            .iter()
+            .zip(&raw_layout)
+            .map(|(section, layout)| {
+                Ok((
+                    layout.raw_size,
+                    section.virtual_size,
+                    section.characteristics,
+                ))
+            }),
+        pe.file_alignment,
+    )?;
+    pe::write_u32(&mut output, pe.size_of_code_offset(), aggregates.0)?;
+    pe::write_u32(
+        &mut output,
+        pe.size_of_initialized_data_offset(),
+        aggregates.1,
+    )?;
+    pe::write_u32(
+        &mut output,
+        pe.size_of_uninitialized_data_offset(),
+        aggregates.2,
+    )?;
+    if let Some((_, debug)) = directories.iter().find(|(index, _)| *index == 6) {
+        rewrite_debug_raw_pointers(&mut output, &raw_layout, *debug)?;
+    }
+    Ok(output)
+}
+
 fn serialize_sections(
     mapped: &[u8],
     pe: &Pe,
@@ -690,6 +937,17 @@ fn serialize_sections(
         .get(..output.len())
         .context("mapped image lacks headers")?;
     output.copy_from_slice(header_bytes);
+    pe::write_u32(&mut output, pe.coff_symbol_table_offset(), 0)?;
+    pe::write_u32(&mut output, pe.coff_symbol_table_offset() + 4, 0)?;
+    pe::write_u32(&mut output, pe.win32_version_value_offset(), 0)?;
+    pe::write_u32(&mut output, pe.loader_flags_offset(), 0)?;
+    let header_padding = section_table_end
+        .checked_add(SECTION_HEADER_SIZE)
+        .context("normalized section table end overflows")?;
+    output
+        .get_mut(header_padding..)
+        .context("normalized section table exceeds SizeOfHeaders")?
+        .fill(0);
     output[pe.opt - 18..pe.opt - 16]
         .copy_from_slice(&u16::try_from(pe.section_count + 1)?.to_le_bytes());
     pe::write_u32(&mut output, pe.entry_rva_offset(), entry_rva)?;
@@ -744,7 +1002,11 @@ fn serialize_sections(
             section.virtual_size,
             section.virtual_address,
             layout.raw_size,
-            layout.raw_pointer,
+            if layout.raw_size == 0 {
+                0
+            } else {
+                layout.raw_pointer
+            },
             section.characteristics,
         )?;
         append_payload(
@@ -784,7 +1046,11 @@ fn serialize_sections(
         import_virtual_size,
         import_rva,
         import_layout.raw_size,
-        import_layout.raw_pointer,
+        if import_layout.raw_size == 0 {
+            0
+        } else {
+            import_layout.raw_pointer
+        },
         IMPORT_SECTION_CHARACTERISTICS,
     )?;
     append_payload(
@@ -840,6 +1106,32 @@ where
             uninitialized = uninitialized
                 .checked_add(virtual_size)
                 .context("SizeOfUninitializedData overflows")?;
+        }
+    }
+    Ok((code, initialized, uninitialized))
+}
+
+fn pogo_section_aggregate_sizes<I>(sections: I, file_alignment: u32) -> Result<(u32, u32, u32)>
+where
+    I: IntoIterator<Item = Result<(u32, u32, u32)>>,
+{
+    let mut code = 0u32;
+    let mut initialized = 0u32;
+    let mut uninitialized = 0u32;
+    for section in sections {
+        let (raw_size, virtual_size, characteristics) = section?;
+        if characteristics & IMAGE_SCN_CNT_CODE != 0 {
+            code = code.checked_add(raw_size).context("SizeOfCode overflows")?;
+        }
+        if characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA != 0 {
+            initialized = initialized
+                .checked_add(pe::align_up(virtual_size, file_alignment)?)
+                .context("POGO SizeOfInitializedData overflows")?;
+        }
+        if characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0 {
+            uninitialized = uninitialized
+                .checked_add(pe::align_up(virtual_size, file_alignment)?)
+                .context("POGO SizeOfUninitializedData overflows")?;
         }
     }
     Ok((code, initialized, uninitialized))
@@ -962,12 +1254,19 @@ fn rewrite_debug_raw_pointers(
 fn recover_directories(mapped: &[u8], pe: &Pe) -> Result<Vec<(usize, DataDirectory)>> {
     let mut result = Vec::new();
     for (index, directory) in pe.directories.iter().copied().enumerate() {
-        if directory.is_empty()
-            || matches!(
-                index,
-                EXPORT_DIRECTORY | IMPORT_DIRECTORY | SECURITY_DIRECTORY | 11 | IAT_DIRECTORY
-            )
-        {
+        if matches!(
+            index,
+            EXPORT_DIRECTORY | IMPORT_DIRECTORY | SECURITY_DIRECTORY | 11 | IAT_DIRECTORY
+        ) {
+            continue;
+        }
+        if index == BASE_RELOCATION_DIRECTORY {
+            if let Some(directory) = recover_base_relocation_directory(mapped, pe, directory)? {
+                result.push((index, directory));
+            }
+            continue;
+        }
+        if directory.is_empty() {
             continue;
         }
         let directory = if index == 2 {
@@ -1000,7 +1299,9 @@ fn validate_retained_directory(
     .context("retained directory is not section-backed")?;
     match index {
         EXCEPTION_DIRECTORY => validate_exception_directory(mapped, pe, directory),
-        BASE_RELOCATION_DIRECTORY => validate_base_relocation_directory(mapped, pe, directory),
+        BASE_RELOCATION_DIRECTORY => {
+            validate_base_relocation_directory(mapped, pe, directory).map(|_| ())
+        }
         6 => validate_debug_directory(mapped, pe, directory),
         9 => validate_tls_directory(mapped, pe, directory),
         DELAY_IMPORT_DIRECTORY => validate_delay_import_directory(mapped, pe, directory),
@@ -1357,11 +1658,185 @@ fn validate_unwind_info(
     }
 }
 
+fn recover_base_relocation_directory(
+    mapped: &[u8],
+    pe: &Pe,
+    declared: DataDirectory,
+) -> Result<Option<DataDirectory>> {
+    if !declared.is_empty() {
+        let relocations = validate_base_relocation_directory(mapped, pe, declared)?;
+        if relocations != 0 {
+            return Ok(Some(declared));
+        }
+    }
+
+    let discovered = scan_base_relocation_directory(mapped, pe)?;
+    Ok(discovered.or_else(|| (!declared.is_empty()).then_some(declared)))
+}
+
+fn scan_base_relocation_directory(mapped: &[u8], pe: &Pe) -> Result<Option<DataDirectory>> {
+    let mut starts = 0usize;
+    let mut candidates = Vec::new();
+    let mut budget = ScanBudget::default();
+    for section in &pe.sections {
+        if section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0 {
+            continue;
+        }
+        let range = section.virtual_range()?;
+        let end = range.end.min(pe.size_of_image);
+        let mut rva = pe::align_up(range.start, 4)?;
+        while rva
+            .checked_add(BASE_RELOCATION_BLOCK_HEADER_SIZE as u32)
+            .is_some_and(|header_end| header_end <= end)
+        {
+            starts = starts
+                .checked_add(1)
+                .context("relocation scan start counter overflows")?;
+            ensure!(
+                starts <= MAX_SCAN_STARTS,
+                "relocation scan start budget exceeded"
+            );
+            if let Some(candidate) = parse_relocation_candidate(mapped, pe, rva, end, &mut budget)?
+            {
+                ensure!(
+                    candidates.len() < MAX_SCAN_CANDIDATES,
+                    "relocation scan candidate budget exceeded"
+                );
+                candidates.push(candidate);
+                rva = candidate
+                    .virtual_address
+                    .checked_add(candidate.size)
+                    .context("relocation candidate end overflows")?;
+            } else {
+                rva = rva
+                    .checked_add(4)
+                    .context("relocation scan RVA overflows")?;
+            }
+        }
+    }
+    ensure!(
+        candidates.len() <= 1,
+        "multiple independent hidden relocation streams were found"
+    );
+    Ok(candidates.pop())
+}
+
+fn parse_relocation_candidate(
+    mapped: &[u8],
+    pe: &Pe,
+    start: u32,
+    owner_end: u32,
+    budget: &mut ScanBudget,
+) -> Result<Option<DataDirectory>> {
+    let image_end = pe
+        .image_base
+        .checked_add(u64::from(pe.size_of_image))
+        .context("preferred image range overflows")?;
+    let mut cursor = start;
+    let mut previous_page = None;
+    let mut relocations = 0usize;
+    while let Some(header_end) = cursor.checked_add(BASE_RELOCATION_BLOCK_HEADER_SIZE as u32) {
+        if header_end > owner_end {
+            break;
+        }
+        let Some(header) = rva_slice(mapped, pe, cursor, BASE_RELOCATION_BLOCK_HEADER_SIZE) else {
+            break;
+        };
+        let page = u32::from_le_bytes(header[0..4].try_into().expect("four bytes"));
+        let block_size = u32::from_le_bytes(header[4..8].try_into().expect("four bytes"));
+        if page == 0
+            || !page.is_multiple_of(0x1000)
+            || page >= pe.size_of_image
+            || pe.section_containing_rva(page).is_none()
+            || previous_page.is_some_and(|previous| page <= previous)
+            || block_size < BASE_RELOCATION_BLOCK_HEADER_SIZE as u32
+            || !block_size.is_multiple_of(4)
+        {
+            break;
+        }
+        let Some(next) = cursor.checked_add(block_size) else {
+            break;
+        };
+        if next > owner_end {
+            break;
+        }
+        let entries = usize::try_from((block_size - BASE_RELOCATION_BLOCK_HEADER_SIZE as u32) / 2)?;
+        let mut block_relocations = 0usize;
+        let mut valid = true;
+        for index in 0..entries {
+            budget.consume(1)?;
+            let entry_rva = header_end
+                .checked_add(u32::try_from(
+                    index.checked_mul(2).context("relocation index overflows")?,
+                )?)
+                .context("relocation entry RVA overflows")?;
+            let Some(entry) = rva_slice(mapped, pe, entry_rva, 2) else {
+                valid = false;
+                break;
+            };
+            let word = u16::from_le_bytes(entry.try_into().expect("two bytes"));
+            let kind = word >> 12;
+            if kind == IMAGE_REL_BASED_ABSOLUTE {
+                continue;
+            }
+            let width = match (pe.pointer_width(), kind) {
+                (PointerWidth::U32, IMAGE_REL_BASED_HIGHLOW) => 4,
+                (PointerWidth::U64, IMAGE_REL_BASED_DIR64) => 8,
+                _ => {
+                    valid = false;
+                    break;
+                }
+            };
+            let Some(target) = page.checked_add(u32::from(word & 0x0fff)) else {
+                valid = false;
+                break;
+            };
+            let Some(value) = rva_slice(mapped, pe, target, width) else {
+                valid = false;
+                break;
+            };
+            let value = match pe.pointer_width() {
+                PointerWidth::U32 => {
+                    u64::from(u32::from_le_bytes(value.try_into().expect("four bytes")))
+                }
+                PointerWidth::U64 => u64::from_le_bytes(value.try_into().expect("eight bytes")),
+            };
+            if value < pe.image_base || value >= image_end {
+                valid = false;
+                break;
+            }
+            block_relocations = block_relocations
+                .checked_add(1)
+                .context("relocation count overflows")?;
+        }
+        if !valid || block_relocations == 0 {
+            break;
+        }
+        relocations = relocations
+            .checked_add(block_relocations)
+            .context("relocation count overflows")?;
+        previous_page = Some(page);
+        cursor = next;
+    }
+    if relocations == 0 {
+        return Ok(None);
+    }
+    let directory = DataDirectory {
+        virtual_address: start,
+        size: cursor
+            .checked_sub(start)
+            .context("relocation candidate size underflows")?,
+    };
+    validate_base_relocation_directory(mapped, pe, directory)?;
+    Ok(Some(directory))
+}
+
 fn validate_base_relocation_directory(
     mapped: &[u8],
     pe: &Pe,
     directory: DataDirectory,
-) -> Result<()> {
+) -> Result<usize> {
+    let mut relocations = 0usize;
     ensure!(
         directory.virtual_address.is_multiple_of(4),
         "relocation directory is not DWORD-aligned"
@@ -1422,6 +1897,9 @@ fn validate_base_relocation_directory(
                 (PointerWidth::U64, IMAGE_REL_BASED_DIR64) => 8,
                 _ => bail!("unsupported relocation kind {kind}"),
             };
+            relocations = relocations
+                .checked_add(1)
+                .context("relocation count overflows")?;
             let target_end = target
                 .checked_add(width)
                 .context("relocation target end overflows")?;
@@ -1435,7 +1913,7 @@ fn validate_base_relocation_directory(
         cursor = next;
     }
     ensure!(cursor == end, "relocation directory trailing bytes");
-    Ok(())
+    Ok(relocations)
 }
 
 fn validate_delay_import_directory(mapped: &[u8], pe: &Pe, directory: DataDirectory) -> Result<()> {

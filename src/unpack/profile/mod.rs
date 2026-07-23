@@ -357,10 +357,10 @@ impl SemanticEntry {
 
 /// The entry contract selected from decrypted PE semantics.
 ///
-/// Native images must expose the unique CrackProof-to-CRT handoff proved by
-/// [`SemanticEntry`].  A CLR DLL instead retains its loader bootstrap entry
-/// verbatim: the managed entry token lives in the COM Descriptor and must not
-/// be reinterpreted as a native CRT or DllMain address.
+/// Native executables must expose the unique CrackProof-to-CRT handoff proved
+/// by [`SemanticEntry`]. Native DLLs must expose an authenticated architecture-
+/// specific CRT entry wrapper. A CLR DLL instead derives its managed entry
+/// contract from the COM Descriptor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OutputEntry {
     Native(SemanticEntry),
@@ -387,9 +387,8 @@ impl OutputEntry {
     ///
     /// A managed DLL can legitimately have a zero native AddressOfEntryPoint;
     /// in that case the COR20 header is its authoritative entry contract and
-    /// is retained independently by the COM Descriptor provenance.  A nonzero
-    /// native bootstrap is protected through its entire executable owner
-    /// section because no fixed bootstrap shape is assumed.
+    /// is retained independently by the COM Descriptor provenance. An
+    /// authenticated native DLL startup protects its executable owner section.
     pub(crate) fn protected_ranges(self, pe: &Pe) -> Result<Vec<Range<u32>>> {
         match self {
             Self::Native(entry) => entry.protected_ranges(),
@@ -397,15 +396,15 @@ impl OutputEntry {
             Self::NativeDll { entry_rva } | Self::Managed { entry_rva } => {
                 let section = pe
                     .section_for_rva_range(entry_rva, 1)
-                    .context("locating preserved DLL native-bootstrap entry section")?;
+                    .context("locating authenticated DLL CRT entry section")?;
                 ensure!(
                     section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0,
-                    "preserved DLL native-bootstrap entry RVA {entry_rva:#x} belongs to non-executable section {}",
+                    "authenticated DLL CRT entry RVA {entry_rva:#x} belongs to non-executable section {}",
                     section.index
                 );
                 Ok(vec![section.virtual_range().with_context(|| {
                     format!(
-                        "reading preserved DLL native-bootstrap entry section {} range",
+                        "reading authenticated DLL CRT entry section {} range",
                         section.index
                     )
                 })?])
@@ -414,24 +413,10 @@ impl OutputEntry {
     }
 }
 
-fn validate_preserved_dll_entry(pe: &Pe) -> Result<u32> {
-    let entry_rva = pe.entry_rva;
-    if entry_rva != 0 {
-        let section = pe
-            .section_for_rva_range(entry_rva, 1)
-            .context("locating preserved DLL native-bootstrap entry")?;
-        ensure!(
-            section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0,
-            "preserved DLL native-bootstrap entry RVA {entry_rva:#x} belongs to non-executable section {}",
-            section.index
-        );
-    }
-    Ok(entry_rva)
-}
-/// Selects the decrypted-image entry profile without guessing from the
-/// packed AddressOfEntryPoint.  Only a nonempty COM Descriptor selects the
-/// managed DLL profile; everything else is required to satisfy the native
-/// semantic-entry proof.
+/// Selects the decrypted-image entry profile without trusting the packed
+/// AddressOfEntryPoint. A nonempty COM Descriptor selects the managed DLL
+/// profile; native DLLs and executables must independently authenticate their
+/// respective CRT entry contracts.
 pub(crate) fn discover_output_entry(mapped: &[u8], pe: &Pe) -> Result<OutputEntry> {
     let com_descriptor = pe
         .directories
@@ -447,8 +432,19 @@ pub(crate) fn discover_output_entry(mapped: &[u8], pe: &Pe) -> Result<OutputEntr
     );
     if com_descriptor.is_empty() {
         if pe.is_dll() {
-            return validate_preserved_dll_entry(pe)
-                .map(|entry_rva| OutputEntry::NativeDll { entry_rva });
+            return match pe.machine_kind() {
+                Machine::Amd64 => {
+                    ensure!(
+                        pe.kind() == PeKind::Pe32Plus && pe.pointer_width() == PointerWidth::U64,
+                        "AMD64 DLL discovery requires a PE32+ image with 64-bit pointers"
+                    );
+                    native::amd64::discover_amd64_dll_entry(mapped, pe)
+                        .map(|entry_rva| OutputEntry::NativeDll { entry_rva })
+                }
+                Machine::I386 => bail!(
+                    "I386 native DLL entry discovery is unsupported; refusing to preserve a packed bootstrap"
+                ),
+            };
         }
         return discover_semantic_entry(mapped, pe).map(OutputEntry::Native);
     }

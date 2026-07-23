@@ -11,10 +11,8 @@ pub use image::{read_u32, read_u64, write_u64};
 pub use model::IMAGE_DIRECTORY_ENTRY_SECURITY;
 pub use model::{DataDirectory, Pe};
 #[cfg(test)]
-pub(crate) use model::{
-    IMAGE_FILE_DLL, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386, Section,
-};
-pub(crate) use model::{Machine, PeKind, PointerWidth};
+pub(crate) use model::{IMAGE_FILE_DLL, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386};
+pub(crate) use model::{Machine, PeKind, PointerWidth, Section};
 
 #[cfg(test)]
 mod tests;

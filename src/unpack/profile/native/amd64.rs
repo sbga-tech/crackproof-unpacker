@@ -9,6 +9,15 @@ const AMD64_DEFAULT_SECURITY_COOKIE: u64 = 0x0000_2b99_2ddf_a232;
 const MAX_SEMANTIC_VENEERS: usize = 4_096;
 const MAX_EXECUTABLE_JUMPS: usize = 65_536;
 const MAX_RUNTIME_FUNCTIONS: usize = 131_072;
+const AMD64_DLL_STARTUP_LEN: usize = 0x3d;
+const AMD64_DLL_STARTUP_PREFIX: [u8; 28] = [
+    0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x20, 0x49,
+    0x8b, 0xf8, 0x8b, 0xda, 0x48, 0x8b, 0xf1, 0x83, 0xfa, 0x01, 0x75, 0x05,
+];
+const AMD64_DLL_STARTUP_SUFFIX: [u8; 23] = [
+    0x4c, 0x8b, 0xc7, 0x8b, 0xd3, 0x48, 0x8b, 0xce, 0x48, 0x8b, 0x5c, 0x24, 0x30, 0x48, 0x8b, 0x74,
+    0x24, 0x38, 0x48, 0x83, 0xc4, 0x20, 0x5f,
+];
 
 #[derive(Clone, Copy, Debug)]
 struct JumpPredecessors {
@@ -111,6 +120,122 @@ pub(crate) fn discover_amd64_semantic_entry(mapped: &[u8], pe: &Pe) -> Result<Se
         [entry] => Ok(*entry),
         _ => bail!(
             "found {} structurally valid AMD64 semantic entries",
+            entries.len()
+        ),
+    }
+}
+
+/// Locates the canonical MSVC AMD64 DLL entry wrapper that initializes the
+/// security cookie before transferring to the CRT DllMain dispatcher.
+/// CrackProof's packed header entry is not payload provenance and must not be
+/// retained in a standalone DLL.
+pub(crate) fn discover_amd64_dll_entry(mapped: &[u8], pe: &Pe) -> Result<u32> {
+    let executable_ranges = executable_section_ranges(mapped, pe)?;
+    ensure_executable_scan_bound(&executable_ranges)?;
+    let mut entries = Vec::new();
+
+    for range in &executable_ranges {
+        let Some(last_rva) = range.end.checked_sub(AMD64_DLL_STARTUP_LEN as u32) else {
+            continue;
+        };
+        for entry_rva in range.start..=last_rva {
+            let bytes = mapped_bytes(mapped, entry_rva, AMD64_DLL_STARTUP_LEN)?;
+            if bytes[..AMD64_DLL_STARTUP_PREFIX.len()] != AMD64_DLL_STARTUP_PREFIX
+                || bytes[28] != 0xe8
+                || bytes[33..56] != AMD64_DLL_STARTUP_SUFFIX
+                || bytes[56] != 0xe9
+            {
+                continue;
+            }
+
+            let Some(cookie_initializer_rva) = direct_rel32_target(
+                mapped,
+                entry_rva
+                    .checked_add(28)
+                    .context("AMD64 DLL cookie CALL RVA overflows")?,
+                0xe8,
+            )?
+            else {
+                continue;
+            };
+            let Some(crt_dispatcher_rva) = direct_rel32_target(
+                mapped,
+                entry_rva
+                    .checked_add(56)
+                    .context("AMD64 DLL CRT JMP RVA overflows")?,
+                0xe9,
+            )?
+            else {
+                continue;
+            };
+            if !is_executable_range(
+                &executable_ranges,
+                cookie_initializer_rva,
+                AMD64_COOKIE_EVIDENCE_LEN,
+            )? || !is_executable_range(
+                &executable_ranges,
+                crt_dispatcher_rva,
+                AMD64_STARTUP_LEN,
+            )? {
+                continue;
+            }
+            if amd64_security_cookie_evidence(
+                mapped,
+                pe,
+                &executable_ranges,
+                cookie_initializer_rva,
+            )?
+            .is_none()
+            {
+                continue;
+            }
+
+            let Some(entry_runtime_function_rva) =
+                amd64_runtime_function_evidence(mapped, pe, &executable_ranges, entry_rva)?
+            else {
+                continue;
+            };
+            let Some(cookie_runtime_function_rva) = amd64_runtime_function_evidence(
+                mapped,
+                pe,
+                &executable_ranges,
+                cookie_initializer_rva,
+            )?
+            else {
+                continue;
+            };
+            let Some(dispatcher_runtime_function_rva) = amd64_runtime_function_evidence(
+                mapped,
+                pe,
+                &executable_ranges,
+                crt_dispatcher_rva,
+            )?
+            else {
+                continue;
+            };
+            if read_u32_rva(mapped, entry_runtime_function_rva)? != entry_rva
+                || read_u32_rva(mapped, cookie_runtime_function_rva)? != cookie_initializer_rva
+                || read_u32_rva(mapped, dispatcher_runtime_function_rva)? != crt_dispatcher_rva
+            {
+                continue;
+            }
+
+            ensure!(
+                entries.len() < MAX_SEMANTIC_VENEERS,
+                "AMD64 DLL entry candidate budget of {MAX_SEMANTIC_VENEERS} exceeded"
+            );
+            entries
+                .try_reserve(1)
+                .context("reserving AMD64 DLL entry candidate")?;
+            entries.push(entry_rva);
+        }
+    }
+
+    match entries.as_slice() {
+        [] => bail!("found no structurally valid AMD64 MSVC DLL entry"),
+        [entry_rva] => Ok(*entry_rva),
+        _ => bail!(
+            "found {} structurally valid AMD64 MSVC DLL entries",
             entries.len()
         ),
     }

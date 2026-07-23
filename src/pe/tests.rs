@@ -121,6 +121,9 @@ fn parses_pe32_plus_with_nonidentity_sections_and_wide_addresses() {
     assert_eq!(pe.fixed_optional_header_size(), 0x70);
     assert_eq!(pe.image_base_offset(), 0x98 + 24);
     assert_eq!(pe.number_of_rva_and_sizes_offset(), 0x98 + 108);
+    assert_eq!(pe.coff_symbol_table_offset(), 0x98 - 12);
+    assert_eq!(pe.win32_version_value_offset(), 0x98 + 52);
+    assert_eq!(pe.loader_flags_offset(), 0x98 + 104);
     assert_eq!(pe.data_directory_table_offset, 0x98 + 112);
     assert_eq!(pe.sections[0].header_offset, 0x98 + 0xf0);
     assert_eq!(pe.data_directory_offset(1).unwrap(), 0x98 + 112 + 8);

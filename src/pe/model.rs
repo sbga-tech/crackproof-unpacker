@@ -215,6 +215,25 @@ impl Pe {
             .expect("PE optional-header offset was validated during parsing")
     }
 
+    /// Absolute offset of COFF PointerToSymbolTable; NumberOfSymbols follows it.
+    pub(crate) fn coff_symbol_table_offset(&self) -> usize {
+        self.opt
+            .checked_sub(12)
+            .expect("PE COFF header was validated during parsing")
+    }
+
+    /// Absolute offset of reserved IMAGE_OPTIONAL_HEADER.Win32VersionValue.
+    pub(crate) fn win32_version_value_offset(&self) -> usize {
+        self.optional_header_offset(52)
+    }
+
+    /// Absolute offset of reserved IMAGE_OPTIONAL_HEADER.LoaderFlags.
+    pub(crate) fn loader_flags_offset(&self) -> usize {
+        self.number_of_rva_and_sizes_offset()
+            .checked_sub(4)
+            .expect("PE optional header was validated during parsing")
+    }
+
     /// Absolute offset of IMAGE_OPTIONAL_HEADER.AddressOfEntryPoint.
     pub(crate) fn entry_rva_offset(&self) -> usize {
         self.optional_header_offset(16)

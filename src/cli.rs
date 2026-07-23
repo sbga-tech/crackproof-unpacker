@@ -17,7 +17,20 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_PACKED_INPUT_SIZE: u64 = 512 << 20;
 
 fn usage() -> &'static str {
-    "usage: crackproof-unpacker <packed.exe> <unpacked.exe>\n       crackproof-unpacker --analyze-json <packed.exe>"
+    "usage: crackproof-unpacker <packed.exe> [unpacked.exe]\n       crackproof-unpacker --analyze-json <packed.exe>"
+}
+
+fn default_output_path(packed: &Path) -> Result<PathBuf> {
+    let stem = packed
+        .file_stem()
+        .context("packed input path has no file name")?;
+    let mut name = OsString::from(stem);
+    name.push("_unpacked");
+    if let Some(extension) = packed.extension().filter(|extension| !extension.is_empty()) {
+        name.push(".");
+        name.push(extension);
+    }
+    Ok(packed.with_file_name(name))
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -27,10 +40,13 @@ enum Command {
 }
 
 fn positional_paths(mut args: impl Iterator<Item = OsString>) -> Result<(PathBuf, PathBuf)> {
-    let packed = args.next().ok_or_else(|| anyhow::anyhow!(usage()))?;
-    let output = args.next().ok_or_else(|| anyhow::anyhow!(usage()))?;
+    let packed = PathBuf::from(args.next().ok_or_else(|| anyhow::anyhow!(usage()))?);
+    let output = match args.next() {
+        Some(output) => PathBuf::from(output),
+        None => default_output_path(&packed)?,
+    };
     ensure!(args.next().is_none(), "{}", usage());
-    Ok((PathBuf::from(packed), PathBuf::from(output)))
+    Ok((packed, output))
 }
 
 fn parse_command(mut args: impl Iterator<Item = OsString>) -> Result<Command> {
@@ -218,6 +234,13 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_command([OsString::from("packed.exe")].into_iter()).unwrap(),
+            Command::Unpack {
+                packed: PathBuf::from("packed.exe"),
+                output: PathBuf::from("packed_unpacked.exe"),
+            }
+        );
+        assert_eq!(
             parse_command(
                 [
                     OsString::from("--analyze-json"),
@@ -260,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_exactly_two_plain_paths() {
+    fn accepts_explicit_output_path() {
         assert_eq!(
             positional_paths(
                 [OsString::from("packed.exe"), OsString::from("unpacked.exe")].into_iter()
@@ -268,6 +291,23 @@ mod tests {
             .unwrap(),
             (PathBuf::from("packed.exe"), PathBuf::from("unpacked.exe"))
         );
+    }
+
+    #[test]
+    fn derives_output_beside_input_and_preserves_its_extension() {
+        for (packed, output) in [
+            ("packed.exe", "packed_unpacked.exe"),
+            (
+                "directory/archive.part.dll",
+                "directory/archive.part_unpacked.dll",
+            ),
+            ("directory/no-extension", "directory/no-extension_unpacked"),
+        ] {
+            assert_eq!(
+                positional_paths([OsString::from(packed)].into_iter()).unwrap(),
+                (PathBuf::from(packed), PathBuf::from(output))
+            );
+        }
     }
 
     #[test]
@@ -318,15 +358,20 @@ mod tests {
             positional_paths(vec![packed.clone(), output.clone()].into_iter()).unwrap(),
             (PathBuf::from(packed), PathBuf::from(output))
         );
+
+        let packed = OsString::from_vec(vec![0xff, b'.', b'e', b'x', b'e']);
+        let derived = OsString::from_vec(vec![
+            0xff, b'_', b'u', b'n', b'p', b'a', b'c', b'k', b'e', b'd', b'.', b'e', b'x', b'e',
+        ]);
+        assert_eq!(
+            positional_paths(vec![packed.clone()].into_iter()).unwrap(),
+            (PathBuf::from(packed), PathBuf::from(derived))
+        );
     }
 
     #[test]
-    fn rejects_only_missing_and_extra_arguments() {
-        for args in [
-            &[][..],
-            &["packed.exe"][..],
-            &["packed.exe", "unpacked.exe", "extra"][..],
-        ] {
+    fn rejects_missing_and_extra_arguments() {
+        for args in [&[][..], &["packed.exe", "unpacked.exe", "extra"][..]] {
             let error = positional_paths(args.iter().map(OsString::from)).unwrap_err();
             assert_eq!(error.to_string(), usage());
         }

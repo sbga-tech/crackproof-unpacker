@@ -371,6 +371,135 @@ fn write_amd64_runtime_function(
     image[start + 8..start + AMD64_RUNTIME_FUNCTION_LEN].copy_from_slice(&unwind_rva.to_le_bytes());
 }
 
+#[derive(Clone, Copy)]
+struct Amd64DllLayout {
+    header_aep: u32,
+    entry: u32,
+    cookie_initializer: u32,
+    crt_dispatcher: u32,
+    cookie_cell: u32,
+    runtime_function: u32,
+    unwind_info: u32,
+}
+
+fn place_amd64_dll_entry(
+    image: &mut [u8],
+    entry: u32,
+    cookie_initializer: u32,
+    crt_dispatcher: u32,
+) {
+    const PREFIX: [u8; 28] = [
+        0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x20,
+        0x49, 0x8b, 0xf8, 0x8b, 0xda, 0x48, 0x8b, 0xf1, 0x83, 0xfa, 0x01, 0x75, 0x05,
+    ];
+    const SUFFIX: [u8; 23] = [
+        0x4c, 0x8b, 0xc7, 0x8b, 0xd3, 0x48, 0x8b, 0xce, 0x48, 0x8b, 0x5c, 0x24, 0x30, 0x48, 0x8b,
+        0x74, 0x24, 0x38, 0x48, 0x83, 0xc4, 0x20, 0x5f,
+    ];
+    let start = offset(entry);
+    image[start..start + PREFIX.len()].copy_from_slice(&PREFIX);
+    write_rel32(image, entry + 28, 0xe8, cookie_initializer);
+    image[start + 33..start + 56].copy_from_slice(&SUFFIX);
+    write_rel32(image, entry + 56, 0xe9, crt_dispatcher);
+}
+
+fn amd64_dll_fixture() -> (Vec<u8>, Pe, Amd64DllLayout) {
+    let layout = Amd64DllLayout {
+        header_aep: 0x1010,
+        entry: 0x1200,
+        cookie_initializer: 0x1300,
+        crt_dispatcher: 0x1400,
+        cookie_cell: 0x3000,
+        runtime_function: 0x4000,
+        unwind_info: 0x4040,
+    };
+    let sections = vec![
+        section(
+            0,
+            0x1000,
+            0x1000,
+            IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ,
+        ),
+        section(1, 0x3000, 0x400, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE),
+        section(2, 0x4000, 0x400, IMAGE_SCN_MEM_READ),
+    ];
+    let mut pe = Pe {
+        opt: 0,
+        machine: Machine::Amd64,
+        coff_characteristics: crate::pe::IMAGE_FILE_DLL,
+        section_count: sections.len(),
+        entry_rva: layout.header_aep,
+        image_base: AMD64_IMAGE_BASE,
+        section_alignment: 0x1000,
+        file_alignment: 0x200,
+        size_of_image: 0x5000,
+        size_of_headers: 0x400,
+        checksum_offset: 0,
+        data_directory_table_offset: 0,
+        directories: vec![
+            DataDirectory {
+                virtual_address: 0,
+                size: 0,
+            };
+            16
+        ],
+        sections,
+        file_len: 0,
+    };
+    pe.directories[IMAGE_DIRECTORY_ENTRY_EXCEPTION] = DataDirectory {
+        virtual_address: layout.runtime_function,
+        size: 3 * AMD64_RUNTIME_FUNCTION_LEN as u32,
+    };
+
+    let mut image = vec![0; usize::try_from(pe.size_of_image).unwrap()];
+    image[offset(layout.header_aep)] = 0xc3;
+    place_amd64_dll_entry(
+        &mut image,
+        layout.entry,
+        layout.cookie_initializer,
+        layout.crt_dispatcher,
+    );
+    let cookie_start = offset(layout.cookie_initializer);
+    image[cookie_start..cookie_start + 7].copy_from_slice(&[0x48, 0x8b, 0x05, 0, 0, 0, 0]);
+    write_rip_relative_displacement(
+        &mut image,
+        layout.cookie_initializer,
+        7,
+        3,
+        layout.cookie_cell,
+    );
+    image[cookie_start + 0x10..cookie_start + 0x18]
+        .copy_from_slice(&AMD64_DEFAULT_SECURITY_COOKIE.to_le_bytes());
+    image[offset(layout.cookie_cell)..offset(layout.cookie_cell) + AMD64_POINTER_CELL_LEN]
+        .copy_from_slice(&AMD64_DEFAULT_SECURITY_COOKIE.to_le_bytes());
+    image[offset(layout.crt_dispatcher)..offset(layout.crt_dispatcher) + 0x20].fill(0x90);
+    image[offset(layout.crt_dispatcher)] = 0xc3;
+
+    write_amd64_runtime_function(
+        &mut image,
+        layout.runtime_function,
+        layout.entry,
+        layout.entry + 0x3d,
+        layout.unwind_info,
+    );
+    write_amd64_runtime_function(
+        &mut image,
+        layout.runtime_function + AMD64_RUNTIME_FUNCTION_LEN as u32,
+        layout.cookie_initializer,
+        layout.cookie_initializer + AMD64_COOKIE_EVIDENCE_LEN as u32,
+        layout.unwind_info,
+    );
+    write_amd64_runtime_function(
+        &mut image,
+        layout.runtime_function + 2 * AMD64_RUNTIME_FUNCTION_LEN as u32,
+        layout.crt_dispatcher,
+        layout.crt_dispatcher + 0x20,
+        layout.unwind_info,
+    );
+    image[offset(layout.unwind_info)] = 1;
+    (image, pe, layout)
+}
+
 #[test]
 fn discovers_standard_amd64_msvc_startup_from_cookie_and_runtime_evidence() {
     let (mut image, mut pe, _) = amd64_fixture();
@@ -993,9 +1122,8 @@ fn rejects_executable_jump_candidate_budget_exhaustion() {
 }
 
 #[test]
-fn native_dll_entry_profile_preserves_native_bootstrap_without_crt_inference() {
-    let (image, mut pe, layout) = fixture(0);
-    pe.coff_characteristics |= crate::pe::IMAGE_FILE_DLL;
+fn native_dll_entry_profile_recovers_authenticated_crt_startup() {
+    let (image, pe, layout) = amd64_dll_fixture();
 
     let profile = discover_output_entry(&image, &pe).unwrap();
 
@@ -1005,22 +1133,59 @@ fn native_dll_entry_profile_preserves_native_bootstrap_without_crt_inference() {
             entry_rva: layout.entry
         }
     );
-    assert_eq!(
-        profile.protected_ranges(&pe).unwrap(),
-        vec![layout.first_executable..layout.first_executable + FIRST_EXECUTABLE_SIZE]
-    );
+    assert_ne!(profile.entry_rva(), layout.header_aep);
+    assert_eq!(profile.protected_ranges(&pe).unwrap(), vec![0x1000..0x2000]);
 }
 
 #[test]
-fn native_dll_entry_profile_rejects_non_executable_bootstrap() {
-    let (image, mut pe, layout) = fixture(0);
+fn native_i386_dll_entry_profile_fails_closed() {
+    let (image, mut pe, _) = fixture(0);
     pe.coff_characteristics |= crate::pe::IMAGE_FILE_DLL;
-    pe.entry_rva = layout.non_executable;
 
     let error = discover_output_entry(&image, &pe).unwrap_err().to_string();
 
     assert!(
-        error.contains("belongs to non-executable section"),
+        error.contains("I386 native DLL entry discovery is unsupported"),
+        "{error}"
+    );
+}
+
+#[test]
+fn native_amd64_dll_entry_profile_rejects_missing_cookie_proof() {
+    let (mut image, pe, layout) = amd64_dll_fixture();
+    image[offset(layout.cookie_cell)..offset(layout.cookie_cell) + AMD64_POINTER_CELL_LEN].fill(0);
+
+    let error = discover_output_entry(&image, &pe).unwrap_err().to_string();
+
+    assert!(
+        error.contains("found no structurally valid AMD64 MSVC DLL entry"),
+        "{error}"
+    );
+}
+
+#[test]
+fn native_amd64_dll_entry_profile_rejects_ambiguous_startups() {
+    let (mut image, mut pe, layout) = amd64_dll_fixture();
+    let duplicate_entry = 0x1500;
+    place_amd64_dll_entry(
+        &mut image,
+        duplicate_entry,
+        layout.cookie_initializer,
+        layout.crt_dispatcher,
+    );
+    write_amd64_runtime_function(
+        &mut image,
+        layout.runtime_function + 3 * AMD64_RUNTIME_FUNCTION_LEN as u32,
+        duplicate_entry,
+        duplicate_entry + 0x3d,
+        layout.unwind_info,
+    );
+    pe.directories[IMAGE_DIRECTORY_ENTRY_EXCEPTION].size = 4 * AMD64_RUNTIME_FUNCTION_LEN as u32;
+
+    let error = discover_output_entry(&image, &pe).unwrap_err().to_string();
+
+    assert!(
+        error.contains("found 2 structurally valid AMD64 MSVC DLL entries"),
         "{error}"
     );
 }
@@ -1367,8 +1532,7 @@ fn unchanged_native_profile_does_not_require_sparse_layout() {
 
 #[test]
 fn dll_and_managed_recovered_programs_have_no_code_transform() {
-    let (mut native_image, mut native_pe, native_layout) = fixture(0);
-    native_pe.coff_characteristics |= crate::pe::IMAGE_FILE_DLL;
+    let (mut native_image, native_pe, native_layout) = amd64_dll_fixture();
 
     let native_profile = select_output_entry(&mut native_image, &native_pe).unwrap();
 
