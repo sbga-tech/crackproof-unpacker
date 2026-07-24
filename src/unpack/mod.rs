@@ -36,17 +36,34 @@ fn finish_stage<T>(
 /// unsupported boundary without requiring the caller to parse an error string.
 pub fn analyze(packed: &[u8]) -> AnalysisReport {
     let mut report = AnalysisReport::default();
-    let _ = unpack_recording(packed, &mut report);
+    let _ = unpack_recording(packed, None, &mut report);
+    report
+}
+
+/// Analyzes a CrackProof image whose encrypted payload stream is in a sidecar.
+pub fn analyze_with_sidecar(packed: &[u8], sidecar: &[u8]) -> AnalysisReport {
+    let mut report = AnalysisReport::default();
+    let _ = unpack_recording(packed, Some(sidecar), &mut report);
     report
 }
 
 /// Unpacks one CrackProof-protected PE image into a compact static PE file.
 pub fn unpack(packed: &[u8]) -> Result<Vec<u8>> {
     let mut report = AnalysisReport::default();
-    unpack_recording(packed, &mut report)
+    unpack_recording(packed, None, &mut report)
 }
 
-fn unpack_recording(packed: &[u8], report: &mut AnalysisReport) -> Result<Vec<u8>> {
+/// Unpacks a CrackProof image whose encrypted payload stream is in a sidecar.
+pub fn unpack_with_sidecar(packed: &[u8], sidecar: &[u8]) -> Result<Vec<u8>> {
+    let mut report = AnalysisReport::default();
+    unpack_recording(packed, Some(sidecar), &mut report)
+}
+
+fn unpack_recording(
+    packed: &[u8],
+    sidecar: Option<&[u8]>,
+    report: &mut AnalysisReport,
+) -> Result<Vec<u8>> {
     let packed_pe = finish_stage(
         report,
         AnalysisStep::InputPe,
@@ -71,9 +88,29 @@ fn unpack_recording(packed: &[u8], report: &mut AnalysisReport) -> Result<Vec<u8
         destination_section_index: family.descriptor.destination_section_index,
     });
 
-    let bootstrap = bootstrap::PackedBootstrap::from(&family.descriptor);
-    let decryption = decrypt::decrypt_packed_image(packed, &packed_pe, bootstrap)
-        .context("decrypting packed image");
+    let mut bootstrap = bootstrap::PackedBootstrap::from(&family.descriptor);
+    let decryption = if let Some(sidecar) = sidecar {
+        let descriptor_end = family
+            .descriptor
+            .file_offset
+            .checked_add(detect::KONN_DESCRIPTOR_SIZE)
+            .context("sidecar descriptor range overflows")?;
+        let packed_descriptor = packed
+            .get(family.descriptor.file_offset..descriptor_end)
+            .context("packed KONN descriptor disappeared")?;
+        let sidecar_descriptor = sidecar
+            .get(..detect::KONN_DESCRIPTOR_SIZE)
+            .context("sidecar does not contain a complete KONN descriptor")?;
+        ensure!(
+            sidecar_descriptor == packed_descriptor,
+            "sidecar KONN descriptor does not match the packed image"
+        );
+        bootstrap.descriptor_file_offset = 0;
+        decrypt::decrypt_packed_image_from_source(packed, &packed_pe, sidecar, bootstrap, None)
+    } else {
+        decrypt::decrypt_packed_image(packed, &packed_pe, bootstrap)
+    }
+    .context("decrypting packed image");
     if let Err(error) = &decryption
         && let Some(selection) = error.downcast_ref::<decrypt::DecryptionSelectionError>()
     {

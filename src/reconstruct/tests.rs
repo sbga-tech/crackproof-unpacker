@@ -194,7 +194,7 @@ fn export_scanner_ignores_directory_values_and_rejects_invalid_target() {
 }
 
 #[test]
-fn resource_closure_includes_contiguous_payload_and_rejects_cross_section_payload() {
+fn resource_closure_scans_nonstandard_sections_and_accepts_cross_section_payload() {
     let mut pe = test_pe();
     let mut image = vec![0; 0x3000];
     let root = 0x1100usize;
@@ -212,6 +212,32 @@ fn resource_closure_includes_contiguous_payload_and_rejects_cross_section_payloa
         resource_node(&image, &pe, root as u32, root as u32, 0, &mut nodes).unwrap(),
         Some((root + 0x1d5) as u32)
     );
+    assert_eq!(
+        scan_resource_root(&image, &pe).unwrap(),
+        Some(DataDirectory {
+            virtual_address: root as u32,
+            size: 0x1d8,
+        })
+    );
+    let duplicate_root = 0x1800usize;
+    let duplicate = image[root..root + 0x1d8].to_vec();
+    image[duplicate_root..duplicate_root + duplicate.len()].copy_from_slice(&duplicate);
+    put_u32(
+        &mut image,
+        duplicate_root + 0x48,
+        (duplicate_root + 0x58) as u32,
+    );
+    pe.directories[RESOURCE_DIRECTORY] = DataDirectory {
+        virtual_address: root as u32,
+        size: 0x1d8,
+    };
+    assert_eq!(
+        scan_resource_root(&image, &pe).unwrap(),
+        Some(DataDirectory {
+            virtual_address: root as u32,
+            size: 0x1d8,
+        })
+    );
     pe.sections.push(Section {
         index: 1,
         header_offset: 0x1a0,
@@ -224,8 +250,17 @@ fn resource_closure_includes_contiguous_payload_and_rejects_cross_section_payloa
     });
     pe.section_count = 2;
     pe.size_of_image = 0x3000;
-    put_u32(&mut image, root + 0x48, 0x2000);
-    put_u32(&mut image, root + 0x4c, 1);
+    put_u32(&mut image, root + 0x48, 0x1fff);
+    put_u32(&mut image, root + 0x4c, 2);
+    let mut nodes = 0;
+    assert_eq!(
+        resource_node(&image, &pe, root as u32, root as u32, 0, &mut nodes).unwrap(),
+        Some(0x2001)
+    );
+    let mut required = vec![0; 2];
+    require_raw_rva_range(&pe, &mut required, 0x1fff..0x2001).unwrap();
+    assert_eq!(required, vec![0x1000, 1]);
+    put_u32(&mut image, root + 0x48, 0x3000);
     let mut nodes = 0;
     assert_eq!(
         resource_node(&image, &pe, root as u32, root as u32, 0, &mut nodes).unwrap(),
@@ -561,9 +596,16 @@ fn hidden_relocation_stream_replaces_empty_declared_block() {
     put_u32(&mut image, 0x1504, 12);
     image[0x1508..0x150a].copy_from_slice(&0xa200u16.to_le_bytes());
     put_u64(&mut image, 0x1200, pe.image_base + 0x1600);
+    let hidden_destination = 0x1500..0x150c;
 
     assert_eq!(
-        recover_base_relocation_directory(&image, &pe, declared).unwrap(),
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            declared,
+            std::slice::from_ref(&hidden_destination),
+        )
+        .unwrap(),
         Some(DataDirectory {
             virtual_address: 0x1500,
             size: 12,
@@ -572,13 +614,147 @@ fn hidden_relocation_stream_replaces_empty_declared_block() {
 
     put_u64(&mut image, 0x1200, 0);
     assert_eq!(
-        recover_base_relocation_directory(&image, &pe, declared).unwrap(),
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            declared,
+            std::slice::from_ref(&hidden_destination),
+        )
+        .unwrap(),
         Some(declared)
     );
 }
 
 #[test]
-fn declared_relocations_win_and_hidden_streams_must_be_unique() {
+fn canonical_relocations_merge_declared_reserved_slots() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x1_4000_0000;
+    let mut image = vec![0; 0x2000];
+    let declared = DataDirectory {
+        virtual_address: 0x1400,
+        size: 12,
+    };
+    let selected = DataDirectory {
+        virtual_address: 0x1500,
+        size: 12,
+    };
+    put_u32(&mut image, 0x1400, 0x1000);
+    put_u32(&mut image, 0x1404, 12);
+    image[0x1408..0x140a].copy_from_slice(&0xa200u16.to_le_bytes());
+    put_u32(&mut image, 0x1500, 0x1000);
+    put_u32(&mut image, 0x1504, 12);
+    image[0x1508..0x150a].copy_from_slice(&0xa210u16.to_le_bytes());
+    image[0x150a..0x150c].copy_from_slice(&0x0200u16.to_le_bytes());
+    put_u64(&mut image, 0x1200, pe.image_base + 0x1200);
+    put_u64(&mut image, 0x1210, pe.image_base + 0x1210);
+    let hidden_destination = 0x1500..0x150c;
+
+    let payload = canonical_base_relocation_payload(
+        &image,
+        &pe,
+        declared,
+        Some(selected),
+        std::slice::from_ref(&hidden_destination),
+    )
+    .unwrap();
+    assert_eq!(
+        u32::from_le_bytes(payload[0..4].try_into().unwrap()),
+        0x1000
+    );
+    assert_eq!(u32::from_le_bytes(payload[4..8].try_into().unwrap()), 12);
+    assert_eq!(
+        u16::from_le_bytes(payload[8..10].try_into().unwrap()),
+        0xa200
+    );
+    assert_eq!(
+        u16::from_le_bytes(payload[10..12].try_into().unwrap()),
+        0xa210
+    );
+}
+
+#[test]
+fn dynamic_base_tls_requires_complete_relocation_closure() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x1_4000_0000;
+    pe.sections[0].characteristics = 0xe000_0040;
+    pe.directories[9] = DataDirectory {
+        virtual_address: 0x1100,
+        size: 40,
+    };
+    let mut image = vec![0; 0x2000];
+    image[pe.opt + 70..pe.opt + 72].copy_from_slice(&0x0040u16.to_le_bytes());
+    for (offset, value) in [
+        (0x1100, pe.image_base + 0x1200),
+        (0x1108, pe.image_base + 0x1208),
+        (0x1110, pe.image_base + 0x1210),
+        (0x1118, pe.image_base + 0x1220),
+        (0x1220, pe.image_base + 0x1300),
+    ] {
+        put_u64(&mut image, offset, value);
+    }
+    let selected = DataDirectory {
+        virtual_address: 0x1500,
+        size: 20,
+    };
+    put_u32(&mut image, 0x1500, 0x1000);
+    put_u32(&mut image, 0x1504, 20);
+    for (index, word) in [0xa100u16, 0xa108, 0x0110, 0xa118, 0xa220, 0]
+        .into_iter()
+        .enumerate()
+    {
+        image[0x1508 + index * 2..0x150a + index * 2].copy_from_slice(&word.to_le_bytes());
+    }
+    let empty = DataDirectory {
+        virtual_address: 0,
+        size: 0,
+    };
+    assert!(canonical_base_relocation_payload(&image, &pe, empty, Some(selected), &[]).is_err());
+
+    image[0x150c..0x150e].copy_from_slice(&0xa110u16.to_le_bytes());
+    let payload =
+        canonical_base_relocation_payload(&image, &pe, empty, Some(selected), &[]).unwrap();
+    assert_eq!(u32::from_le_bytes(payload[4..8].try_into().unwrap()), 20);
+    assert_eq!(
+        u16::from_le_bytes(payload[12..14].try_into().unwrap()),
+        0xa110
+    );
+}
+
+#[test]
+fn canonical_relocations_reuse_or_append_storage() {
+    let pe = test_pe();
+    let payload = [0xa5; 12];
+    let selected = DataDirectory {
+        virtual_address: 0x1100,
+        size: 12,
+    };
+    let mut mapped = vec![0; 0x3000];
+    let (directory, generated) =
+        place_base_relocation_payload(&mut mapped, &pe, Some(selected), &payload, 0x3000).unwrap();
+    assert_eq!(directory, selected);
+    assert!(generated.is_empty());
+    assert_eq!(&mapped[0x1100..0x110c], &payload);
+
+    let too_small = DataDirectory {
+        virtual_address: 0x1100,
+        size: 8,
+    };
+    let (directory, generated) =
+        place_base_relocation_payload(&mut mapped, &pe, Some(too_small), &payload, 0x3000).unwrap();
+    assert_eq!(
+        directory,
+        DataDirectory {
+            virtual_address: 0x3000,
+            size: 12,
+        }
+    );
+    assert_eq!(generated, payload);
+}
+
+#[test]
+fn authenticated_relocations_override_nonprovenant_declared_streams() {
     let mut pe = test_pe();
     pe.machine = Machine::Amd64;
     pe.image_base = 0x1_4000_0000;
@@ -598,10 +774,53 @@ fn declared_relocations_win_and_hidden_streams_must_be_unique() {
             pe.image_base + u64::try_from(target).unwrap(),
         );
     }
+    let declared_destination = 0x1400..0x140c;
+    let hidden_destination = 0x1500..0x150c;
 
     assert_eq!(
-        recover_base_relocation_directory(&image, &pe, declared).unwrap(),
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            declared,
+            std::slice::from_ref(&declared_destination),
+        )
+        .unwrap(),
         Some(declared)
+    );
+
+    assert_eq!(
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            declared,
+            std::slice::from_ref(&hidden_destination),
+        )
+        .unwrap(),
+        Some(DataDirectory {
+            virtual_address: 0x1500,
+            size: 12,
+        })
+    );
+
+    let selected = DataDirectory {
+        virtual_address: 0x1500,
+        size: 12,
+    };
+    let payload = canonical_base_relocation_payload(
+        &image,
+        &pe,
+        declared,
+        Some(selected),
+        std::slice::from_ref(&hidden_destination),
+    )
+    .unwrap();
+    assert_eq!(
+        u16::from_le_bytes(payload[8..10].try_into().unwrap()),
+        0xa200
+    );
+    assert_eq!(
+        u16::from_le_bytes(payload[10..12].try_into().unwrap()),
+        0xa210
     );
 
     let empty_declared = DataDirectory {
@@ -610,7 +829,15 @@ fn declared_relocations_win_and_hidden_streams_must_be_unique() {
     };
     put_u32(&mut image, 0x1400, 0);
     put_u32(&mut image, 0x1404, BASE_RELOCATION_BLOCK_HEADER_SIZE as u32);
-    assert!(recover_base_relocation_directory(&image, &pe, empty_declared).is_err());
+    assert!(
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            empty_declared,
+            &[0x1500..0x150c, 0x1600..0x160c],
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -980,6 +1207,7 @@ fn serializer_normalizes_image_section_and_header_fields() {
         0x2000,
         0x1000,
         &[],
+        0x2000,
         0x1000,
         None,
         0,
@@ -988,6 +1216,10 @@ fn serializer_normalizes_image_section_and_header_fields() {
         DataDirectory {
             virtual_address: 0x1100,
             size: 4,
+        },
+        DataDirectory {
+            virtual_address: 0,
+            size: 0,
         },
     )
     .unwrap();
@@ -1040,6 +1272,7 @@ fn serializer_translates_debug_pointer_for_nonidentity_raw_layout() {
         0x2000,
         0x1000,
         &[],
+        0x2000,
         0x1000,
         None,
         0,
@@ -1048,6 +1281,10 @@ fn serializer_translates_debug_pointer_for_nonidentity_raw_layout() {
         DataDirectory {
             virtual_address: 0x1100,
             size: 4,
+        },
+        DataDirectory {
+            virtual_address: 0,
+            size: 0,
         },
     )
     .unwrap();
@@ -1172,6 +1409,7 @@ fn iat_envelope_rejects_cross_section_and_missing_slot() {
             0x3000,
             0x1000,
             &[],
+            0x3000,
             0x1000,
             None,
             0,
@@ -1180,7 +1418,11 @@ fn iat_envelope_rejects_cross_section_and_missing_slot() {
             DataDirectory {
                 virtual_address: 0x1100,
                 size: 4
-            }
+            },
+            DataDirectory {
+                virtual_address: 0,
+                size: 0
+            },
         )
         .is_err()
     );
@@ -1279,6 +1521,7 @@ fn serializer_maps_trimmed_zero_tail_back_to_the_original_image() {
         0x2000,
         0x1000,
         &[],
+        0x2000,
         0x1000,
         None,
         0,
@@ -1287,6 +1530,10 @@ fn serializer_maps_trimmed_zero_tail_back_to_the_original_image() {
         DataDirectory {
             virtual_address: 0x1100,
             size: 4,
+        },
+        DataDirectory {
+            virtual_address: 0,
+            size: 0,
         },
     )
     .unwrap();

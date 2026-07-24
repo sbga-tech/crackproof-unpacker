@@ -15,7 +15,9 @@ use decoder::{CustomDecodeError, decode_custom_stream};
 pub(crate) use decoder::{
     DecoderCandidate, custom_decoder_prefix_is_viable, decode_custom_stream_with_history,
 };
-pub(crate) use replay::{DecryptionSelectionError, decrypt_packed_image};
+pub(crate) use replay::{
+    DecryptionSelectionError, decrypt_packed_image, decrypt_packed_image_from_source,
+};
 
 #[cfg(test)]
 use aes::*;

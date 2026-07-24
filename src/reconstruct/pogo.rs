@@ -9,8 +9,8 @@ use crate::unpack::imports::{ImportSymbol, LoaderDiscovery};
 use super::{
     BASE_RELOCATION_BLOCK_HEADER_SIZE, BASE_RELOCATION_DIRECTORY, EXCEPTION_DIRECTORY,
     EXPORT_DIRECTORY, IAT_DIRECTORY, IMAGE_IMPORT_DESCRIPTOR_SIZE, IMPORT_DIRECTORY, ScanBudget,
-    canonical_import_graph, parse_export_candidate, parse_import_candidate,
-    parse_relocation_candidate, resource_node, rva_slice, u32_at,
+    canonical_import_graph, covered_by_destinations, parse_export_candidate,
+    parse_import_candidate, parse_relocation_candidate, resource_node, rva_slice, u32_at,
     validate_base_relocation_directory, validate_debug_directory, validate_exception_directory,
 };
 
@@ -875,26 +875,6 @@ fn range_contains_span(range: &Range<u32>, start: u32, size: u32) -> bool {
 fn contribution<'a>(gctl: &'a GctlLayout, name: &str) -> Result<&'a Contribution> {
     unique_contribution(gctl, name)
         .with_context(|| format!("GCTL lacks one unique required {name} contribution"))
-}
-
-fn covered_by_destinations(ranges: &[Range<u32>], target: Range<u32>) -> bool {
-    if target.start >= target.end {
-        return false;
-    }
-    let mut cursor = target.start;
-    for range in ranges {
-        if range.end <= cursor {
-            continue;
-        }
-        if range.start > cursor {
-            return false;
-        }
-        cursor = cursor.max(range.end);
-        if cursor >= target.end {
-            return true;
-        }
-    }
-    false
 }
 
 fn read_pointer(mapped: &[u8], width: PointerWidth, rva: u32) -> Result<u64> {

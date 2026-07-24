@@ -5,7 +5,7 @@ use super::records::{f2a0_byte, f2a0_transform_from_dl};
 pub(super) const CUSTOM_DECODER_NODE_SIZE: usize = 3;
 pub(super) const CUSTOM_DECODER_ROOT_NODES: usize = 256;
 pub(super) const CUSTOM_DECODER_MAX_CODE_BITS: usize = 24;
-const MAX_DECODER_PRECURSOR_CANDIDATES: usize = 1 << 27;
+const MAX_DECODER_PRECURSOR_CANDIDATES: usize = 1 << 28;
 const MAX_DECODER_TABLE_NODES: usize = 65_536;
 const MAX_STRUCTURAL_DECODER_CANDIDATES: usize = 64;
 const DECODER_CHEAP_ROOT_PREFILTER: usize = 16;

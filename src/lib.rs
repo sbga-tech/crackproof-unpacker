@@ -8,4 +8,4 @@ pub use report::{
     CodeTransform, DecryptionDetails, GeneratedSemanticClrContainer, ImportSource, ImportSummary,
     ManagedSemanticClrSource, ProtectorInfo, RecoveredProgram, StartupKind,
 };
-pub use unpack::{analyze, unpack};
+pub use unpack::{analyze, analyze_with_sidecar, unpack, unpack_with_sidecar};

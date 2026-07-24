@@ -56,11 +56,17 @@ fn dump_detected_family_for_analysis() {
 fn dump_decrypted_image_for_analysis() {
     let input = std::env::var("CRACKPROOF_ANALYSIS_INPUT").unwrap();
     let output = std::env::var("CRACKPROOF_ANALYSIS_MAPPED").unwrap();
-    let packed = std::fs::read(input).unwrap();
+    let packed = std::fs::read(&input).unwrap();
     let pe = Pe::parse(&packed).unwrap();
     let family = detect::detect_family(&packed, &pe).unwrap();
-    let bootstrap = bootstrap::PackedBootstrap::from(&family.descriptor);
-    let decrypted = decrypt::decrypt_packed_image(&packed, &pe, bootstrap).unwrap();
+    let mut bootstrap = bootstrap::PackedBootstrap::from(&family.descriptor);
+    let sidecar = std::fs::read(format!("{input}._")).ok();
+    let decrypted = if let Some(sidecar) = sidecar.as_deref() {
+        bootstrap.descriptor_file_offset = 0;
+        decrypt::decrypt_packed_image_from_source(&packed, &pe, sidecar, bootstrap, None).unwrap()
+    } else {
+        decrypt::decrypt_packed_image(&packed, &pe, bootstrap).unwrap()
+    };
     std::fs::write(output, decrypted.image).unwrap();
 }
 
@@ -226,6 +232,19 @@ fn descriptor_key_and_unused_tail_word_are_unrestricted() {
     let found = scan_konn_descriptors(&packed, &pe).expect("zero-key descriptor");
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].key, 0);
+}
+
+#[test]
+fn descriptor_prefix_marker_need_not_cover_the_source_length() {
+    let pe = synthetic_pe(0x3000);
+    let mut packed = vec![0; pe.file_len];
+    let mut decoded = decode_konn_words(encrypted_descriptor(0x3000));
+    decoded[6] = 0x3000 + 0x5700;
+    place_words(&mut packed, 0x100, encode_konn_words(decoded));
+
+    let found = scan_konn_descriptors(&packed, &pe).expect("bounded prefix marker");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].source_rva, 0x3000 + 0x5700);
 }
 
 #[test]

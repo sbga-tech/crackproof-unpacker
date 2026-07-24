@@ -42,7 +42,7 @@ pub(crate) enum NestedReplay {
 }
 
 pub(crate) trait NestedRecordReplayer {
-    fn begin_graph(&mut self) -> Result<()>;
+    fn begin_graph(&mut self, extended_profile: bool) -> Result<()>;
 
     fn replay(
         &mut self,
@@ -54,7 +54,8 @@ pub(crate) trait NestedRecordReplayer {
     ) -> Result<NestedReplay>;
 }
 
-fn replay_nested_key_tiers(
+#[allow(clippy::too_many_arguments)]
+fn replay_nested_keys(
     replayer: &mut impl NestedRecordReplayer,
     staged_outer: &[u8],
     bootstrap: PackedBootstrap,
@@ -62,24 +63,29 @@ fn replay_nested_key_tiers(
     keys: &[u32],
     direct_key_count: usize,
     byte_maps: &[(usize, Box<[u8; 256]>)],
+    extended_profile: bool,
 ) -> Result<NestedReplay> {
     ensure!(
         direct_key_count <= keys.len(),
-        "nested direct-key tier exceeds the complete key set"
+        "nested direct-key prefix exceeds the complete key set"
     );
     if direct_key_count != 0 {
-        match replayer.replay(
+        let direct = replayer.replay(
             staged_outer,
             bootstrap,
             record,
             &keys[..direct_key_count],
             byte_maps,
-        )? {
-            NestedReplay::NoMatch => {}
-            result => return Ok(result),
+        )?;
+        if !matches!(direct, NestedReplay::NoMatch)
+            && (!extended_profile || matches!(direct, NestedReplay::Unique(..)))
+        {
+            return Ok(direct);
         }
     }
-    if direct_key_count < keys.len() {
+    if extended_profile {
+        replayer.replay(staged_outer, bootstrap, record, keys, byte_maps)
+    } else if direct_key_count < keys.len() {
         replayer.replay(
             staged_outer,
             bootstrap,
@@ -316,19 +322,21 @@ pub(crate) fn amd64_runtime_header_checksums(
     let Some(header) = mapped.get(..pe.size_of_headers as usize) else {
         return Ok(Vec::new());
     };
-    let (Some(import), Some(resource)) = (
-        pe.directories.get(IMPORT_DIRECTORY).copied(),
-        pe.directories.get(RESOURCE_DIRECTORY).copied(),
-    ) else {
+    let Some(import) = pe.directories.get(IMPORT_DIRECTORY).copied() else {
         return Ok(Vec::new());
     };
-    if import.is_empty() || resource.is_empty() {
+    if import.is_empty() {
         return Ok(Vec::new());
     }
+    let resource = pe
+        .directories
+        .get(RESOURCE_DIRECTORY)
+        .copied()
+        .filter(|directory| !directory.is_empty());
 
     let mut import_rvas = vec![import.virtual_address];
-    for offset in (stage_range.start..stage_range.end.saturating_sub(4 * size_of::<u32>() - 1))
-        .step_by(size_of::<u32>())
+    for offset in
+        (0..staged_outer.len().saturating_sub(4 * size_of::<u32>() - 1)).step_by(size_of::<u32>())
     {
         let values = [
             read_u32_at(staged_outer, offset),
@@ -353,29 +361,32 @@ pub(crate) fn amd64_runtime_header_checksums(
         }
     }
 
-    let resource_size_limit = resource.size.saturating_add(pe.section_alignment);
-    let mut resources = vec![(resource.virtual_address, resource.size)];
-    for offset in (stage_range.start..stage_range.end.saturating_sub(2 * size_of::<u32>() - 1))
-        .step_by(size_of::<u32>())
-    {
-        let (Some(rva), Some(size)) = (
-            read_u32_at(staged_outer, offset),
-            read_u32_at(staged_outer, offset + 4),
-        ) else {
-            continue;
-        };
-        if !rva.is_multiple_of(pe.section_alignment)
-            || size < resource.size
-            || size > resource_size_limit
-            || !size.is_multiple_of(8)
-            || pe
-                .section_for_rva_range(rva, usize::try_from(size).unwrap_or(usize::MAX))
-                .is_err()
+    let mut resources = vec![(0, 0)];
+    if let Some(resource) = resource {
+        resources[0] = (resource.virtual_address, resource.size);
+        let resource_size_limit = resource.size.saturating_add(pe.section_alignment);
+        for offset in (0..staged_outer.len().saturating_sub(2 * size_of::<u32>() - 1))
+            .step_by(size_of::<u32>())
         {
-            continue;
-        }
-        if !resources.contains(&(rva, size)) {
-            resources.push((rva, size));
+            let (Some(rva), Some(size)) = (
+                read_u32_at(staged_outer, offset),
+                read_u32_at(staged_outer, offset + 4),
+            ) else {
+                continue;
+            };
+            if !rva.is_multiple_of(pe.section_alignment)
+                || size < resource.size
+                || size > resource_size_limit
+                || !size.is_multiple_of(8)
+                || rva
+                    .checked_add(size)
+                    .is_none_or(|end| end > pe.size_of_image)
+            {
+                continue;
+            }
+            if !resources.contains(&(rva, size)) {
+                resources.push((rva, size));
+            }
         }
     }
 
@@ -384,10 +395,9 @@ pub(crate) fn amd64_runtime_header_checksums(
         .checked_sub(24)
         .context("AMD64 optional-header offset precedes NT headers")?;
     let mut header_ranges = Vec::<Vec<Range<usize>>>::new();
-    for offset in (stage_range.start
-        ..stage_range
-            .end
-            .saturating_sub(MIN_HEADER_RANGE_COUNT * 2 * size_of::<u32>() - 1))
+    for offset in (0..staged_outer
+        .len()
+        .saturating_sub(MIN_HEADER_RANGE_COUNT * 2 * size_of::<u32>() - 1))
         .step_by(size_of::<u32>())
     {
         let mut ranges = Vec::with_capacity(MAX_HEADER_RANGE_COUNT);
@@ -440,8 +450,8 @@ pub(crate) fn amd64_runtime_header_checksums(
     let relocation_offset = directory_base + BASE_RELOCATION_DIRECTORY * 2 * size_of::<u32>();
     let com_descriptor_offset = directory_base + COM_DESCRIPTOR_DIRECTORY * 2 * size_of::<u32>();
     let mut checksums = Vec::new();
-    for &import_rva in &import_rvas {
-        for &(resource_rva, resource_size) in &resources {
+    for &import_rva in import_rvas.iter().rev() {
+        for &(resource_rva, resource_size) in resources.iter().rev() {
             let mut patched = header.to_vec();
             patched[import_offset..import_offset + 4].copy_from_slice(&import_rva.to_le_bytes());
             patched[resource_offset..resource_offset + 4]
@@ -460,7 +470,7 @@ pub(crate) fn amd64_runtime_header_checksums(
                 variants.push(without_com);
             }
             for patched in variants {
-                for ranges in &header_ranges {
+                for ranges in header_ranges.iter().rev() {
                     let checksum = ranges.iter().fold(0u32, |checksum, range| {
                         checksum ^ crackproof_checksum(&patched[range.clone()], table)
                     });
@@ -474,6 +484,11 @@ pub(crate) fn amd64_runtime_header_checksums(
                 }
             }
         }
+    }
+    if std::env::var_os("CRACKPROOF_TRACE_NESTED").is_some() {
+        eprintln!(
+            "nested header candidates: imports={import_rvas:x?} resources={resources:x?} ranges={header_ranges:?} checksums={checksums:x?}"
+        );
     }
     Ok(checksums)
 }
@@ -573,6 +588,7 @@ fn nested_checksum_bases(
     spans: &[NestedSpan],
     header_checksum: u32,
     table: &[u32; 256],
+    extended_profile: bool,
 ) -> Vec<u32> {
     let mut checksums = Vec::with_capacity(spans.len());
     for span in spans {
@@ -590,6 +606,22 @@ fn nested_checksum_bases(
     for (index, pair) in spans.windows(2).enumerate() {
         if pair[1].descriptor_offset == pair[0].descriptor_offset + 2 * size_of::<u32>() {
             let value = header_checksum ^ checksums[index] ^ checksums[index + 1];
+            if !bases.contains(&value) {
+                bases.push(value);
+            }
+        }
+    }
+    if extended_profile {
+        let mut suffix = 0u32;
+        for index in (0..spans.len()).rev() {
+            if index + 1 == spans.len()
+                || spans[index + 1].descriptor_offset
+                    != spans[index].descriptor_offset + 2 * size_of::<u32>()
+            {
+                suffix = 0;
+            }
+            suffix ^= checksums[index];
+            let value = header_checksum ^ suffix;
             if !bases.contains(&value) {
                 bases.push(value);
             }
@@ -636,12 +668,13 @@ pub(super) fn push_nested_adjacent_scalar_variants(
 }
 
 /// Scalar values with explicit metadata references precede bounded raw-word fallbacks.
-/// `values[..direct_len]` is independently replayable without the speculative suffix.
+/// `values[..direct_len]` records that stronger-evidence prefix for diagnostics.
 struct NestedScalarCandidates {
     values: Vec<u32>,
     direct_len: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn nested_scalar_candidates(
     staged_outer: &[u8],
     bootstrap: PackedBootstrap,
@@ -650,6 +683,7 @@ fn nested_scalar_candidates(
     output_ranges: &[Range<usize>],
     include_outputs: bool,
     image_base: u64,
+    extended_profile: bool,
 ) -> Result<NestedScalarCandidates> {
     let mut values = Vec::new();
     let mut seen = HashSet::new();
@@ -717,6 +751,32 @@ fn nested_scalar_candidates(
             .min(stage_range.end);
         for offset in (start..end).step_by(size_of::<u32>()) {
             if let Some(value) = read_u32_at(staged_outer, offset) {
+                push_nested_scalar_variants(&mut values, &mut seen, value)?;
+            }
+        }
+    }
+
+    if extended_profile {
+        const SELECTOR_TABLE_WORDS: usize = 8;
+        for offset in (stage_range.start
+            ..stage_range
+                .end
+                .saturating_sub(SELECTOR_TABLE_WORDS * size_of::<u32>() - 1))
+            .step_by(size_of::<u32>())
+        {
+            let words = std::array::from_fn::<_, SELECTOR_TABLE_WORDS, _>(|index| {
+                read_u32_at(staged_outer, offset + index * size_of::<u32>()).unwrap_or(0)
+            });
+            if words[..4].contains(&0)
+                || words[4..].iter().any(|&value| value != 0)
+                || words[..4]
+                    .iter()
+                    .enumerate()
+                    .any(|(index, value)| words[..index].contains(value))
+            {
+                continue;
+            }
+            for &value in &words[..4] {
                 push_nested_scalar_variants(&mut values, &mut seen, value)?;
             }
         }
@@ -797,7 +857,22 @@ pub(crate) fn nested_transform_dwords_into(
     destination[transformed_len..].copy_from_slice(&source[transformed_len..]);
 }
 
-fn collect_nested_maps_from_graph(
+fn commit_nested_output_maps(
+    maps: &mut Vec<(usize, Box<[u8; 256]>)>,
+    output_maps: Vec<(usize, Box<[u8; 256]>)>,
+    map_generations: &mut usize,
+) -> bool {
+    if output_maps.is_empty() {
+        return false;
+    }
+    maps.clear();
+    maps.extend(output_maps);
+    *map_generations += 1;
+    *map_generations >= 2
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_nested_maps_from_graph_profile(
     outer: &[u8],
     bootstrap: PackedBootstrap,
     image_base: u64,
@@ -808,8 +883,9 @@ fn collect_nested_maps_from_graph(
     table: &[u32; 256],
     maps: &mut Vec<(usize, Box<[u8; 256]>)>,
     replayer: &mut impl NestedRecordReplayer,
-) -> Result<()> {
-    replayer.begin_graph()?;
+    extended_profile: bool,
+) -> Result<bool> {
+    replayer.begin_graph(extended_profile)?;
     let mut staged_outer = outer.to_vec();
     staged_outer[stage_range.clone()].copy_from_slice(stage_bytes);
     let records = discover_nested_records(&staged_outer, bootstrap, stage_range.clone())?;
@@ -824,8 +900,14 @@ fn collect_nested_maps_from_graph(
     let mut map_generations = 0usize;
 
     for _ in 0..records.len() {
-        let checksum_bases =
-            nested_checksum_bases(&staged_outer, bootstrap, &spans, header_checksum, table);
+        let checksum_bases = nested_checksum_bases(
+            &staged_outer,
+            bootstrap,
+            &spans,
+            header_checksum,
+            table,
+            extended_profile,
+        );
         let mut progress = false;
         for output_pass in 0..=output_ranges.len() {
             let include_outputs = output_pass != 0;
@@ -842,6 +924,7 @@ fn collect_nested_maps_from_graph(
                 output_contexts,
                 include_outputs,
                 image_base,
+                extended_profile,
             )?;
             let mut keys = Vec::new();
             let key_capacity = checksum_bases
@@ -850,38 +933,39 @@ fn collect_nested_maps_from_graph(
                 .min(MAX_NESTED_KEY_CANDIDATES);
             let mut key_set = HashSet::with_capacity(key_capacity);
             let mut direct_key_count = 0;
-            for (phase, scalars) in [
-                &scalar_candidates.values[..scalar_candidates.direct_len],
-                &scalar_candidates.values[scalar_candidates.direct_len..],
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                for &scalar in scalars {
-                    for &base in &checksum_bases {
-                        let key = base ^ scalar;
-                        if !key_set.insert(key) {
-                            continue;
-                        }
-                        ensure!(
-                            keys.len() < MAX_NESTED_KEY_CANDIDATES,
-                            "nested stage produced too many key candidates"
-                        );
-                        keys.push(key);
+            for (scalar_index, &scalar) in scalar_candidates.values.iter().enumerate() {
+                for &base in &checksum_bases {
+                    let key = base ^ scalar;
+                    if !key_set.insert(key) {
+                        continue;
                     }
+                    ensure!(
+                        keys.len() < MAX_NESTED_KEY_CANDIDATES,
+                        "nested stage produced too many key candidates"
+                    );
+                    keys.push(key);
                 }
-                if phase == 0 {
+                if scalar_index + 1 == scalar_candidates.direct_len {
                     direct_key_count = keys.len();
                 }
+            }
+            if std::env::var_os("CRACKPROOF_TRACE_NESTED").is_some() && output_pass == 0 {
+                eprintln!(
+                    "nested keys: bases={checksum_bases:x?} scalars={} direct={} keys={}",
+                    scalar_candidates.values.len(),
+                    scalar_candidates.direct_len,
+                    keys.len()
+                );
             }
             let ordered_records = records.iter().collect::<Vec<_>>();
             for record in ordered_records {
                 if processed.contains(&record.descriptor_offset) {
                     continue;
                 }
-                // A unique output from reference-rooted scalars needs no speculative
-                // raw-word search. Broaden only when the direct tier proves nothing.
-                let replayed = replay_nested_key_tiers(
+                // A unique metadata-rooted result needs no speculative search. If that
+                // prefix is empty or ambiguous, validate the complete candidate set so
+                // a uniquely structured bounded-output candidate can close the graph.
+                let replayed = replay_nested_keys(
                     replayer,
                     &staged_outer,
                     bootstrap,
@@ -889,6 +973,7 @@ fn collect_nested_maps_from_graph(
                     &keys,
                     direct_key_count,
                     maps,
+                    extended_profile,
                 )?;
                 let NestedReplay::Unique(output, selected_key) = replayed else {
                     continue;
@@ -915,7 +1000,7 @@ fn collect_nested_maps_from_graph(
                 let output_maps = lfsr_al_maps(&output);
                 if std::env::var_os("CRACKPROOF_TRACE_NESTED").is_some() {
                     eprintln!(
-                        "nested commit record {:#x}: output_maps={}, generation={}",
+                        "nested commit record {:#x}: key={selected_key:#x} output_maps={}, generation={}",
                         record.descriptor_offset,
                         output_maps.len(),
                         map_generations + usize::from(!output_maps.is_empty())
@@ -928,13 +1013,8 @@ fn collect_nested_maps_from_graph(
                     ));
                     std::fs::write(path, &output).context("writing nested diagnostic output")?;
                 }
-                if !output_maps.is_empty() {
-                    maps.clear();
-                    maps.extend(output_maps);
-                    map_generations += 1;
-                    if map_generations >= 2 {
-                        return Ok(());
-                    }
+                if commit_nested_output_maps(maps, output_maps, &mut map_generations) {
+                    return Ok(true);
                 }
                 progress = true;
                 break;
@@ -947,9 +1027,55 @@ fn collect_nested_maps_from_graph(
             break;
         }
     }
-    Ok(())
+    Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn collect_nested_maps_from_graph(
+    outer: &[u8],
+    bootstrap: PackedBootstrap,
+    image_base: u64,
+    stage_range: Range<usize>,
+    stage_bytes: &[u8],
+    header_checksum: u32,
+    root_spans: &[NestedSpan],
+    table: &[u32; 256],
+    maps: &mut Vec<(usize, Box<[u8; 256]>)>,
+    replayer: &mut impl NestedRecordReplayer,
+) -> Result<bool> {
+    let initial_maps = maps.clone();
+    if collect_nested_maps_from_graph_profile(
+        outer,
+        bootstrap,
+        image_base,
+        stage_range.clone(),
+        stage_bytes,
+        header_checksum,
+        root_spans,
+        table,
+        maps,
+        replayer,
+        false,
+    )? {
+        return Ok(true);
+    }
+    maps.clone_from(&initial_maps);
+    collect_nested_maps_from_graph_profile(
+        outer,
+        bootstrap,
+        image_base,
+        stage_range,
+        stage_bytes,
+        header_checksum,
+        root_spans,
+        table,
+        maps,
+        replayer,
+        true,
+    )
+}
+
+#[allow(clippy::vec_box)]
 pub(crate) fn discover_nested_byte_maps(
     mapped: &[u8],
     pe: &Pe,
@@ -1064,7 +1190,7 @@ pub(crate) fn discover_nested_byte_maps(
                 else {
                     continue;
                 };
-                collect_nested_maps_from_graph(
+                if collect_nested_maps_from_graph(
                     outer,
                     bootstrap,
                     pe.image_base,
@@ -1075,7 +1201,9 @@ pub(crate) fn discover_nested_byte_maps(
                     &table,
                     &mut maps,
                     &mut replayer,
-                )?;
+                )? {
+                    return Ok(maps.into_iter().map(|(_, map)| map).collect());
+                }
             }
         }
     }
@@ -1123,6 +1251,11 @@ pub(crate) fn discover_nested_byte_maps(
                 if !derived.is_empty() {
                     header_checksums = derived;
                 }
+                if std::env::var_os("CRACKPROOF_TRACE_NESTED").is_some() {
+                    eprintln!(
+                        "nested amd64 context {table_offset:#x}: header_checksums={header_checksums:x?}"
+                    );
+                }
             }
             for descriptor_offset in (context_start
                 ..table_offset.saturating_sub(2 * size_of::<u32>() - 1))
@@ -1156,14 +1289,23 @@ pub(crate) fn discover_nested_byte_maps(
                     };
                     let mut staged_outer = outer.to_vec();
                     staged_outer[stage_range.clone()].copy_from_slice(&decoded);
+                    if std::env::var_os("CRACKPROOF_TRACE_NESTED").is_some() {
+                        let record_count =
+                            discover_nested_records(&staged_outer, bootstrap, stage_range.clone())?
+                                .len();
+                        eprintln!(
+                            "nested stage {descriptor_offset:#x}: rva={stage_rva:#x} length={stage_length:#x} key={initial_key:#x} shift={shift} records={record_count}"
+                        );
+                    }
                     if discover_nested_records(&staged_outer, bootstrap, stage_range.clone())?
                         .is_empty()
                     {
                         continue;
                     }
                     let mut candidate_maps = Vec::new();
+                    let mut graph_complete = false;
                     for &header_checksum in &header_checksums {
-                        collect_nested_maps_from_graph(
+                        graph_complete = collect_nested_maps_from_graph(
                             outer,
                             bootstrap,
                             pe.image_base,
@@ -1175,6 +1317,9 @@ pub(crate) fn discover_nested_byte_maps(
                             &mut candidate_maps,
                             &mut replayer,
                         )?;
+                        if graph_complete {
+                            break;
+                        }
                     }
                     for candidate in candidate_maps {
                         if !maps.iter().any(|(_, map)| map == &candidate.1) {
@@ -1184,6 +1329,9 @@ pub(crate) fn discover_nested_byte_maps(
                             );
                             maps.push(candidate);
                         }
+                    }
+                    if graph_complete {
+                        return Ok(maps.into_iter().map(|(_, map)| map).collect());
                     }
                 }
             }

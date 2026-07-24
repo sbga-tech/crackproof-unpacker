@@ -27,6 +27,8 @@ pub(crate) fn detect_family(packed: &[u8], pe: &Pe) -> Result<FamilyEvidence> {
     konn::detect_family(packed, pe)
 }
 
+pub(crate) use konn::KONN_DESCRIPTOR_SIZE;
+
 #[cfg(test)]
 pub(crate) use konn::{
     IMAGE_SCN_MEM_EXECUTE, KONN_MAGIC, KONN_WORD_COUNT, MAX_KONN_CANDIDATES, MAX_KONN_MATCHES,

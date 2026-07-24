@@ -10,14 +10,11 @@ pub(crate) const KONN_MAGIC: u32 = u32::from_le_bytes(*b"KONN");
 pub(crate) const KONN_WORD_COUNT: usize = 8;
 pub(crate) const KONN_DESCRIPTOR_SIZE: usize = KONN_WORD_COUNT * size_of::<u32>();
 pub(crate) const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
-// These caps bound structural candidate processing after the cheap encrypted
-// magic prefilter. They are not family identities.
+// Bound the linear byte-offset prefilter to the CLI's maximum accepted input.
+// Full descriptor decoding happens only after the decoded-magic condition.
 pub(crate) const MAX_KONN_CANDIDATES: usize = 8_000_000;
 pub(crate) const MAX_KONN_MATCHES: usize = 2;
-// Descriptor scanning reads encrypted words at every packed-body byte offset
-// before the magic prefilter can reject it. Bound that total offset work,
-// independently of input size and the post-prefilter candidate cap.
-pub(crate) const MAX_KONN_SCAN_BODY_BYTES: usize = 64 << 20;
+pub(crate) const MAX_KONN_SCAN_BODY_BYTES: usize = 512 << 20;
 
 pub(crate) fn decode_konn_words(encrypted: [u32; KONN_WORD_COUNT]) -> [u32; KONN_WORD_COUNT] {
     let mut decoded = [0u32; KONN_WORD_COUNT];
@@ -115,8 +112,28 @@ pub(crate) fn scan_konn_descriptors(packed: &[u8], pe: &Pe) -> Result<Vec<KonnDe
     let mut matches = Vec::new();
     let mut candidates = 0usize;
     for file_offset in body_range.start..=last_offset {
+        let first = u32::from_le_bytes(
+            packed[file_offset..file_offset + size_of::<u32>()]
+                .try_into()
+                .expect("bounds-checked first KONN word"),
+        );
+        let second_start = file_offset + size_of::<u32>();
+        let second = u32::from_le_bytes(
+            packed[second_start..second_start + size_of::<u32>()]
+                .try_into()
+                .expect("bounds-checked second KONN word"),
+        );
+
+        // This is the decoded KONN magic condition, not a recurrence
+        // round-trip: the recurrence itself is invertible for every input.
+        if second ^ first != KONN_MAGIC {
+            continue;
+        }
+        reserve_konn_candidate(&mut candidates)?;
         let mut encrypted_words = [0u32; KONN_WORD_COUNT];
-        for (index, word) in encrypted_words.iter_mut().enumerate() {
+        encrypted_words[0] = first;
+        encrypted_words[1] = second;
+        for (index, word) in encrypted_words.iter_mut().enumerate().skip(2) {
             let start = file_offset + index * size_of::<u32>();
             *word = u32::from_le_bytes(
                 packed[start..start + size_of::<u32>()]
@@ -124,13 +141,6 @@ pub(crate) fn scan_konn_descriptors(packed: &[u8], pe: &Pe) -> Result<Vec<KonnDe
                     .expect("bounds-checked KONN word"),
             );
         }
-
-        // This is the decoded KONN magic condition, not a recurrence
-        // round-trip: the recurrence itself is invertible for every input.
-        if encrypted_words[1] ^ encrypted_words[0] != KONN_MAGIC {
-            continue;
-        }
-        reserve_konn_candidate(&mut candidates)?;
         let decoded = decode_konn_words(encrypted_words);
         if decoded[2] != pe.entry_rva
             || decoded[5] == 0
@@ -175,7 +185,7 @@ pub(crate) fn scan_konn_descriptors(packed: &[u8], pe: &Pe) -> Result<Vec<KonnDe
         let Ok(destination_section) = pe.section_for_rva_range(decoded[3], source_length) else {
             continue;
         };
-        if pe.section_for_rva_range(decoded[6], source_length).is_err() {
+        if pe.section_containing_rva(decoded[6]).is_none() {
             continue;
         }
 

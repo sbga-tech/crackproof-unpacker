@@ -23,9 +23,9 @@ use super::{
     ensure_source_excludes_security, scan_aes_contexts_in_range,
 };
 
-pub(super) const MAX_DECRYPTION_REPLAY_WORK: usize = 64 << 20;
+pub(super) const MAX_DECRYPTION_REPLAY_WORK: usize = 512 << 20;
 pub(super) const MAX_DECRYPTION_REPLAY_PAIRS: usize = 64;
-pub(super) const MAX_DECRYPTION_AGGREGATE_REPLAY_WORK: usize = 1 << 30;
+pub(super) const MAX_DECRYPTION_AGGREGATE_REPLAY_WORK: usize = 16 << 30;
 
 const MAX_RECORDED_CUSTOM_DECODER_REJECTIONS: usize = 8;
 
@@ -212,16 +212,28 @@ pub(super) struct NestedTransformedSource<'a> {
     source: &'a [u8],
     initial_key: u32,
     byte_map: Option<&'a [u8; 256]>,
+    shift: u32,
     cached_indices: [usize; 2],
     cached_dwords: [u32; 2],
 }
 
 impl<'a> NestedTransformedSource<'a> {
+    #[cfg(test)]
     pub(super) fn new(source: &'a [u8], initial_key: u32, byte_map: Option<&'a [u8; 256]>) -> Self {
+        Self::with_shift(source, initial_key, byte_map, 19)
+    }
+
+    fn with_shift(
+        source: &'a [u8],
+        initial_key: u32,
+        byte_map: Option<&'a [u8; 256]>,
+        shift: u32,
+    ) -> Self {
         Self {
             source,
             initial_key,
             byte_map,
+            shift,
             cached_indices: [usize::MAX; 2],
             cached_dwords: [0; 2],
         }
@@ -241,7 +253,7 @@ impl<'a> NestedTransformedSource<'a> {
             let key_delta = index * index.saturating_sub(1) / 2;
             let round_key = self.initial_key.wrapping_add(key_delta as u32);
             self.cached_dwords[slot] = (ciphertext ^ round_key)
-                .rotate_right(19)
+                .rotate_right(self.shift)
                 .wrapping_sub(index as u32);
             self.cached_indices[slot] = dword_index;
         }
@@ -297,6 +309,17 @@ fn nested_decoder_prefix_is_viable(
     )
 }
 
+fn nested_replay_byte_maps<'a>(
+    extended: bool,
+    fixed_map: &'a [u8; 256],
+    byte_maps: &'a [(usize, Box<[u8; 256]>)],
+) -> impl Iterator<Item = Option<&'a [u8; 256]>> {
+    std::iter::once(None)
+        .chain(extended.then_some(Some(fixed_map)))
+        .chain(byte_maps.iter().map(|(_, map)| Some(map.as_ref())))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn replay_nested_record(
     contexts: &[AesContextMatch],
     staged_outer: &[u8],
@@ -305,6 +328,7 @@ fn replay_nested_record(
     keys: &[u32],
     decoders: &[DecoderCandidate],
     byte_maps: &[(usize, Box<[u8; 256]>)],
+    extended: bool,
 ) -> Result<NestedReplay> {
     let source_range = nested_outer_range(
         bootstrap,
@@ -371,37 +395,38 @@ fn replay_nested_record(
     let mut output = vec![0u8; destination_range.len()];
     let prefix_len = source.len().min(4);
     let mut transformed_prefix = [0u8; 4];
+    let fixed_map = std::array::from_fn(|value| f8_byte(value as u8));
     for context in contexts {
         aes_plaintext.copy_from_slice(source);
         aes256_cbc_decrypt_full_blocks_in_place(&mut aes_plaintext, &context.raw_key);
         for &key in keys {
-            if direct_record {
-                nested_transform_dwords_into(&aes_plaintext, &mut transformed, key, 19);
-                for byte_map in
-                    std::iter::once(None).chain(byte_maps.iter().map(|(_, map)| Some(map.as_ref())))
-                {
-                    let payload = if let Some(byte_map) = byte_map {
-                        for (destination, &source) in mapped_payload.iter_mut().zip(&transformed) {
-                            *destination = byte_map[usize::from(source)];
-                        }
-                        mapped_payload.as_slice()
-                    } else {
-                        transformed.as_slice()
-                    };
-                    consider_output(payload, key)?;
+            let shifts = if extended { 0..u32::BITS } else { 19..20 };
+            for shift in shifts {
+                if direct_record {
+                    nested_transform_dwords_into(&aes_plaintext, &mut transformed, key, shift);
+                    for byte_map in nested_replay_byte_maps(extended, &fixed_map, byte_maps) {
+                        let payload = if let Some(byte_map) = byte_map {
+                            for (destination, &source) in
+                                mapped_payload.iter_mut().zip(&transformed)
+                            {
+                                *destination = byte_map[usize::from(source)];
+                            }
+                            mapped_payload.as_slice()
+                        } else {
+                            transformed.as_slice()
+                        };
+                        consider_output(payload, key)?;
+                    }
+                    continue;
                 }
-                continue;
-            }
 
-            nested_transform_dwords_into(
-                &aes_plaintext[..prefix_len],
-                &mut transformed_prefix[..prefix_len],
-                key,
-                19,
-            );
-            if !std::iter::once(None)
-                .chain(byte_maps.iter().map(|(_, map)| Some(map.as_ref())))
-                .any(|byte_map| {
+                nested_transform_dwords_into(
+                    &aes_plaintext[..prefix_len],
+                    &mut transformed_prefix[..prefix_len],
+                    key,
+                    shift,
+                );
+                if !nested_replay_byte_maps(extended, &fixed_map, byte_maps).any(|byte_map| {
                     decoders.iter().any(|decoder| {
                         nested_decoder_prefix_is_viable(
                             decoder,
@@ -412,49 +437,52 @@ fn replay_nested_record(
                             destination_range.len(),
                         )
                     })
-                })
-            {
-                continue;
-            }
-            for byte_map in
-                std::iter::once(None).chain(byte_maps.iter().map(|(_, map)| Some(map.as_ref())))
-            {
-                if !decoders.iter().any(|decoder| {
-                    nested_decoder_prefix_is_viable(
-                        decoder,
-                        &transformed_prefix[..prefix_len],
-                        byte_map,
-                        source.len(),
-                        history.len(),
-                        destination_range.len(),
-                    )
                 }) {
                     continue;
                 }
-                for decoder in decoders {
-                    if !nested_decoder_prefix_is_viable(
-                        decoder,
-                        &transformed_prefix[..prefix_len],
-                        byte_map,
-                        source.len(),
-                        history.len(),
-                        destination_range.len(),
-                    ) {
+                for byte_map in nested_replay_byte_maps(extended, &fixed_map, byte_maps) {
+                    if !decoders.iter().any(|decoder| {
+                        nested_decoder_prefix_is_viable(
+                            decoder,
+                            &transformed_prefix[..prefix_len],
+                            byte_map,
+                            source.len(),
+                            history.len(),
+                            destination_range.len(),
+                        )
+                    }) {
                         continue;
                     }
-                    let mut payload = NestedTransformedSource::new(&aes_plaintext, key, byte_map);
-                    // The decoder reads only history and bytes below its current write cursor,
-                    // so failed attempts do not require clearing the reusable destination.
-                    if decode_custom_stream_with_history_source_mode(
-                        &decoder.table,
-                        &mut payload,
-                        history,
-                        &mut output,
-                        false,
-                    )
-                    .is_ok()
-                    {
-                        consider_output(&output, key)?;
+                    for decoder in decoders {
+                        if !nested_decoder_prefix_is_viable(
+                            decoder,
+                            &transformed_prefix[..prefix_len],
+                            byte_map,
+                            source.len(),
+                            history.len(),
+                            destination_range.len(),
+                        ) {
+                            continue;
+                        }
+                        let mut payload = NestedTransformedSource::with_shift(
+                            &aes_plaintext,
+                            key,
+                            byte_map,
+                            shift,
+                        );
+                        // The decoder reads only history and bytes below its current write cursor,
+                        // so failed attempts do not require clearing the reusable destination.
+                        if decode_custom_stream_with_history_source_mode(
+                            &decoder.table,
+                            &mut payload,
+                            history,
+                            &mut output,
+                            false,
+                        )
+                        .is_ok()
+                        {
+                            consider_output(&output, key)?;
+                        }
                     }
                 }
             }
@@ -487,15 +515,27 @@ fn replay_nested_record(
 }
 
 struct DecryptionNestedReplayer<'a> {
-    packed: &'a [u8],
+    payload_source: &'a [u8],
     source_file_range: Range<usize>,
     decoders: &'a [DecoderCandidate],
     contexts: Vec<AesContextMatch>,
+    extended_profile: bool,
 }
 
 impl NestedRecordReplayer for DecryptionNestedReplayer<'_> {
-    fn begin_graph(&mut self) -> Result<()> {
-        self.contexts = scan_aes_contexts_in_range(self.packed, self.source_file_range.clone())?;
+    fn begin_graph(&mut self, extended_profile: bool) -> Result<()> {
+        self.extended_profile = extended_profile;
+        self.contexts =
+            scan_aes_contexts_in_range(self.payload_source, self.source_file_range.clone())?;
+        if std::env::var_os("CRACKPROOF_TRACE_NESTED").is_some() {
+            eprintln!(
+                "nested AES contexts: {:?}",
+                self.contexts
+                    .iter()
+                    .map(|context| (context.file_offset, context.seed, context.raw_key))
+                    .collect::<Vec<_>>()
+            );
+        }
         Ok(())
     }
 
@@ -507,6 +547,19 @@ impl NestedRecordReplayer for DecryptionNestedReplayer<'_> {
         keys: &[u32],
         byte_maps: &[(usize, Box<[u8; 256]>)],
     ) -> Result<NestedReplay> {
+        let legacy = replay_nested_record(
+            &self.contexts,
+            staged_outer,
+            bootstrap,
+            record,
+            keys,
+            self.decoders,
+            byte_maps,
+            false,
+        )?;
+        if !self.extended_profile || !matches!(legacy, NestedReplay::NoMatch) {
+            return Ok(legacy);
+        }
         replay_nested_record(
             &self.contexts,
             staged_outer,
@@ -515,6 +568,7 @@ impl NestedRecordReplayer for DecryptionNestedReplayer<'_> {
             keys,
             self.decoders,
             byte_maps,
+            true,
         )
     }
 }
@@ -606,6 +660,7 @@ fn record_replay_rejection(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chain_replays(
     packed: &[u8],
     stream_base: usize,
@@ -771,31 +826,53 @@ pub(crate) fn decrypt_packed_image(
     pe: &Pe,
     bootstrap: PackedBootstrap,
 ) -> Result<DecryptedImage> {
-    let source_file_range = bootstrap_source_file_range(packed, bootstrap)?;
-    let (source_start, outer) = derive_outer_source(packed, bootstrap)?;
-    let source_length = source_file_range.len();
-    let stream_base = source_file_range.end;
     let security_range = pe
         .security_directory_file_range(packed.len())
         .context("validating packed Security Directory against A-record sources")?;
-    ensure_source_excludes_security(&source_file_range, security_range.as_ref())?;
+    decrypt_packed_image_from_source(packed, pe, packed, bootstrap, security_range.as_ref())
+}
+
+pub(crate) fn decrypt_packed_image_from_source(
+    packed: &[u8],
+    pe: &Pe,
+    payload_source: &[u8],
+    bootstrap: PackedBootstrap,
+    source_security_range: Option<&Range<usize>>,
+) -> Result<DecryptedImage> {
+    let source_file_range = bootstrap_source_file_range(payload_source, bootstrap)?;
+    let (source_start, outer) = derive_outer_source(payload_source, bootstrap)?;
+    let source_length = source_file_range.len();
+    let stream_base = source_file_range.end;
+    ensure_source_excludes_security(&source_file_range, source_security_range)?;
 
     let mut mapped = pe.map_image(packed).context("mapping packed PE image")?;
     let records = discover_a_record_run(
         &outer,
         bootstrap,
         stream_base,
-        packed.len(),
+        payload_source.len(),
         mapped.len(),
-        security_range.as_ref(),
+        source_security_range,
     )?;
+    if std::env::var_os("CRACKPROOF_TRACE_RECORDS").is_some() {
+        for (index, record) in records.records.iter().enumerate() {
+            if record.encoded_length == record.destination_length {
+                eprintln!(
+                    "copied_record index={index} source_offset={:#x} length={:#x} destination_rva={:#x}",
+                    record.source_offset, record.encoded_length, record.destination_rva
+                );
+            }
+        }
+    }
     let destination_ranges = merged_a_record_destination_ranges(&records.records)?;
-    let decoder_candidates = discover_decoder_candidates(source_start, packed, source_length)?;
+    let decoder_candidates =
+        discover_decoder_candidates(source_start, payload_source, source_length)?;
     let nested_replayer = DecryptionNestedReplayer {
-        packed,
+        payload_source,
         source_file_range: source_file_range.clone(),
         decoders: &decoder_candidates,
         contexts: Vec::new(),
+        extended_profile: false,
     };
     let mut post_transforms =
         discover_nested_byte_maps(&mapped, pe, bootstrap, &outer, nested_replayer)?
@@ -819,7 +896,7 @@ pub(crate) fn decrypt_packed_image(
     let transform_count = post_transforms.len();
     let decoder_count = decoder_candidates.len();
     let (plan, decryption_details) = select_decryption_plan(
-        packed,
+        payload_source,
         source_file_range,
         stream_base,
         &mapped,
@@ -832,7 +909,7 @@ pub(crate) fn decrypt_packed_image(
             "selecting from {transform_count} payload transforms and {decoder_count} decoder precursors"
         )
     })?;
-    apply_decryption_plan(packed, stream_base, &mut mapped, plan)?;
+    apply_decryption_plan(payload_source, stream_base, &mut mapped, plan)?;
     Ok(DecryptedImage {
         image: mapped,
         destination_ranges,

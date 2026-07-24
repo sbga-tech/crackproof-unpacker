@@ -10,7 +10,7 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, ensure};
-use crackproof_unpacker::{analyze, unpack};
+use crackproof_unpacker::{analyze, analyze_with_sidecar, unpack, unpack_with_sidecar};
 
 #[cfg(test)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -168,10 +168,34 @@ fn read_packed_path(packed_path: &Path) -> Result<Vec<u8>> {
         .with_context(|| format!("reading packed input {}", packed_path.display()))
 }
 
+fn sidecar_path(packed_path: &Path) -> PathBuf {
+    let mut path = packed_path.as_os_str().to_os_string();
+    path.push("._");
+    PathBuf::from(path)
+}
+
+fn read_optional_sidecar(packed_path: &Path) -> Result<Option<Vec<u8>>> {
+    let path = sidecar_path(packed_path);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening sidecar input {}", path.display()));
+        }
+    };
+    read_with_limit(file, MAX_PACKED_INPUT_SIZE)
+        .with_context(|| format!("reading sidecar input {}", path.display()))
+        .map(Some)
+}
+
 fn run_paths(packed_path: &Path, output_path: &Path) -> Result<()> {
     ensure_distinct_input_output(packed_path, output_path)?;
     let packed = read_packed_path(packed_path)?;
-    let output = unpack(&packed)?;
+    let sidecar = read_optional_sidecar(packed_path)?;
+    let output = match sidecar.as_deref() {
+        Some(sidecar) => unpack_with_sidecar(&packed, sidecar)?,
+        None => unpack(&packed)?,
+    };
     ensure_distinct_input_output(packed_path, output_path)?;
     write_output(output_path, &output)?;
     Ok(())
@@ -179,7 +203,11 @@ fn run_paths(packed_path: &Path, output_path: &Path) -> Result<()> {
 
 fn analyze_path(packed_path: &Path) -> Result<crackproof_unpacker::AnalysisReport> {
     let packed = read_packed_path(packed_path)?;
-    Ok(analyze(&packed))
+    let sidecar = read_optional_sidecar(packed_path)?;
+    Ok(match sidecar.as_deref() {
+        Some(sidecar) => analyze_with_sidecar(&packed, sidecar),
+        None => analyze(&packed),
+    })
 }
 
 pub(super) fn run() -> Result<()> {

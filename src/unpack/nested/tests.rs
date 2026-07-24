@@ -32,6 +32,7 @@ fn referenced_output_scalars_precede_exhaustive_output_words() {
         std::slice::from_ref(&output_range),
         true,
         0,
+        true,
     )
     .unwrap();
     let direct = &candidates.values[..candidates.direct_len];
@@ -42,12 +43,12 @@ fn referenced_output_scalars_precede_exhaustive_output_words() {
     assert!(exhaustive.contains(&unreferenced));
 }
 
-struct AmbiguousDirectReplayer {
+struct CompleteCandidateReplayer {
     calls: usize,
 }
 
-impl NestedRecordReplayer for AmbiguousDirectReplayer {
-    fn begin_graph(&mut self) -> Result<()> {
+impl NestedRecordReplayer for CompleteCandidateReplayer {
+    fn begin_graph(&mut self, _extended_profile: bool) -> Result<()> {
         Ok(())
     }
 
@@ -60,16 +61,16 @@ impl NestedRecordReplayer for AmbiguousDirectReplayer {
         _byte_maps: &[(usize, Box<[u8; 256]>)],
     ) -> Result<NestedReplay> {
         self.calls += 1;
-        if keys == [1] {
-            Ok(NestedReplay::Ambiguous)
-        } else {
+        if keys == [1, 2] {
             Ok(NestedReplay::Unique(vec![0], 2))
+        } else {
+            Ok(NestedReplay::Ambiguous)
         }
     }
 }
 
 #[test]
-fn ambiguous_direct_keys_do_not_fall_through_to_speculative_keys() {
+fn direct_and_speculative_keys_are_validated_together() {
     let bootstrap = PackedBootstrap {
         descriptor_file_offset: 0,
         key: 0,
@@ -85,11 +86,151 @@ fn ambiguous_direct_keys_do_not_fall_through_to_speculative_keys() {
         destination_rva: 0,
         destination_length: 2,
     };
-    let mut replayer = AmbiguousDirectReplayer { calls: 0 };
+    let mut replayer = CompleteCandidateReplayer { calls: 0 };
 
-    let result =
-        replay_nested_key_tiers(&mut replayer, &[], bootstrap, &record, &[1, 2], 1, &[]).unwrap();
+    let result = replay_nested_keys(
+        &mut replayer,
+        &[],
+        bootstrap,
+        &record,
+        &[1, 2],
+        1,
+        &[],
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(result, NestedReplay::Unique(vec![0], 2));
+    assert_eq!(replayer.calls, 2);
+}
+
+#[test]
+fn legacy_profile_keeps_direct_ambiguity_terminal() {
+    let bootstrap = PackedBootstrap {
+        descriptor_file_offset: 0,
+        key: 0,
+        destination_rva: 0,
+        source_offset: 0,
+        length: 0,
+        source_rva: 0,
+    };
+    let record = NestedRecord {
+        descriptor_offset: 0,
+        source_rva: 0,
+        encoded_length: 1,
+        destination_rva: 0,
+        destination_length: 2,
+    };
+    let mut replayer = CompleteCandidateReplayer { calls: 0 };
+
+    let result = replay_nested_keys(
+        &mut replayer,
+        &[],
+        bootstrap,
+        &record,
+        &[1, 2],
+        1,
+        &[],
+        false,
+    )
+    .unwrap();
 
     assert_eq!(result, NestedReplay::Ambiguous);
     assert_eq!(replayer.calls, 1);
+}
+
+struct UnstructuredFallbackReplayer {
+    calls: usize,
+}
+
+impl NestedRecordReplayer for UnstructuredFallbackReplayer {
+    fn begin_graph(&mut self, _extended_profile: bool) -> Result<()> {
+        Ok(())
+    }
+
+    fn replay(
+        &mut self,
+        _staged_outer: &[u8],
+        _bootstrap: PackedBootstrap,
+        _record: &NestedRecord,
+        keys: &[u32],
+        _byte_maps: &[(usize, Box<[u8; 256]>)],
+    ) -> Result<NestedReplay> {
+        self.calls += 1;
+        if keys == [1] {
+            Ok(NestedReplay::Unique(vec![1], 1))
+        } else {
+            Ok(NestedReplay::Ambiguous)
+        }
+    }
+}
+
+#[test]
+fn unique_reference_rooted_output_avoids_speculative_replay() {
+    let bootstrap = PackedBootstrap {
+        descriptor_file_offset: 0,
+        key: 0,
+        destination_rva: 0,
+        source_offset: 0,
+        length: 0,
+        source_rva: 0,
+    };
+    let record = NestedRecord {
+        descriptor_offset: 0,
+        source_rva: 0,
+        encoded_length: 1,
+        destination_rva: 0,
+        destination_length: 2,
+    };
+    let mut replayer = UnstructuredFallbackReplayer { calls: 0 };
+
+    let result = replay_nested_keys(
+        &mut replayer,
+        &[],
+        bootstrap,
+        &record,
+        &[1, 2],
+        1,
+        &[],
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(result, NestedReplay::Unique(vec![1], 1));
+    assert_eq!(replayer.calls, 1);
+}
+
+#[test]
+fn nested_map_graph_completes_after_two_nonempty_generations() {
+    let original = Box::new([0x11; 256]);
+    let first = Box::new([0x22; 256]);
+    let second = Box::new([0x33; 256]);
+    let mut maps = vec![(1, original)];
+    let mut generations = 0;
+
+    assert!(!commit_nested_output_maps(
+        &mut maps,
+        Vec::new(),
+        &mut generations
+    ));
+    assert_eq!(generations, 0);
+    assert_eq!(maps[0].1.as_ref(), &[0x11; 256]);
+
+    assert!(!commit_nested_output_maps(
+        &mut maps,
+        vec![(2, first)],
+        &mut generations
+    ));
+    assert_eq!(generations, 1);
+    assert_eq!(maps[0].0, 2);
+    assert_eq!(maps[0].1.as_ref(), &[0x22; 256]);
+
+    assert!(commit_nested_output_maps(
+        &mut maps,
+        vec![(3, second)],
+        &mut generations
+    ));
+    assert_eq!(generations, 2);
+    assert_eq!(maps[0].0, 3);
+    assert_eq!(maps[0].1.as_ref(), &[0x33; 256]);
 }

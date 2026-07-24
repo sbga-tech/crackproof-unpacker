@@ -10,6 +10,7 @@ pub(crate) mod managed;
 
 const EXPORT_DIRECTORY: usize = 0;
 const IMPORT_DIRECTORY: usize = 1;
+const RESOURCE_DIRECTORY: usize = 2;
 const EXCEPTION_DIRECTORY: usize = 3;
 const SECURITY_DIRECTORY: usize = 4;
 const BASE_RELOCATION_DIRECTORY: usize = 5;
@@ -141,22 +142,46 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
     // Only a unique parser-proven winner is stale scaffolding. Competing graphs
     // fail closed in selection; descriptor suffixes coalesce to the winner.
     clear_selected_import_candidate(&mut mapped, &decrypted_pe)?;
-    let retained_directories = recover_directories(&mapped, &decrypted_pe)?;
+    let mut retained_directories =
+        recover_directories(&mapped, &decrypted_pe, &destination_ranges)?;
+    let selected_relocations = retained_directories
+        .iter()
+        .position(|(index, _)| *index == BASE_RELOCATION_DIRECTORY)
+        .map(|index| retained_directories.remove(index).1);
+    let relocation_payload = canonical_base_relocation_payload(
+        &mapped,
+        &decrypted_pe,
+        decrypted_pe.directory(BASE_RELOCATION_DIRECTORY)?,
+        selected_relocations,
+        &destination_ranges,
+    )?;
+    let generated_rva = pe::align_up(decrypted_pe.size_of_image, decrypted_pe.section_alignment)?;
+    let (relocation_directory, relocation_prefix) = place_base_relocation_payload(
+        &mut mapped,
+        &decrypted_pe,
+        selected_relocations,
+        &relocation_payload,
+        generated_rva,
+    )?;
 
     let export = scan_export(&mapped, &decrypted_pe)?;
-    let import_rva = pe::align_up(decrypted_pe.size_of_image, decrypted_pe.section_alignment)?;
+    let relocation_end = generated_rva
+        .checked_add(u32::try_from(relocation_prefix.len())?)
+        .context("generated relocation range overflows")?;
+    let import_rva = pe::align_up(
+        relocation_end,
+        u32::try_from(decrypted_pe.pointer_width().bytes())?,
+    )?;
     let emission = emit_imports(&decrypted_pe, &discovery, import_rva)?;
-    let import_end = import_rva
-        .checked_add(u32::try_from(emission.bytes.len())?)
-        .context("import section RVA overflows")?;
-    let import_virtual_size = pe::align_up(
-        import_end
-            .checked_sub(import_rva)
-            .context("import section underflows")?,
+    let mut generated = relocation_prefix;
+    generated.resize(usize::try_from(import_rva - generated_rva)?, 0);
+    generated.extend_from_slice(&emission.bytes);
+    let generated_virtual_size = pe::align_up(
+        u32::try_from(generated.len())?,
         decrypted_pe.section_alignment,
     )?;
-    let final_image_size = import_rva
-        .checked_add(import_virtual_size)
+    let final_image_size = generated_rva
+        .checked_add(generated_virtual_size)
         .context("final SizeOfImage overflows")?;
 
     initialize_iat_cells(
@@ -169,17 +194,18 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
     let mut output = serialize_sections(
         &mapped,
         &decrypted_pe,
+        generated_rva,
+        generated_virtual_size,
+        &generated,
         import_rva,
-        import_virtual_size,
-        &emission.bytes,
         output_entry.entry_rva(),
         export.as_ref(),
         emission.directory_size,
         final_image_size,
         &retained_directories,
         iat_directory,
+        relocation_directory,
     )?;
-
     let parsed = Pe::parse(&output).context("parsing reconstructed PE")?;
     pe::write_u32(&mut output, parsed.checksum_offset, 0)?;
     let checksum = pe::pe_checksum(&output, parsed.checksum_offset)?;
@@ -209,6 +235,13 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
         final_pe.directory(IAT_DIRECTORY)? == iat_directory,
         "serialized IAT directory differs from canonical envelope"
     );
+    ensure!(
+        final_pe.directory(BASE_RELOCATION_DIRECTORY)? == relocation_directory,
+        "serialized base-relocation directory differs from canonical output"
+    );
+    if !relocation_directory.is_empty() {
+        validate_base_relocation_directory(&final_mapped, &final_pe, relocation_directory)?;
+    }
     let aggregates = section_aggregate_sizes(final_pe.sections.iter().map(|section| {
         Ok((
             section.raw_size,
@@ -782,13 +815,19 @@ fn compact_raw_layout(
 
 fn require_raw_rva_range(pe: &Pe, required: &mut [u32], range: Range<u32>) -> Result<()> {
     ensure!(range.start < range.end, "required raw range is empty");
-    let section =
-        pe.section_for_rva_range(range.start, usize::try_from(range.end - range.start)?)?;
-    let end = range.end - section.virtual_address;
-    let prefix = required
-        .get_mut(section.index)
-        .context("section index exceeds raw-layout state")?;
-    *prefix = (*prefix).max(end);
+    let mut cursor = range.start;
+    while cursor < range.end {
+        let section = pe
+            .section_containing_rva(cursor)
+            .with_context(|| format!("RVA {cursor:#x} is not contained in a section"))?;
+        let section_end = section.virtual_range()?.end.min(range.end);
+        ensure!(section_end > cursor, "required raw range does not advance");
+        let prefix = required
+            .get_mut(section.index)
+            .context("section index exceeds raw-layout state")?;
+        *prefix = (*prefix).max(section_end - section.virtual_address);
+        cursor = section_end;
+    }
     Ok(())
 }
 
@@ -909,18 +948,21 @@ fn serialize_recovered_sections(
     Ok(output)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serialize_sections(
     mapped: &[u8],
     pe: &Pe,
+    generated_rva: u32,
+    generated_virtual_size: u32,
+    generated: &[u8],
     import_rva: u32,
-    import_virtual_size: u32,
-    import: &[u8],
     entry_rva: u32,
     export: Option<&ExportCandidate>,
     import_directory_size: u32,
     final_image_size: u32,
     retained_directories: &[(usize, DataDirectory)],
     iat_directory: DataDirectory,
+    relocation_directory: DataDirectory,
 ) -> Result<Vec<u8>> {
     let section_table_end = pe
         .sections
@@ -930,7 +972,7 @@ fn serialize_sections(
         + SECTION_HEADER_SIZE;
     ensure!(
         section_table_end + SECTION_HEADER_SIZE <= usize::try_from(pe.size_of_headers)?,
-        "PE headers have no room for normalized import section"
+        "PE headers have no room for normalized metadata section"
     );
     let mut output = vec![0; usize::try_from(pe.size_of_headers)?];
     let header_bytes = mapped
@@ -987,6 +1029,14 @@ fn serialize_sections(
         },
     )?;
     write_directory(&mut output, pe, IAT_DIRECTORY, iat_directory)?;
+    if !relocation_directory.is_empty() {
+        write_directory(
+            &mut output,
+            pe,
+            BASE_RELOCATION_DIRECTORY,
+            relocation_directory,
+        )?;
+    }
     let raw_layout = compact_raw_layout(mapped, pe, retained_directories)?;
     for (section, layout) in pe.sections.iter().zip(&raw_layout) {
         let payload = mapped
@@ -1023,51 +1073,50 @@ fn serialize_sections(
         .checked_add(raw_layout.last().expect("nonempty raw layout").raw_size)
         .context("raw section cursor overflows")?;
     ensure!(
-        u32::try_from(import.len())? <= import_virtual_size,
-        "import payload exceeds virtual section"
+        u32::try_from(generated.len())? <= generated_virtual_size,
+        "generated metadata exceeds virtual section"
     );
-    let raw_size = if import.is_empty() {
+    let raw_size = if generated.is_empty() {
         0
     } else {
-        pe::align_up(u32::try_from(import.len())?, pe.file_alignment)?
+        pe::align_up(u32::try_from(generated.len())?, pe.file_alignment)?
     };
-    let import_layout = RawSectionLayout {
-        virtual_range: import_rva
-            ..import_rva
-                .checked_add(import_virtual_size)
-                .context("import virtual range overflows")?,
+    let generated_layout = RawSectionLayout {
+        virtual_range: generated_rva
+            ..generated_rva
+                .checked_add(generated_virtual_size)
+                .context("generated metadata virtual range overflows")?,
         raw_pointer: raw_cursor,
         raw_size,
     };
     write_section_header(
         &mut output,
         section_table_end,
-        b".cpimp\0\0",
-        import_virtual_size,
-        import_rva,
-        import_layout.raw_size,
-        if import_layout.raw_size == 0 {
+        b".cpmeta\0",
+        generated_virtual_size,
+        generated_rva,
+        generated_layout.raw_size,
+        if generated_layout.raw_size == 0 {
             0
         } else {
-            import_layout.raw_pointer
+            generated_layout.raw_pointer
         },
         IMPORT_SECTION_CHARACTERISTICS,
     )?;
     append_payload(
         &mut output,
-        import_layout.raw_pointer,
-        import_layout.raw_size,
-        import,
+        generated_layout.raw_pointer,
+        generated_layout.raw_size,
+        generated,
     )?;
-    let aggregates =
-        section_aggregate_sizes((0..usize::try_from(pe.section_count + 1)?).map(|index| {
-            let offset = pe.sections[0].header_offset + index * SECTION_HEADER_SIZE;
-            Ok((
-                u32_at(&output, offset + 16)?,
-                u32_at(&output, offset + 8)?,
-                u32_at(&output, offset + 36)?,
-            ))
-        }))?;
+    let aggregates = section_aggregate_sizes((0..pe.section_count + 1).map(|index| {
+        let offset = pe.sections[0].header_offset + index * SECTION_HEADER_SIZE;
+        Ok((
+            u32_at(&output, offset + 16)?,
+            u32_at(&output, offset + 8)?,
+            u32_at(&output, offset + 36)?,
+        ))
+    }))?;
     pe::write_u32(&mut output, pe.size_of_code_offset(), aggregates.0)?;
     pe::write_u32(
         &mut output,
@@ -1165,6 +1214,7 @@ fn append_payload(
     output[start..start + payload.len()].copy_from_slice(payload);
     Ok(())
 }
+#[allow(clippy::too_many_arguments)]
 fn write_section_header(
     output: &mut [u8],
     offset: usize,
@@ -1251,7 +1301,31 @@ fn rewrite_debug_raw_pointers(
     Ok(())
 }
 
-fn recover_directories(mapped: &[u8], pe: &Pe) -> Result<Vec<(usize, DataDirectory)>> {
+fn covered_by_destinations(ranges: &[Range<u32>], target: Range<u32>) -> bool {
+    if target.start >= target.end {
+        return false;
+    }
+    let mut cursor = target.start;
+    for range in ranges {
+        if range.end <= cursor {
+            continue;
+        }
+        if range.start > cursor {
+            return false;
+        }
+        cursor = cursor.max(range.end);
+        if cursor >= target.end {
+            return true;
+        }
+    }
+    false
+}
+
+fn recover_directories(
+    mapped: &[u8],
+    pe: &Pe,
+    destination_ranges: &[Range<u32>],
+) -> Result<Vec<(usize, DataDirectory)>> {
     let mut result = Vec::new();
     for (index, directory) in pe.directories.iter().copied().enumerate() {
         if matches!(
@@ -1261,7 +1335,9 @@ fn recover_directories(mapped: &[u8], pe: &Pe) -> Result<Vec<(usize, DataDirecto
             continue;
         }
         if index == BASE_RELOCATION_DIRECTORY {
-            if let Some(directory) = recover_base_relocation_directory(mapped, pe, directory)? {
+            if let Some(directory) =
+                recover_base_relocation_directory(mapped, pe, directory, destination_ranges)?
+            {
                 result.push((index, directory));
             }
             continue;
@@ -1271,7 +1347,7 @@ fn recover_directories(mapped: &[u8], pe: &Pe) -> Result<Vec<(usize, DataDirecto
         }
         let directory = if index == 2 {
             scan_resource_root(mapped, pe)?
-                .context("nonempty Resource Directory has no unique valid raw root")?
+                .context("nonempty Resource Directory has no unique valid root")?
         } else {
             validate_retained_directory(mapped, pe, index, directory)?;
             directory
@@ -1662,19 +1738,331 @@ fn recover_base_relocation_directory(
     mapped: &[u8],
     pe: &Pe,
     declared: DataDirectory,
+    destination_ranges: &[Range<u32>],
 ) -> Result<Option<DataDirectory>> {
-    if !declared.is_empty() {
-        let relocations = validate_base_relocation_directory(mapped, pe, declared)?;
-        if relocations != 0 {
-            return Ok(Some(declared));
-        }
+    let (declared_range, declared_relocations) = if declared.is_empty() {
+        (None, 0)
+    } else {
+        let range = declared
+            .checked_rva_range()?
+            .context("declared relocation directory is partial")?;
+        (
+            Some(range),
+            validate_base_relocation_directory(mapped, pe, declared)?,
+        )
+    };
+    if declared_relocations != 0
+        && declared_range
+            .as_ref()
+            .is_some_and(|range| covered_by_destinations(destination_ranges, range.clone()))
+    {
+        return Ok(Some(declared));
     }
 
-    let discovered = scan_base_relocation_directory(mapped, pe)?;
-    Ok(discovered.or_else(|| (!declared.is_empty()).then_some(declared)))
+    let discovered =
+        scan_base_relocation_directory(mapped, pe, declared_range.as_ref(), destination_ranges)?;
+    if let Some(discovered) = discovered {
+        return Ok(Some(discovered));
+    }
+    Ok(declared_range.is_some().then_some(declared))
 }
 
-fn scan_base_relocation_directory(mapped: &[u8], pe: &Pe) -> Result<Option<DataDirectory>> {
+#[derive(Clone, Copy)]
+struct BaseRelocationSlot {
+    target_rva: u32,
+    kind: u16,
+}
+
+fn base_relocation_slots(
+    mapped: &[u8],
+    pe: &Pe,
+    directory: DataDirectory,
+) -> Result<Vec<BaseRelocationSlot>> {
+    validate_base_relocation_directory(mapped, pe, directory)?;
+    let end = directory
+        .virtual_address
+        .checked_add(directory.size)
+        .context("relocation directory overflow")?;
+    let mut cursor = directory.virtual_address;
+    let mut slots = Vec::new();
+    while cursor < end {
+        let header = rva_slice(mapped, pe, cursor, BASE_RELOCATION_BLOCK_HEADER_SIZE)
+            .expect("validated relocation header");
+        let page = u32::from_le_bytes(header[0..4].try_into().expect("four bytes"));
+        let block_size = u32::from_le_bytes(header[4..8].try_into().expect("four bytes"));
+        let next = cursor
+            .checked_add(block_size)
+            .context("relocation block overflow")?;
+        if page != 0 {
+            for entry_offset in (BASE_RELOCATION_BLOCK_HEADER_SIZE as u32..block_size).step_by(2) {
+                let entry_rva = cursor
+                    .checked_add(entry_offset)
+                    .context("relocation entry overflow")?;
+                let entry =
+                    rva_slice(mapped, pe, entry_rva, 2).expect("validated relocation entry");
+                let word = u16::from_le_bytes(entry.try_into().expect("two bytes"));
+                slots.push(BaseRelocationSlot {
+                    target_rva: page
+                        .checked_add(u32::from(word & 0x0fff))
+                        .context("relocation target overflow")?,
+                    kind: word >> 12,
+                });
+            }
+        }
+        cursor = next;
+    }
+    Ok(slots)
+}
+
+fn relocation_width(pe: &Pe, kind: u16) -> Result<usize> {
+    match (pe.pointer_width(), kind) {
+        (PointerWidth::U32, IMAGE_REL_BASED_HIGHLOW) => Ok(4),
+        (PointerWidth::U64, IMAGE_REL_BASED_DIR64) => Ok(8),
+        _ => bail!("unsupported relocation kind {kind}"),
+    }
+}
+
+fn validate_preferred_relocation_value(
+    mapped: &[u8],
+    pe: &Pe,
+    slot: BaseRelocationSlot,
+) -> Result<()> {
+    let width = relocation_width(pe, slot.kind)?;
+    let bytes = rva_slice(mapped, pe, slot.target_rva, width)
+        .context("relocation target is not section-backed")?;
+    let value = match pe.pointer_width() {
+        PointerWidth::U32 => u64::from(u32::from_le_bytes(bytes.try_into().expect("four bytes"))),
+        PointerWidth::U64 => u64::from_le_bytes(bytes.try_into().expect("eight bytes")),
+    };
+    let image_end = pe
+        .image_base
+        .checked_add(u64::from(pe.size_of_image))
+        .context("preferred image range overflows")?;
+    ensure!(
+        value >= pe.image_base && value < image_end,
+        "relocation target {:#x} does not hold a preferred-image VA",
+        slot.target_rva
+    );
+    Ok(())
+}
+
+fn overlaps_destinations(ranges: &[Range<u32>], target: Range<u32>) -> bool {
+    ranges
+        .iter()
+        .any(|range| range.start < target.end && target.start < range.end)
+}
+
+fn has_effective_relocation(entries: &[BaseRelocationSlot], target_rva: u32) -> bool {
+    entries
+        .binary_search_by_key(&target_rva, |entry| entry.target_rva)
+        .is_ok()
+}
+
+fn validate_tls_relocation_closure(
+    mapped: &[u8],
+    pe: &Pe,
+    entries: &[BaseRelocationSlot],
+) -> Result<()> {
+    let characteristics = u16::from_le_bytes(
+        mapped
+            .get(pe.opt + 70..pe.opt + 72)
+            .context("DLL characteristics exceed mapped headers")?
+            .try_into()
+            .expect("two bytes"),
+    );
+    if characteristics & 0x0040 == 0 {
+        return Ok(());
+    }
+    let directory = pe.directory(9)?;
+    if directory.is_empty() {
+        return Ok(());
+    }
+    validate_tls_directory(mapped, pe, directory)?;
+    let width = pe.pointer_width().bytes();
+    let header = rva_slice(mapped, pe, directory.virtual_address, width * 4)
+        .context("TLS VA fields are not section-backed")?;
+    let read_pointer = |bytes: &[u8]| match pe.pointer_width() {
+        PointerWidth::U32 => u64::from(u32::from_le_bytes(bytes.try_into().expect("four bytes"))),
+        PointerWidth::U64 => u64::from_le_bytes(bytes.try_into().expect("eight bytes")),
+    };
+    for index in 0..4usize {
+        let value = read_pointer(&header[index * width..(index + 1) * width]);
+        if value == 0 {
+            continue;
+        }
+        va_to_rva(pe, value)?.context("TLS field VA is unexpectedly null")?;
+        let field_rva = directory
+            .virtual_address
+            .checked_add(u32::try_from(index * width)?)
+            .context("TLS field RVA overflows")?;
+        ensure!(
+            has_effective_relocation(entries, field_rva),
+            "dynamic-base TLS field at RVA {field_rva:#x} lacks a base relocation"
+        );
+    }
+
+    let callbacks_va = read_pointer(&header[3 * width..4 * width]);
+    let Some(callbacks_rva) = va_to_rva(pe, callbacks_va)? else {
+        return Ok(());
+    };
+    for index in 0..4096usize {
+        let cell_rva = callbacks_rva
+            .checked_add(u32::try_from(index * width)?)
+            .context("TLS callback cell RVA overflows")?;
+        let cell = rva_slice(mapped, pe, cell_rva, width)
+            .context("TLS callback cell is not section-backed")?;
+        if read_pointer(cell) == 0 {
+            return Ok(());
+        }
+        ensure!(
+            has_effective_relocation(entries, cell_rva),
+            "TLS callback cell at RVA {cell_rva:#x} lacks a base relocation"
+        );
+    }
+    bail!("TLS callback array has no bounded terminator")
+}
+
+fn emit_base_relocation_payload(entries: &[BaseRelocationSlot]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < entries.len() {
+        let page = entries[cursor].target_rva & !0x0fff;
+        let block_start = output.len();
+        output.extend_from_slice(&page.to_le_bytes());
+        output.extend_from_slice(&0u32.to_le_bytes());
+        let mut count = 0usize;
+        while cursor < entries.len() && entries[cursor].target_rva & !0x0fff == page {
+            let entry = entries[cursor];
+            let offset = u16::try_from(entry.target_rva - page)?;
+            output.extend_from_slice(&((entry.kind << 12) | offset).to_le_bytes());
+            cursor += 1;
+            count += 1;
+        }
+        if !count.is_multiple_of(2) {
+            output.extend_from_slice(&0u16.to_le_bytes());
+        }
+        let block_size = u32::try_from(output.len() - block_start)?;
+        output[block_start + 4..block_start + 8].copy_from_slice(&block_size.to_le_bytes());
+    }
+    Ok(output)
+}
+
+fn canonical_base_relocation_payload(
+    mapped: &[u8],
+    pe: &Pe,
+    declared: DataDirectory,
+    selected: Option<DataDirectory>,
+    destination_ranges: &[Range<u32>],
+) -> Result<Vec<u8>> {
+    let selected_slots = selected
+        .map(|directory| base_relocation_slots(mapped, pe, directory))
+        .transpose()?
+        .unwrap_or_default();
+    let placeholders = selected_slots
+        .iter()
+        .filter(|slot| slot.kind == IMAGE_REL_BASED_ABSOLUTE)
+        .map(|slot| slot.target_rva)
+        .collect::<BTreeSet<_>>();
+    let mut entries = selected_slots
+        .into_iter()
+        .filter(|slot| slot.kind != IMAGE_REL_BASED_ABSOLUTE)
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|slot| slot.target_rva);
+    for pair in entries.windows(2) {
+        ensure!(
+            pair[0].target_rva != pair[1].target_rva || pair[0].kind == pair[1].kind,
+            "selected relocation stream has conflicting target kinds"
+        );
+    }
+    entries.dedup_by_key(|slot| slot.target_rva);
+
+    if !declared.is_empty() {
+        for slot in base_relocation_slots(mapped, pe, declared)? {
+            if slot.kind == IMAGE_REL_BASED_ABSOLUTE {
+                continue;
+            }
+            match entries.binary_search_by_key(&slot.target_rva, |entry| entry.target_rva) {
+                Ok(index) => ensure!(
+                    entries[index].kind == slot.kind,
+                    "declared and selected relocations disagree at RVA {:#x}",
+                    slot.target_rva
+                ),
+                Err(index) => {
+                    let width = u32::try_from(relocation_width(pe, slot.kind)?)?;
+                    let target = slot.target_rva
+                        ..slot
+                            .target_rva
+                            .checked_add(width)
+                            .context("declared relocation target range overflows")?;
+                    if placeholders.contains(&slot.target_rva)
+                        || !overlaps_destinations(destination_ranges, target)
+                    {
+                        validate_preferred_relocation_value(mapped, pe, slot)?;
+                        entries.insert(index, slot);
+                    }
+                }
+            }
+        }
+    }
+    for &entry in &entries {
+        validate_preferred_relocation_value(mapped, pe, entry)?;
+    }
+    validate_tls_relocation_closure(mapped, pe, &entries)?;
+    emit_base_relocation_payload(&entries)
+}
+
+fn place_base_relocation_payload(
+    mapped: &mut [u8],
+    pe: &Pe,
+    selected: Option<DataDirectory>,
+    payload: &[u8],
+    append_rva: u32,
+) -> Result<(DataDirectory, Vec<u8>)> {
+    if payload.is_empty() {
+        return Ok((
+            DataDirectory {
+                virtual_address: 0,
+                size: 0,
+            },
+            Vec::new(),
+        ));
+    }
+    if let Some(selected) = selected
+        && u32::try_from(payload.len())? <= selected.size
+        && rva_slice(mapped, pe, selected.virtual_address, payload.len()).is_some()
+    {
+        let start = usize::try_from(selected.virtual_address)?;
+        let end = start
+            .checked_add(payload.len())
+            .context("canonical relocation range overflows")?;
+        mapped
+            .get_mut(start..end)
+            .context("canonical relocation range exceeds mapped image")?
+            .copy_from_slice(payload);
+        return Ok((
+            DataDirectory {
+                virtual_address: selected.virtual_address,
+                size: u32::try_from(payload.len())?,
+            },
+            Vec::new(),
+        ));
+    }
+
+    Ok((
+        DataDirectory {
+            virtual_address: append_rva,
+            size: u32::try_from(payload.len())?,
+        },
+        payload.to_vec(),
+    ))
+}
+
+fn scan_base_relocation_directory(
+    mapped: &[u8],
+    pe: &Pe,
+    declared_range: Option<&Range<u32>>,
+    destination_ranges: &[Range<u32>],
+) -> Result<Option<DataDirectory>> {
     let mut starts = 0usize;
     let mut candidates = Vec::new();
     let mut budget = ScanBudget::default();
@@ -1698,15 +2086,24 @@ fn scan_base_relocation_directory(mapped: &[u8], pe: &Pe) -> Result<Option<DataD
             );
             if let Some(candidate) = parse_relocation_candidate(mapped, pe, rva, end, &mut budget)?
             {
-                ensure!(
-                    candidates.len() < MAX_SCAN_CANDIDATES,
-                    "relocation scan candidate budget exceeded"
-                );
-                candidates.push(candidate);
-                rva = candidate
-                    .virtual_address
-                    .checked_add(candidate.size)
-                    .context("relocation candidate end overflows")?;
+                let candidate_range = candidate
+                    .checked_rva_range()?
+                    .context("discovered relocation directory is partial")?;
+                let is_declared = declared_range == Some(&candidate_range);
+                let authenticated =
+                    covered_by_destinations(destination_ranges, candidate_range.clone());
+                if !is_declared && authenticated {
+                    ensure!(
+                        candidates.len() < MAX_SCAN_CANDIDATES,
+                        "relocation scan candidate budget exceeded"
+                    );
+                    candidates.push(candidate);
+                    rva = candidate_range.end;
+                } else {
+                    rva = rva
+                        .checked_add(4)
+                        .context("relocation scan RVA overflows")?;
+                }
             } else {
                 rva = rva
                     .checked_add(4)
@@ -1716,7 +2113,7 @@ fn scan_base_relocation_directory(mapped: &[u8], pe: &Pe) -> Result<Option<DataD
     }
     ensure!(
         candidates.len() <= 1,
-        "multiple independent hidden relocation streams were found"
+        "multiple independent authenticated relocation streams were found"
     );
     Ok(candidates.pop())
 }
@@ -2137,12 +2534,29 @@ fn validate_delay_import_tables(
 }
 
 fn scan_resource_root(mapped: &[u8], pe: &Pe) -> Result<Option<DataDirectory>> {
+    let declared = pe.directory(RESOURCE_DIRECTORY)?;
+    if declared.virtual_address != 0 && declared.size != 0 {
+        let mut nodes = 0;
+        if let Some(end) = resource_node(
+            mapped,
+            pe,
+            declared.virtual_address,
+            declared.virtual_address,
+            0,
+            &mut nodes,
+        )? {
+            let size = end
+                .checked_sub(declared.virtual_address)
+                .context("declared resource span underflows")?;
+            return Ok(Some(DataDirectory {
+                virtual_address: declared.virtual_address,
+                size: pe::align_up(size, 4)?,
+            }));
+        }
+    }
     let mut roots = Vec::new();
     let mut starts = 0usize;
     for section in &pe.sections {
-        if !section.name_bytes.starts_with(b".rsrc") {
-            continue;
-        }
         let range = section.virtual_range()?;
         for rva in (range.start..range.end.saturating_sub(16)).step_by(4) {
             starts += 1;
@@ -2165,10 +2579,7 @@ fn scan_resource_root(mapped: &[u8], pe: &Pe) -> Result<Option<DataDirectory>> {
     }
     roots.sort_by_key(|root| (root.virtual_address, root.size));
     roots.dedup();
-    ensure!(
-        roots.len() <= 1,
-        "multiple valid raw resource roots were found"
-    );
+    ensure!(roots.len() <= 1, "multiple valid resource roots were found");
     Ok(roots.pop())
 }
 fn resource_node(
@@ -2251,16 +2662,7 @@ fn resource_node(
             };
             let data_rva = u32::from_le_bytes(data[..4].try_into().unwrap());
             let size = u32::from_le_bytes(data[4..8].try_into().unwrap());
-            if size == 0 || rva_slice(mapped, pe, data_rva, usize::try_from(size)?).is_none() {
-                return Ok(None);
-            }
-            let root_section = pe
-                .section_containing_rva(root)
-                .context("resource root is not section-backed")?;
-            let payload_section = pe
-                .section_containing_rva(data_rva)
-                .context("resource payload is not section-backed")?;
-            if root_section.index != payload_section.index {
+            if size == 0 || !rva_span_is_section_backed(mapped, pe, data_rva, size)? {
                 return Ok(None);
             }
             end = end.max(child + 16).max(
@@ -2499,7 +2901,6 @@ fn parse_import_candidate(
         if modules.len() == MAX_IMPORT_MODULES {
             return Ok(None);
         }
-        budget.consume(1)?;
         let Some(descriptor) = rva_slice(mapped, pe, rva, IMAGE_IMPORT_DESCRIPTOR_SIZE) else {
             return Ok(None);
         };
@@ -2527,6 +2928,7 @@ fn parse_import_candidate(
         let Some(dll) = read_ascii(mapped, pe, name_rva, MAX_IMPORT_STRING) else {
             return Ok(None);
         };
+        budget.consume(1)?;
         let dll_end = name_rva
             .checked_add(u32::try_from(dll.len() + 1)?)
             .context("candidate DLL range overflows")?;
@@ -2554,12 +2956,14 @@ fn parse_import_candidate(
     }
 }
 
+type ParsedThunkTable = (Vec<ImportSymbol>, Vec<Range<u32>>);
+
 fn parse_thunks(
     mapped: &[u8],
     pe: &Pe,
     mut rva: u32,
     budget: &mut ScanBudget,
-) -> Result<Option<(Vec<ImportSymbol>, Vec<Range<u32>>)>> {
+) -> Result<Option<ParsedThunkTable>> {
     let start = rva;
     let width = pe.pointer_width().bytes();
     let mut symbols = Vec::new();
@@ -2754,7 +3158,7 @@ fn parse_export_candidate(mapped: &[u8], pe: &Pe, rva: u32) -> Result<Option<Exp
         }
         let forwarder =
             read_ascii(mapped, pe, target, MAX_EXPORT_STRING).filter(|text| valid_forwarder(text));
-        if let Some(_) = forwarder {
+        if forwarder.is_some() {
             let Some(end) = string_end(mapped, pe, target, MAX_EXPORT_STRING) else {
                 return Ok(None);
             };
@@ -2780,6 +3184,30 @@ fn scan_ranges(pe: &Pe) -> Result<Vec<Range<u32>>> {
         .iter()
         .map(|section| section.virtual_range())
         .collect()
+}
+
+fn rva_span_is_section_backed(mapped: &[u8], pe: &Pe, rva: u32, len: u32) -> Result<bool> {
+    let Some(end) = rva.checked_add(len) else {
+        return Ok(false);
+    };
+    let (Ok(start), Ok(finish)) = (usize::try_from(rva), usize::try_from(end)) else {
+        return Ok(false);
+    };
+    if start >= finish || mapped.get(start..finish).is_none() {
+        return Ok(false);
+    }
+    let mut cursor = rva;
+    while cursor < end {
+        let Some(section) = pe.section_containing_rva(cursor) else {
+            return Ok(false);
+        };
+        let section_end = section.virtual_range()?.end;
+        if section_end <= cursor {
+            return Ok(false);
+        }
+        cursor = section_end.min(end);
+    }
+    Ok(true)
 }
 
 fn rva_slice<'a>(mapped: &'a [u8], pe: &Pe, rva: u32, len: usize) -> Option<&'a [u8]> {

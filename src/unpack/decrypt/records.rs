@@ -6,8 +6,8 @@ use crate::unpack::bootstrap::PackedBootstrap;
 
 pub(super) const A_RECORD_SIZE: usize = 16;
 pub(super) const A_RECORD_PHASES: usize = u8::MAX as usize + 1;
-pub(super) const MAX_A_DISCOVERY_CANDIDATES: usize = 8_000_000;
-pub(super) const MAX_A_RECORD_CHECKS: usize = 16_000_000;
+pub(super) const MAX_A_DISCOVERY_CANDIDATES: usize = 16_000_000;
+pub(super) const MAX_A_RECORD_CHECKS: usize = 32_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ARecord {

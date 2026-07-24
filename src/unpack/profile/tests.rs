@@ -328,6 +328,7 @@ fn write_rip_relative_displacement(
     image[start..start + 4].copy_from_slice(&displacement.to_le_bytes());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn place_amd64_candidate(
     image: &mut [u8],
     predecessor: u32,
@@ -582,10 +583,41 @@ fn recognizes_legacy_amd64_crt_pe_header_validation() {
     image[0x60..0x64].copy_from_slice(&[0x50, 0x45, 0x00, 0x00]);
     image[0x70..0x74].copy_from_slice(&[0x0b, 0x02, 0x00, 0x00]);
 
-    assert!(amd64_crt_startup_evidence(&image, startup_rva).unwrap());
+    let executable_range = 0..image.len() as u32;
+    assert!(
+        amd64_crt_startup_evidence(&image, std::slice::from_ref(&executable_range), startup_rva)
+            .unwrap()
+    );
 
     image[0x60..0x64].fill(0);
-    assert!(!amd64_crt_startup_evidence(&image, startup_rva).unwrap());
+    assert!(
+        !amd64_crt_startup_evidence(&image, std::slice::from_ref(&executable_range), startup_rva,)
+            .unwrap()
+    );
+}
+
+#[test]
+fn recognizes_modern_amd64_crt_lock_helper() {
+    let startup_rva = 0x40;
+    let helper_rva = 0xc0;
+    let mut image = vec![0x90; 0x200];
+    write_rel32(&mut image, startup_rva, 0xe8, helper_rva);
+    image[helper_rva as usize..helper_rva as usize + 9]
+        .copy_from_slice(&[0x65, 0x48, 0x8b, 0x04, 0x25, 0x30, 0, 0, 0]);
+    image[helper_rva as usize + 9..helper_rva as usize + 18]
+        .copy_from_slice(&[0xf0, 0x48, 0x0f, 0xb1, 0x15, 0, 0, 0, 0]);
+    let executable_range = 0..image.len() as u32;
+
+    assert!(
+        amd64_crt_startup_evidence(&image, std::slice::from_ref(&executable_range), startup_rva)
+            .unwrap()
+    );
+
+    image[helper_rva as usize + 9..helper_rva as usize + 13].fill(0x90);
+    assert!(
+        !amd64_crt_startup_evidence(&image, std::slice::from_ref(&executable_range), startup_rva,)
+            .unwrap()
+    );
 }
 
 #[test]

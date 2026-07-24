@@ -8,7 +8,7 @@ const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
 const AMD64_DEFAULT_SECURITY_COOKIE: u64 = 0x0000_2b99_2ddf_a232;
 const MAX_SEMANTIC_VENEERS: usize = 4_096;
 const MAX_EXECUTABLE_JUMPS: usize = 65_536;
-const MAX_RUNTIME_FUNCTIONS: usize = 131_072;
+const MAX_RUNTIME_FUNCTIONS: usize = 1 << 20;
 const AMD64_DLL_STARTUP_LEN: usize = 0x3d;
 const AMD64_DLL_STARTUP_PREFIX: [u8; 28] = [
     0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x20, 0x49,
@@ -297,7 +297,7 @@ fn amd64_msvc_semantic_entries(
             else {
                 continue;
             };
-            if !amd64_crt_startup_evidence(mapped, startup_rva)? {
+            if !amd64_crt_startup_evidence(mapped, executable_ranges, startup_rva)? {
                 continue;
             }
             let Some(entry_runtime_function_rva) =
@@ -681,13 +681,46 @@ fn amd64_security_cookie_evidence(
     Ok(cookie_rva)
 }
 
-pub(crate) fn amd64_crt_startup_evidence(mapped: &[u8], startup_rva: u32) -> Result<bool> {
+pub(crate) fn amd64_crt_startup_evidence(
+    mapped: &[u8],
+    executable_ranges: &[Range<u32>],
+    startup_rva: u32,
+) -> Result<bool> {
     let bytes = mapped_bytes(mapped, startup_rva, AMD64_CRT_EVIDENCE_LEN)?;
-    let modern = bytes.windows(3).any(|window| window == [0x65, 0x48, 0x8b])
+    if amd64_modern_crt_markers(bytes) || amd64_legacy_crt_markers(bytes) {
+        return Ok(true);
+    }
+
+    for (offset, instruction) in bytes.windows(DIRECT_REL32_LEN).enumerate() {
+        if instruction[0] != 0xe8 {
+            continue;
+        }
+        let call_rva = startup_rva
+            .checked_add(u32::try_from(offset).context("AMD64 CRT CALL offset exceeds u32")?)
+            .context("AMD64 CRT CALL RVA overflows")?;
+        let Some(helper_rva) = direct_rel32_target(mapped, call_rva, 0xe8)? else {
+            continue;
+        };
+        if !is_executable_range(executable_ranges, helper_rva, AMD64_CRT_EVIDENCE_LEN)? {
+            continue;
+        }
+        let helper = mapped_bytes(mapped, helper_rva, AMD64_CRT_EVIDENCE_LEN)?;
+        if amd64_modern_crt_markers(helper) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn amd64_modern_crt_markers(bytes: &[u8]) -> bool {
+    bytes.windows(3).any(|window| window == [0x65, 0x48, 0x8b])
         && bytes
             .windows(4)
-            .any(|window| window == [0xf0, 0x48, 0x0f, 0xb1]);
-    let legacy = bytes
+            .any(|window| window == [0xf0, 0x48, 0x0f, 0xb1])
+}
+
+fn amd64_legacy_crt_markers(bytes: &[u8]) -> bool {
+    bytes
         .windows(4)
         .any(|window| window == [0x4d, 0x5a, 0x00, 0x00])
         && bytes
@@ -695,8 +728,7 @@ pub(crate) fn amd64_crt_startup_evidence(mapped: &[u8], startup_rva: u32) -> Res
             .any(|window| window == [0x50, 0x45, 0x00, 0x00])
         && bytes
             .windows(4)
-            .any(|window| window == [0x0b, 0x02, 0x00, 0x00]);
-    Ok(modern || legacy)
+            .any(|window| window == [0x0b, 0x02, 0x00, 0x00])
 }
 
 fn amd64_veneer_starts(mapped: &[u8], executable_ranges: &[Range<u32>]) -> Result<Vec<u32>> {

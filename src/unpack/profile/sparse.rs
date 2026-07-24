@@ -5,6 +5,7 @@ use crate::pe::Pe;
 use super::{IMAGE_SCN_MEM_EXECUTE, SPARSE_BLOCK_SIZE, SPARSE_PAGE_SIZE};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum SparsePageKey {
     PageIndex,
     PageRvaOrTextSizeMask,

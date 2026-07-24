@@ -21,7 +21,7 @@ pub(crate) const AMD64_MSVC_ENTRY_LEN: usize = 18;
 pub(crate) const AMD64_COOKIE_EVIDENCE_LEN: usize = 0x2c;
 pub(crate) const AMD64_CRT_EVIDENCE_LEN: usize = 0x60;
 pub(crate) const SEMANTIC_PROTECTED_RANGE_COUNT: usize = 8;
-pub(crate) const MAX_SEMANTIC_EXECUTABLE_SCAN_BYTES: usize = 64 << 20;
+pub(crate) const MAX_SEMANTIC_EXECUTABLE_SCAN_BYTES: usize = 512 << 20;
 
 mod native;
 mod sparse;
@@ -329,6 +329,7 @@ impl SemanticEntry {
     /// Compatibility construction for fixtures outside this module.  Production
     /// entries are exclusively created by `discover_semantic_entry`.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) const fn i386_for_test(
         entry_rva: u32,
         predecessor_rva: u32,

@@ -1151,7 +1151,7 @@ fn decoder_validation_seen_generation_rollover_clears_old_marks() {
 
 #[test]
 fn discovers_long_a_run_without_cumulative_suffix_rescans() {
-    const RECORD_COUNT: usize = 6_000;
+    const RECORD_COUNT: usize = 8_000;
     let bootstrap = PackedBootstrap {
         descriptor_file_offset: 0,
         key: 0,
