@@ -32,6 +32,7 @@ use replay::*;
 /// image.
 #[derive(Debug)]
 pub(crate) struct DecryptedImage {
+    pub(crate) destination_record_ranges: Vec<Range<u32>>,
     pub(crate) destination_ranges: Vec<Range<u32>>,
     pub(crate) image: Vec<u8>,
     pub(crate) decryption_details: DecryptionDetails,

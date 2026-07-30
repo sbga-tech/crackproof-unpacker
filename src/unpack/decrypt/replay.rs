@@ -15,13 +15,13 @@ use super::aes::AES_256_KEY_SIZE;
 use super::decoder::{
     CustomDecodeError, CustomDecoderSource, decode_custom_stream_with_history_source_mode,
 };
-use super::merged_a_record_destination_ranges;
 use super::{
     ARecord, AesContextMatch, DecoderCandidate, DecryptedImage,
     aes256_cbc_decrypt_full_blocks_in_place, custom_decoder_prefix_is_viable,
     decode_custom_stream_with_history, discover_a_record_run, discover_decoder_candidates,
     ensure_source_excludes_security, scan_aes_contexts_in_range,
 };
+use super::{a_record_destination_range, merged_a_record_destination_ranges};
 
 pub(super) const MAX_DECRYPTION_REPLAY_WORK: usize = 512 << 20;
 pub(super) const MAX_DECRYPTION_REPLAY_PAIRS: usize = 64;
@@ -854,16 +854,12 @@ pub(crate) fn decrypt_packed_image_from_source(
         mapped.len(),
         source_security_range,
     )?;
-    if std::env::var_os("CRACKPROOF_TRACE_RECORDS").is_some() {
-        for (index, record) in records.records.iter().enumerate() {
-            if record.encoded_length == record.destination_length {
-                eprintln!(
-                    "copied_record index={index} source_offset={:#x} length={:#x} destination_rva={:#x}",
-                    record.source_offset, record.encoded_length, record.destination_rva
-                );
-            }
-        }
-    }
+    let mut destination_record_ranges = records
+        .records
+        .iter()
+        .map(a_record_destination_range)
+        .collect::<Result<Vec<_>>>()?;
+    destination_record_ranges.sort_unstable_by_key(|range| range.start);
     let destination_ranges = merged_a_record_destination_ranges(&records.records)?;
     let decoder_candidates =
         discover_decoder_candidates(source_start, payload_source, source_length)?;
@@ -911,6 +907,7 @@ pub(crate) fn decrypt_packed_image_from_source(
     })?;
     apply_decryption_plan(payload_source, stream_base, &mut mapped, plan)?;
     Ok(DecryptedImage {
+        destination_record_ranges,
         image: mapped,
         destination_ranges,
         decryption_details,

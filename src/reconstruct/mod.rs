@@ -50,6 +50,7 @@ pub(crate) struct ReconstructionInput {
     pub(crate) decrypted_pe: Pe,
     pub(crate) output_entry: OutputEntry,
     pub(crate) discovery: LoaderDiscovery,
+    pub(crate) destination_record_ranges: Vec<Range<u32>>,
     pub(crate) destination_ranges: Vec<Range<u32>>,
 }
 
@@ -119,6 +120,7 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
         decrypted_pe,
         output_entry,
         discovery,
+        destination_record_ranges,
         destination_ranges,
     } = input;
     ensure!(
@@ -142,8 +144,12 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
     // Only a unique parser-proven winner is stale scaffolding. Competing graphs
     // fail closed in selection; descriptor suffixes coalesce to the winner.
     clear_selected_import_candidate(&mut mapped, &decrypted_pe)?;
-    let mut retained_directories =
-        recover_directories(&mapped, &decrypted_pe, &destination_ranges)?;
+    let mut retained_directories = recover_directories(
+        &mapped,
+        &decrypted_pe,
+        &destination_ranges,
+        &destination_record_ranges,
+    )?;
     let selected_relocations = retained_directories
         .iter()
         .position(|(index, _)| *index == BASE_RELOCATION_DIRECTORY)
@@ -1325,6 +1331,7 @@ fn recover_directories(
     mapped: &[u8],
     pe: &Pe,
     destination_ranges: &[Range<u32>],
+    destination_record_ranges: &[Range<u32>],
 ) -> Result<Vec<(usize, DataDirectory)>> {
     let mut result = Vec::new();
     for (index, directory) in pe.directories.iter().copied().enumerate() {
@@ -1335,9 +1342,13 @@ fn recover_directories(
             continue;
         }
         if index == BASE_RELOCATION_DIRECTORY {
-            if let Some(directory) =
-                recover_base_relocation_directory(mapped, pe, directory, destination_ranges)?
-            {
+            if let Some(directory) = recover_base_relocation_directory(
+                mapped,
+                pe,
+                directory,
+                destination_ranges,
+                destination_record_ranges,
+            )? {
                 result.push((index, directory));
             }
             continue;
@@ -1739,6 +1750,7 @@ fn recover_base_relocation_directory(
     pe: &Pe,
     declared: DataDirectory,
     destination_ranges: &[Range<u32>],
+    destination_record_ranges: &[Range<u32>],
 ) -> Result<Option<DataDirectory>> {
     let (declared_range, declared_relocations) = if declared.is_empty() {
         (None, 0)
@@ -1759,12 +1771,20 @@ fn recover_base_relocation_directory(
         return Ok(Some(declared));
     }
 
-    let discovered =
-        scan_base_relocation_directory(mapped, pe, declared_range.as_ref(), destination_ranges)?;
-    if let Some(discovered) = discovered {
-        return Ok(Some(discovered));
+    if let Some(produced) = recover_base_relocation_from_record_producer_closures(
+        mapped,
+        pe,
+        destination_ranges,
+        destination_record_ranges,
+    )? {
+        return Ok(Some(produced));
     }
-    Ok(declared_range.is_some().then_some(declared))
+
+    ensure!(
+        declared_relocations == 0,
+        "effective declared base-relocation directory is not authenticated by recovered payload records, and no authenticated relocation producer closure was found"
+    );
+    Ok(None)
 }
 
 #[derive(Clone, Copy)]
@@ -2057,63 +2077,65 @@ fn place_base_relocation_payload(
     ))
 }
 
-fn scan_base_relocation_directory(
+fn recover_base_relocation_from_record_producer_closures(
     mapped: &[u8],
     pe: &Pe,
-    declared_range: Option<&Range<u32>>,
     destination_ranges: &[Range<u32>],
+    destination_record_ranges: &[Range<u32>],
 ) -> Result<Option<DataDirectory>> {
     let mut starts = 0usize;
     let mut candidates = Vec::new();
+    let mut consumed_until = 0u32;
     let mut budget = ScanBudget::default();
-    for section in &pe.sections {
+    for producer in destination_record_ranges {
+        let rva = producer.start;
+        if rva < consumed_until
+            || !rva.is_multiple_of(4)
+            || producer.end.saturating_sub(rva) < BASE_RELOCATION_BLOCK_HEADER_SIZE as u32
+        {
+            continue;
+        }
+        let Some(owner) = destination_ranges
+            .iter()
+            .find(|range| range.start <= rva && rva < range.end)
+        else {
+            continue;
+        };
+        if owner.start != rva {
+            continue;
+        }
+        let section = pe.section_for_rva_range(rva, BASE_RELOCATION_BLOCK_HEADER_SIZE)?;
         if section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0 {
             continue;
         }
-        let range = section.virtual_range()?;
-        let end = range.end.min(pe.size_of_image);
-        let mut rva = pe::align_up(range.start, 4)?;
-        while rva
-            .checked_add(BASE_RELOCATION_BLOCK_HEADER_SIZE as u32)
-            .is_some_and(|header_end| header_end <= end)
-        {
-            starts = starts
-                .checked_add(1)
-                .context("relocation scan start counter overflows")?;
-            ensure!(
-                starts <= MAX_SCAN_STARTS,
-                "relocation scan start budget exceeded"
-            );
-            if let Some(candidate) = parse_relocation_candidate(mapped, pe, rva, end, &mut budget)?
-            {
-                let candidate_range = candidate
-                    .checked_rva_range()?
-                    .context("discovered relocation directory is partial")?;
-                let is_declared = declared_range == Some(&candidate_range);
-                let authenticated =
-                    covered_by_destinations(destination_ranges, candidate_range.clone());
-                if !is_declared && authenticated {
-                    ensure!(
-                        candidates.len() < MAX_SCAN_CANDIDATES,
-                        "relocation scan candidate budget exceeded"
-                    );
-                    candidates.push(candidate);
-                    rva = candidate_range.end;
-                } else {
-                    rva = rva
-                        .checked_add(4)
-                        .context("relocation scan RVA overflows")?;
-                }
-            } else {
-                rva = rva
-                    .checked_add(4)
-                    .context("relocation scan RVA overflows")?;
-            }
-        }
+        let owner_end = owner
+            .end
+            .min(section.virtual_range()?.end)
+            .min(pe.size_of_image);
+        starts = starts
+            .checked_add(1)
+            .context("relocation producer start counter overflows")?;
+        ensure!(
+            starts <= MAX_SCAN_STARTS,
+            "relocation producer start budget exceeded"
+        );
+        let Some(candidate) = parse_relocation_candidate(mapped, pe, rva, owner_end, &mut budget)?
+        else {
+            continue;
+        };
+        let candidate_range = candidate
+            .checked_rva_range()?
+            .context("producer relocation directory is partial")?;
+        consumed_until = candidate_range.end;
+        ensure!(
+            candidates.len() < MAX_SCAN_CANDIDATES,
+            "relocation producer candidate budget exceeded"
+        );
+        candidates.push(candidate);
     }
     ensure!(
         candidates.len() <= 1,
-        "multiple independent authenticated relocation streams were found"
+        "multiple independent A-record relocation producer closures were found"
     );
     Ok(candidates.pop())
 }

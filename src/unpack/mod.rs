@@ -118,6 +118,7 @@ fn unpack_recording(
     }
     let decrypt::DecryptedImage {
         mut image,
+        destination_record_ranges,
         destination_ranges,
         decryption_details,
     } = finish_stage(report, AnalysisStep::PayloadDecryption, decryption)?;
@@ -182,6 +183,7 @@ fn unpack_recording(
             decrypted_pe,
             output_entry,
             discovery,
+            destination_record_ranges,
             destination_ranges,
         })
     };

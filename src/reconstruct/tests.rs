@@ -582,7 +582,7 @@ fn relocation_blocks_require_dword_layout_and_owned_pages() {
 }
 
 #[test]
-fn hidden_relocation_stream_replaces_empty_declared_block() {
+fn producer_relocation_stream_replaces_empty_declared_block() {
     let mut pe = test_pe();
     pe.machine = Machine::Amd64;
     pe.image_base = 0x1_4000_0000;
@@ -604,6 +604,7 @@ fn hidden_relocation_stream_replaces_empty_declared_block() {
             &pe,
             declared,
             std::slice::from_ref(&hidden_destination),
+            std::slice::from_ref(&hidden_destination),
         )
         .unwrap(),
         Some(DataDirectory {
@@ -619,9 +620,98 @@ fn hidden_relocation_stream_replaces_empty_declared_block() {
             &pe,
             declared,
             std::slice::from_ref(&hidden_destination),
+            std::slice::from_ref(&hidden_destination),
         )
         .unwrap(),
-        Some(declared)
+        None
+    );
+}
+
+#[test]
+fn effective_unprovenant_declared_relocations_fail_closed() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x1_4000_0000;
+    let mut image = vec![0; 0x2000];
+    let declared = DataDirectory {
+        virtual_address: 0x1400,
+        size: 12,
+    };
+    put_u32(&mut image, 0x1400, 0x1000);
+    put_u32(&mut image, 0x1404, 12);
+    image[0x1408..0x140a].copy_from_slice(&0xa200u16.to_le_bytes());
+    put_u64(&mut image, 0x1200, pe.image_base + 0x1600);
+
+    let error = recover_base_relocation_directory(&image, &pe, declared, &[], &[])
+        .expect_err("unprovenant effective relocation directory must fail closed");
+    assert!(error.to_string().contains(
+        "effective declared base-relocation directory is not authenticated by recovered payload records"
+    ));
+}
+
+#[test]
+fn relocation_like_bytes_inside_a_producer_closure_are_not_scanned() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x1_4000_0000;
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1500, 0x1000);
+    put_u32(&mut image, 0x1504, 12);
+    image[0x1508..0x150a].copy_from_slice(&0xa200u16.to_le_bytes());
+    put_u64(&mut image, 0x1200, pe.image_base + 0x1600);
+    let producer_closure = 0x1400..0x1600;
+
+    assert_eq!(
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0,
+                size: 0,
+            },
+            std::slice::from_ref(&producer_closure),
+            std::slice::from_ref(&producer_closure),
+        )
+        .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn record_provenance_selects_exact_relocation_producer() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x1_4000_0000;
+    let mut image = vec![0; 0x2000];
+    for (stream, target) in [(0x1500, 0x1200), (0x1600, 0x1210)] {
+        put_u32(&mut image, stream, 0x1000);
+        put_u32(&mut image, stream + 4, 12);
+        image[stream + 8..stream + 10]
+            .copy_from_slice(&(0xa000u16 | u16::try_from(target - 0x1000).unwrap()).to_le_bytes());
+        put_u64(
+            &mut image,
+            target,
+            pe.image_base + u64::try_from(target).unwrap(),
+        );
+    }
+    let producer_destination = 0x1500..0x150c;
+
+    assert_eq!(
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0,
+                size: 0,
+            },
+            &[0x1500..0x150c, 0x1600..0x160c],
+            std::slice::from_ref(&producer_destination),
+        )
+        .unwrap(),
+        Some(DataDirectory {
+            virtual_address: 0x1500,
+            size: 12,
+        })
     );
 }
 
@@ -783,6 +873,7 @@ fn authenticated_relocations_override_nonprovenant_declared_streams() {
             &pe,
             declared,
             std::slice::from_ref(&declared_destination),
+            std::slice::from_ref(&declared_destination),
         )
         .unwrap(),
         Some(declared)
@@ -793,6 +884,7 @@ fn authenticated_relocations_override_nonprovenant_declared_streams() {
             &image,
             &pe,
             declared,
+            std::slice::from_ref(&hidden_destination),
             std::slice::from_ref(&hidden_destination),
         )
         .unwrap(),
@@ -834,6 +926,7 @@ fn authenticated_relocations_override_nonprovenant_declared_streams() {
             &image,
             &pe,
             empty_declared,
+            &[0x1500..0x150c, 0x1600..0x160c],
             &[0x1500..0x150c, 0x1600..0x160c],
         )
         .is_err()
