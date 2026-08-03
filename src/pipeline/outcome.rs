@@ -1,0 +1,194 @@
+use std::time::Duration;
+
+use serde::Serialize;
+
+use super::stage::Stage;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProtectorInfo {
+    pub format: &'static str,
+    pub descriptor_file_offset: usize,
+    pub key: u32,
+    pub packed_entry_rva: u32,
+    pub destination_rva: u32,
+    pub source_offset: u32,
+    pub length: u32,
+    pub source_rva: u32,
+    pub destination_section_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ByteTransform {
+    Identity,
+    FixedF8,
+    ByteMap,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SelectedAesContext {
+    pub file_offset: usize,
+    pub seed: u8,
+    pub raw_key_hex: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SelectedDecoder {
+    pub source_file_offset: usize,
+    pub phase: u8,
+    pub table_nodes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SelectedDecryptionChain {
+    pub aes: SelectedAesContext,
+    pub decoder: SelectedDecoder,
+    pub byte_transform: ByteTransform,
+    pub byte_map: Vec<u8>,
+}
+
+/// Bounded evidence and the unique fully authenticated A-record replay chain.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct DecryptionDetails {
+    pub chunk_count: usize,
+    pub copied_chunk_count: usize,
+    pub decoded_chunk_count: usize,
+    pub aes_key_candidates: usize,
+    pub decoder_candidates: usize,
+    pub byte_transform_candidates: usize,
+    pub selected_chain: Option<SelectedDecryptionChain>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeTransform {
+    Unchanged,
+    PageIndex,
+    PageRvaOrTextSizeMask,
+    PageRvaRol { rotation: u32 },
+    NotApplicable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupKind {
+    I386CrtHandoff,
+    I386MsvcStandalone,
+    Amd64ImportHandoff,
+    Amd64MsvcUnwind,
+    NativeDllEntry,
+    ManagedDll,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RecoveredProgram {
+    pub code_transform: CodeTransform,
+    pub startup_kind: StartupKind,
+    pub startup_rva: u32,
+    pub handoff_rva: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportSource {
+    CrackproofLoader,
+    PeImportTable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ImportSummary {
+    pub source: ImportSource,
+    pub module_count: usize,
+    pub function_count: usize,
+}
+
+/// Explicit label for generated semantic CLR output; never original-bootstrap provenance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GeneratedSemanticClrContainer {
+    pub generated_architecture: &'static str,
+    pub entry_rva: u32,
+    pub import_rva: u32,
+    pub iat_rva: u32,
+    pub reloc_rva: u32,
+    pub cor20_rva: u32,
+    pub cor20_size: u32,
+    pub metadata_rva: u32,
+}
+
+/// Authenticated attributes of the protected source map. This remains separate
+/// from the generated PE32 container it produces.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedSemanticClrSource {
+    pub source_architecture: &'static str,
+    pub source_pe_entry_rva: u32,
+    pub source_import_rva: u32,
+    pub source_iat_rva: u32,
+    pub source_cor20_rva: u32,
+    pub source_metadata_rva: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ArtifactSummary {
+    pub path: String,
+    pub size: usize,
+    pub sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PeSummary {
+    pub kind: &'static str,
+    pub machine: &'static str,
+    pub image_base: u64,
+    pub entry_rva: u32,
+    pub size_of_image: u32,
+    pub section_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OutputArtifactSummary {
+    pub path: Option<String>,
+    pub size: usize,
+    pub sha256: Option<String>,
+    pub written: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StageTiming {
+    pub stage: Stage,
+    pub elapsed_ms: u128,
+}
+
+impl StageTiming {
+    pub fn new(stage: Stage, duration: Duration) -> Self {
+        Self {
+            stage,
+            elapsed_ms: duration.as_millis(),
+        }
+    }
+}
+
+/// Authoritative semantic result assembled from completed stage outputs.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct RunSummary {
+    pub input_artifact: Option<ArtifactSummary>,
+    pub sidecar_artifact: Option<ArtifactSummary>,
+    pub input_pe: Option<PeSummary>,
+    pub output_artifact: Option<OutputArtifactSummary>,
+    pub output_pe: Option<PeSummary>,
+    pub dry_run: bool,
+    pub protector: Option<ProtectorInfo>,
+    pub decryption: Option<DecryptionDetails>,
+    pub recovered_program: Option<RecoveredProgram>,
+    pub imports: Option<ImportSummary>,
+    pub generated_semantic_clr_container: Option<GeneratedSemanticClrContainer>,
+    pub managed_semantic_clr_source: Option<ManagedSemanticClrSource>,
+    pub rebuilt_file_size: Option<usize>,
+    pub stage_timings: Vec<StageTiming>,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Debug)]
+pub struct PipelineOutput {
+    pub image: Vec<u8>,
+    pub summary: RunSummary,
+}

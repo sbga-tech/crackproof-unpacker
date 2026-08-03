@@ -1,11 +1,19 @@
-mod pe;
-mod reconstruct;
-mod report;
-mod unpack;
+#![forbid(unsafe_code)]
 
-pub use report::{
-    AnalysisError, AnalysisReport, AnalysisStatus, AnalysisStep, ByteTransform, CandidateRejection,
-    CodeTransform, DecryptionDetails, GeneratedSemanticClrContainer, ImportSource, ImportSummary,
-    ManagedSemanticClrSource, ProtectorInfo, RecoveredProgram, StartupKind,
+mod pe;
+pub use pe::{FileOffset, FileRange, Rva, RvaRange};
+pub mod pipeline;
+
+pub use pipeline::Pipeline;
+pub use pipeline::cancellation::CancellationToken;
+pub use pipeline::failure::{FailureReason, PipelineFailure, RunFailure};
+pub use pipeline::observer::{NoopObserver, Observer, StateEvent};
+pub use pipeline::outcome::{
+    ArtifactSummary, ByteTransform, CodeTransform, DecryptionDetails,
+    GeneratedSemanticClrContainer, ImportSource, ImportSummary, ManagedSemanticClrSource,
+    OutputArtifactSummary, PeSummary, PipelineOutput, ProtectorInfo, RecoveredProgram, RunSummary,
+    SelectedAesContext, SelectedDecoder, SelectedDecryptionChain, StartupKind,
 };
-pub use unpack::{analyze, analyze_with_sidecar, unpack, unpack_with_sidecar};
+pub use pipeline::progress::ProgressUnit;
+pub use pipeline::request::PipelineRequest;
+pub use pipeline::stage::{Operation, Stage};

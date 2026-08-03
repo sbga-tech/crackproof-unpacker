@@ -1,0 +1,1726 @@
+use super::*;
+use crate::pe::{Machine, Section};
+use crate::pipeline::stages::startup::AMD64_RUNTIME_FUNCTION_LEN;
+
+fn test_pe() -> Pe {
+    Pe {
+        opt: 0x98,
+        machine: Machine::I386,
+        coff_characteristics: 0x102,
+        section_count: 1,
+        entry_rva: 0x1000,
+        image_base: 0x400000,
+        section_alignment: 0x1000,
+        file_alignment: 0x200,
+        size_of_image: 0x2000,
+        size_of_headers: 0x200,
+        checksum_offset: 0xd8,
+        data_directory_table_offset: 0xf8,
+        directories: vec![
+            DataDirectory {
+                virtual_address: 0,
+                size: 0
+            };
+            16
+        ],
+        sections: vec![Section {
+            index: 0,
+            header_offset: 0x178,
+            name_bytes: *b".data\0\0\0",
+            virtual_size: 0x1000,
+            virtual_address: 0x1000,
+            raw_size: 0x1000,
+            raw_pointer: 0x200,
+            characteristics: 0xc0000040,
+        }],
+        file_len: 0x1200,
+    }
+}
+
+fn put_u32(image: &mut [u8], rva: usize, value: u32) {
+    image[rva..rva + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(image: &mut [u8], rva: usize, value: u64) {
+    image[rva..rva + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn standard_import(image: &mut [u8], start: usize, suffix: u8) {
+    put_u32(image, start, (start + 0x40) as u32);
+    put_u32(image, start + 12, (start + 0x60) as u32);
+    put_u32(image, start + 16, (start + 0x80) as u32);
+    put_u32(image, start + 0x40, (start + 0xa0) as u32);
+    image[start + 0x60..start + 0x68].copy_from_slice(b"mod.dll\0");
+    image[start + 0xa2..start + 0xa7].copy_from_slice(b"Func\0");
+    image[start + 0xa0] = suffix;
+}
+
+fn standard_export(image: &mut [u8], start: usize) {
+    put_u32(image, start + 12, (start + 0x40) as u32);
+    put_u32(image, start + 16, 1);
+    put_u32(image, start + 20, 1);
+    put_u32(image, start + 24, 1);
+    put_u32(image, start + 28, (start + 0x50) as u32);
+    put_u32(image, start + 32, (start + 0x60) as u32);
+    put_u32(image, start + 36, (start + 0x64) as u32);
+    image[start + 0x40..start + 0x46].copy_from_slice(b"x.dll\0");
+    put_u32(image, start + 0x50, 0x1400);
+    put_u32(image, start + 0x60, (start + 0x70) as u32);
+    image[start + 0x70..start + 0x75].copy_from_slice(b"Func\0");
+}
+
+#[test]
+fn import_scanner_ignores_directory_values_and_rejects_competing_graphs() {
+    let mut pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    standard_import(&mut image, 0x1100, 0);
+    pe.directories[IMPORT_DIRECTORY] = DataDirectory {
+        virtual_address: 0x1abc,
+        size: 1,
+    };
+    let selected = select_import_candidate(scan_import_candidates(&image, &pe).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.start, 0x1100);
+    assert_eq!(selected.graph.functions, 1);
+
+    standard_import(&mut image, 0x1200, 1);
+    assert!(select_import_candidate(scan_import_candidates(&image, &pe).unwrap()).is_err());
+}
+
+#[test]
+fn candidate_cleanup_removes_proven_metadata_without_touching_unrelated_bytes() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    standard_import(&mut image, 0x1100, 0);
+    image[0x1700..0x1709].copy_from_slice(b"unrelated");
+    let candidate = select_import_candidate(scan_import_candidates(&image, &pe).unwrap())
+        .unwrap()
+        .unwrap();
+    clear_candidate(&mut image, &pe, &candidate).unwrap();
+    assert!(
+        image
+            .windows(b"mod.dll".len())
+            .all(|window| window != b"mod.dll")
+    );
+    assert!(image.windows(b"Func".len()).all(|window| window != b"Func"));
+    assert_eq!(&image[0x1700..0x1709], b"unrelated");
+}
+
+fn two_module_import(image: &mut [u8], start: usize) {
+    for (descriptor, lookup, dll, iat, hint_name, module, api) in [
+        (
+            start,
+            start + 0x40,
+            start + 0x60,
+            start + 0x80,
+            start + 0xa0,
+            b"one.dll\0".as_slice(),
+            b"One\0".as_slice(),
+        ),
+        (
+            start + 20,
+            start + 0xc0,
+            start + 0xe0,
+            start + 0x100,
+            start + 0x120,
+            b"two.dll\0".as_slice(),
+            b"Two\0".as_slice(),
+        ),
+    ] {
+        put_u32(image, descriptor, lookup as u32);
+        put_u32(image, descriptor + 12, dll as u32);
+        put_u32(image, descriptor + 16, iat as u32);
+        put_u32(image, lookup, hint_name as u32);
+        image[dll..dll + module.len()].copy_from_slice(module);
+        image[hint_name + 2..hint_name + 2 + api.len()].copy_from_slice(api);
+    }
+}
+
+#[test]
+fn selected_import_winner_coalesces_suffixes_and_rejects_disjoint_graphs_without_mutation() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    two_module_import(&mut image, 0x1100);
+    image[0x1700..0x1709].copy_from_slice(b"untouched");
+    let winner = select_import_candidate(scan_import_candidates(&image, &pe).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(winner.graph.modules.len(), 2);
+    clear_selected_import_candidate(&mut image, &pe).unwrap();
+    assert!(
+        image
+            .windows(b"one.dll".len())
+            .all(|window| window != b"one.dll")
+    );
+    assert!(
+        image
+            .windows(b"two.dll".len())
+            .all(|window| window != b"two.dll")
+    );
+    assert_eq!(&image[0x1700..0x1709], b"untouched");
+    let mut competing = vec![0; 0x2000];
+    two_module_import(&mut competing, 0x1100);
+    standard_import(&mut competing, 0x1400, 0);
+    let before = competing.clone();
+    assert!(clear_selected_import_candidate(&mut competing, &pe).is_err());
+    assert_eq!(competing, before);
+}
+#[test]
+fn import_scanner_rejects_invalid_ordinal_encoding() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    standard_import(&mut image, 0x1100, 0);
+    put_u32(&mut image, 0x1140, 0x8001_0001);
+    assert!(scan_import_candidates(&image, &pe).unwrap().is_empty());
+}
+
+#[test]
+fn export_scanner_ignores_directory_values_and_rejects_invalid_target() {
+    let mut pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    standard_export(&mut image, 0x1300);
+    pe.directories[EXPORT_DIRECTORY] = DataDirectory {
+        virtual_address: 0,
+        size: 0,
+    };
+    let selected = scan_export(&image, &pe).unwrap().unwrap();
+    assert_eq!(selected.rva, 0x1300);
+    assert_eq!(selected.functions, 1);
+    assert_eq!(selected.names, 1);
+
+    put_u32(&mut image, 0x1350, 0x3000);
+    assert!(scan_export(&image, &pe).unwrap().is_none());
+}
+
+#[test]
+fn resource_closure_scans_nonstandard_sections_and_accepts_cross_section_payload() {
+    let mut pe = test_pe();
+    let mut image = vec![0; 0x3000];
+    let root = 0x1100usize;
+    // Root -> type -> name -> language -> IMAGE_RESOURCE_DATA_ENTRY.
+    image[root + 14..root + 16].copy_from_slice(&1u16.to_le_bytes());
+    put_u32(&mut image, root + 20, 0x8000_0018);
+    image[root + 0x18 + 14..root + 0x18 + 16].copy_from_slice(&1u16.to_le_bytes());
+    put_u32(&mut image, root + 0x18 + 20, 0x8000_0030);
+    image[root + 0x30 + 14..root + 0x30 + 16].copy_from_slice(&1u16.to_le_bytes());
+    put_u32(&mut image, root + 0x30 + 20, 0x48);
+    put_u32(&mut image, root + 0x48, (root + 0x58) as u32);
+    put_u32(&mut image, root + 0x4c, 0x17d);
+    let mut nodes = 0;
+    assert_eq!(
+        resource_node(&image, &pe, root as u32, root as u32, 0, &mut nodes).unwrap(),
+        Some((root + 0x1d5) as u32)
+    );
+    assert_eq!(
+        scan_resource_root(&image, &pe).unwrap(),
+        Some(DataDirectory {
+            virtual_address: root as u32,
+            size: 0x1d8,
+        })
+    );
+    let duplicate_root = 0x1800usize;
+    let duplicate = image[root..root + 0x1d8].to_vec();
+    image[duplicate_root..duplicate_root + duplicate.len()].copy_from_slice(&duplicate);
+    put_u32(
+        &mut image,
+        duplicate_root + 0x48,
+        (duplicate_root + 0x58) as u32,
+    );
+    pe.directories[RESOURCE_DIRECTORY] = DataDirectory {
+        virtual_address: root as u32,
+        size: 0x1d8,
+    };
+    assert_eq!(
+        scan_resource_root(&image, &pe).unwrap(),
+        Some(DataDirectory {
+            virtual_address: root as u32,
+            size: 0x1d8,
+        })
+    );
+    pe.sections.push(Section {
+        index: 1,
+        header_offset: 0x1a0,
+        name_bytes: *b".next\0\0\0",
+        virtual_size: 0x1000,
+        virtual_address: 0x2000,
+        raw_size: 0x1000,
+        raw_pointer: 0x1200,
+        characteristics: 0xc0000040,
+    });
+    pe.section_count = 2;
+    pe.size_of_image = 0x3000;
+    put_u32(&mut image, root + 0x48, 0x1fff);
+    put_u32(&mut image, root + 0x4c, 2);
+    let mut nodes = 0;
+    assert_eq!(
+        resource_node(&image, &pe, root as u32, root as u32, 0, &mut nodes).unwrap(),
+        Some(0x2001)
+    );
+    let mut required = vec![0; 2];
+    require_raw_rva_range(&pe, &mut required, 0x1fff..0x2001).unwrap();
+    assert_eq!(required, vec![0x1000, 1]);
+    put_u32(&mut image, root + 0x48, 0x3000);
+    let mut nodes = 0;
+    assert_eq!(
+        resource_node(&image, &pe, root as u32, root as u32, 0, &mut nodes).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn forwarder_grammar_rejects_non_decimal_ordinals() {
+    assert!(valid_forwarder("other.RealName"));
+    assert!(valid_forwarder("other.#12"));
+    assert!(!valid_forwarder("other.#abc"));
+}
+
+#[test]
+fn retained_directory_validators_reject_unsupported_and_malformed_metadata() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            7,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 4
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1100, 72);
+    put_u32(&mut image, 0x1108, 0x1200);
+    put_u32(&mut image, 0x110c, 16);
+    assert!(
+        validate_clr_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 72
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1100 + 16, 1);
+    put_u32(&mut image, 0x1100 + 20, 0);
+    put_u32(&mut image, 0x1100 + 24, 0x1234);
+    assert!(
+        validate_debug_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 28
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn exception_and_relocation_directories_require_valid_native_structure() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.sections[0].characteristics = 0xe000_0020;
+    let mut image = vec![0; 0x2000];
+    image[0x1300] = 1; // UNWIND_INFO version 1, no flags or unwind codes.
+    put_u32(&mut image, 0x1100, 0x1200);
+    put_u32(&mut image, 0x1104, 0x1204);
+    put_u32(&mut image, 0x1108, 0x1300);
+    validate_retained_directory(
+        &image,
+        &pe,
+        3,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 12,
+        },
+    )
+    .expect("valid AMD64 runtime function");
+    put_u32(&mut image, 0x1104, 0x1200);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1104, 0x1204);
+    put_u32(&mut image, 0x1400, 0x1000);
+    put_u32(&mut image, 0x1404, 12);
+    image[0x1408..0x140a].copy_from_slice(&0xa200u16.to_le_bytes());
+    image[0x140a..0x140c].copy_from_slice(&0u16.to_le_bytes());
+    validate_retained_directory(
+        &image,
+        &pe,
+        5,
+        DataDirectory {
+            virtual_address: 0x1400,
+            size: 12,
+        },
+    )
+    .expect("valid DIR64 relocation block");
+    put_u32(&mut image, 0x1400, 0x1001);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            5,
+            DataDirectory {
+                virtual_address: 0x1400,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1404, 10);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            5,
+            DataDirectory {
+                virtual_address: 0x1400,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn native_directory_alignment_and_unwind_contracts_fail_closed() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.sections[0].characteristics = 0xe000_0020;
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1100, 0x1200);
+    put_u32(&mut image, 0x1104, 0x1210);
+    put_u32(&mut image, 0x1108, 0x1300);
+    image[0x1300..0x1304].copy_from_slice(&[1, 6, 5, 5]);
+    image[0x1304..0x130e].copy_from_slice(&[
+        6, 0x30, // UWOP_PUSH_NONVOL RBX
+        5, 0x02, // UWOP_ALLOC_SMALL
+        4, 0x03, // UWOP_SET_FPREG
+        3, 0x68, // UWOP_SAVE_XMM128 XMM6
+        0, 0,
+    ]);
+    validate_retained_directory(
+        &image,
+        &pe,
+        3,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 12,
+        },
+    )
+    .expect("valid aligned nonvolatile UNWIND_INFO");
+    image[0x1304] = 0;
+    image[0x1306] = 0;
+    image[0x1308] = 0;
+    image[0x130a] = 0;
+    validate_retained_directory(
+        &image,
+        &pe,
+        3,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 12,
+        },
+    )
+    .expect("zero-offset unwind slots remain bounded and ordered");
+    image[0x1304..0x130c].copy_from_slice(&[6, 0x30, 5, 0x02, 4, 0x03, 3, 0x68]);
+
+    image[0x1305] = 0x40;
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    image[0x1305] = 0x30;
+    image[0x130b] = 0x08;
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    image[0x130b] = 0x68;
+    image[0x1309] = 0x13;
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    image[0x1309] = 0x03;
+    image[0x1301] = 2;
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    image[0x1301] = 6;
+    put_u32(&mut image, 0x1108, 0x1302);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1108, 0x1300);
+    put_u32(&mut image, 0x110c, 0x1100);
+    put_u32(&mut image, 0x1110, 0x1104);
+    put_u32(&mut image, 0x1114, 0x1300);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 24
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn relocation_blocks_require_dword_layout_and_owned_pages() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1400, 0x1000);
+    put_u32(&mut image, 0x1404, 12);
+    validate_base_relocation_directory(
+        &image,
+        &pe,
+        DataDirectory {
+            virtual_address: 0x1400,
+            size: 12,
+        },
+    )
+    .expect("valid DWORD-aligned relocation block");
+
+    put_u32(&mut image, 0x1404, 10);
+    assert!(
+        validate_base_relocation_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1400,
+                size: 10
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1404, 12);
+    assert!(
+        validate_base_relocation_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1402,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1400, 0x2000);
+    assert!(
+        validate_base_relocation_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1400,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn producer_relocation_stream_replaces_empty_declared_block() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x1_4000_0000;
+    let mut image = vec![0; 0x2000];
+    let declared = DataDirectory {
+        virtual_address: 0x1100,
+        size: BASE_RELOCATION_BLOCK_HEADER_SIZE as u32,
+    };
+    put_u32(&mut image, 0x1104, BASE_RELOCATION_BLOCK_HEADER_SIZE as u32);
+    put_u32(&mut image, 0x1500, 0x1000);
+    put_u32(&mut image, 0x1504, 12);
+    image[0x1508..0x150a].copy_from_slice(&0xa200u16.to_le_bytes());
+    put_u64(&mut image, 0x1200, pe.image_base + 0x1600);
+    let hidden_destination = 0x1500..0x150c;
+
+    assert_eq!(
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            declared,
+            std::slice::from_ref(&hidden_destination),
+            std::slice::from_ref(&hidden_destination),
+        )
+        .unwrap(),
+        Some(DataDirectory {
+            virtual_address: 0x1500,
+            size: 12,
+        })
+    );
+
+    put_u64(&mut image, 0x1200, 0);
+    assert_eq!(
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            declared,
+            std::slice::from_ref(&hidden_destination),
+            std::slice::from_ref(&hidden_destination),
+        )
+        .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn effective_unprovenant_declared_relocations_fail_closed() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x1_4000_0000;
+    let mut image = vec![0; 0x2000];
+    let declared = DataDirectory {
+        virtual_address: 0x1400,
+        size: 12,
+    };
+    put_u32(&mut image, 0x1400, 0x1000);
+    put_u32(&mut image, 0x1404, 12);
+    image[0x1408..0x140a].copy_from_slice(&0xa200u16.to_le_bytes());
+    put_u64(&mut image, 0x1200, pe.image_base + 0x1600);
+
+    let error = recover_base_relocation_directory(&image, &pe, declared, &[], &[])
+        .expect_err("unprovenant effective relocation directory must fail closed");
+    assert!(error.to_string().contains(
+        "effective declared base-relocation directory is not authenticated by recovered payload records"
+    ));
+}
+
+#[test]
+fn relocation_like_bytes_inside_a_producer_closure_are_not_scanned() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x1_4000_0000;
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1500, 0x1000);
+    put_u32(&mut image, 0x1504, 12);
+    image[0x1508..0x150a].copy_from_slice(&0xa200u16.to_le_bytes());
+    put_u64(&mut image, 0x1200, pe.image_base + 0x1600);
+    let producer_closure = 0x1400..0x1600;
+
+    assert_eq!(
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0,
+                size: 0,
+            },
+            std::slice::from_ref(&producer_closure),
+            std::slice::from_ref(&producer_closure),
+        )
+        .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn record_provenance_selects_exact_relocation_producer() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x1_4000_0000;
+    let mut image = vec![0; 0x2000];
+    for (stream, target) in [(0x1500, 0x1200), (0x1600, 0x1210)] {
+        put_u32(&mut image, stream, 0x1000);
+        put_u32(&mut image, stream + 4, 12);
+        image[stream + 8..stream + 10]
+            .copy_from_slice(&(0xa000u16 | u16::try_from(target - 0x1000).unwrap()).to_le_bytes());
+        put_u64(
+            &mut image,
+            target,
+            pe.image_base + u64::try_from(target).unwrap(),
+        );
+    }
+    let producer_destination = 0x1500..0x150c;
+
+    assert_eq!(
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0,
+                size: 0,
+            },
+            &[0x1500..0x150c, 0x1600..0x160c],
+            std::slice::from_ref(&producer_destination),
+        )
+        .unwrap(),
+        Some(DataDirectory {
+            virtual_address: 0x1500,
+            size: 12,
+        })
+    );
+}
+
+#[test]
+fn canonical_relocations_merge_declared_reserved_slots() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x1_4000_0000;
+    let mut image = vec![0; 0x2000];
+    let declared = DataDirectory {
+        virtual_address: 0x1400,
+        size: 12,
+    };
+    let selected = DataDirectory {
+        virtual_address: 0x1500,
+        size: 12,
+    };
+    put_u32(&mut image, 0x1400, 0x1000);
+    put_u32(&mut image, 0x1404, 12);
+    image[0x1408..0x140a].copy_from_slice(&0xa200u16.to_le_bytes());
+    put_u32(&mut image, 0x1500, 0x1000);
+    put_u32(&mut image, 0x1504, 12);
+    image[0x1508..0x150a].copy_from_slice(&0xa210u16.to_le_bytes());
+    image[0x150a..0x150c].copy_from_slice(&0x0200u16.to_le_bytes());
+    put_u64(&mut image, 0x1200, pe.image_base + 0x1200);
+    put_u64(&mut image, 0x1210, pe.image_base + 0x1210);
+    let hidden_destination = 0x1500..0x150c;
+
+    let payload = canonical_base_relocation_payload(
+        &image,
+        &pe,
+        declared,
+        Some(selected),
+        std::slice::from_ref(&hidden_destination),
+    )
+    .unwrap();
+    assert_eq!(
+        u32::from_le_bytes(payload[0..4].try_into().unwrap()),
+        0x1000
+    );
+    assert_eq!(u32::from_le_bytes(payload[4..8].try_into().unwrap()), 12);
+    assert_eq!(
+        u16::from_le_bytes(payload[8..10].try_into().unwrap()),
+        0xa200
+    );
+    assert_eq!(
+        u16::from_le_bytes(payload[10..12].try_into().unwrap()),
+        0xa210
+    );
+}
+
+#[test]
+fn dynamic_base_tls_requires_complete_relocation_closure() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x1_4000_0000;
+    pe.sections[0].characteristics = 0xe000_0040;
+    pe.directories[9] = DataDirectory {
+        virtual_address: 0x1100,
+        size: 40,
+    };
+    let mut image = vec![0; 0x2000];
+    image[pe.opt + 70..pe.opt + 72].copy_from_slice(&0x0040u16.to_le_bytes());
+    for (offset, value) in [
+        (0x1100, pe.image_base + 0x1200),
+        (0x1108, pe.image_base + 0x1208),
+        (0x1110, pe.image_base + 0x1210),
+        (0x1118, pe.image_base + 0x1220),
+        (0x1220, pe.image_base + 0x1300),
+    ] {
+        put_u64(&mut image, offset, value);
+    }
+    let selected = DataDirectory {
+        virtual_address: 0x1500,
+        size: 20,
+    };
+    put_u32(&mut image, 0x1500, 0x1000);
+    put_u32(&mut image, 0x1504, 20);
+    for (index, word) in [0xa100u16, 0xa108, 0x0110, 0xa118, 0xa220, 0]
+        .into_iter()
+        .enumerate()
+    {
+        image[0x1508 + index * 2..0x150a + index * 2].copy_from_slice(&word.to_le_bytes());
+    }
+    let empty = DataDirectory {
+        virtual_address: 0,
+        size: 0,
+    };
+    assert!(canonical_base_relocation_payload(&image, &pe, empty, Some(selected), &[]).is_err());
+
+    image[0x150c..0x150e].copy_from_slice(&0xa110u16.to_le_bytes());
+    let payload =
+        canonical_base_relocation_payload(&image, &pe, empty, Some(selected), &[]).unwrap();
+    assert_eq!(u32::from_le_bytes(payload[4..8].try_into().unwrap()), 20);
+    assert_eq!(
+        u16::from_le_bytes(payload[12..14].try_into().unwrap()),
+        0xa110
+    );
+}
+
+#[test]
+fn canonical_relocations_reuse_or_append_storage() {
+    let pe = test_pe();
+    let payload = [0xa5; 12];
+    let selected = DataDirectory {
+        virtual_address: 0x1100,
+        size: 12,
+    };
+    let mut mapped = vec![0; 0x3000];
+    let (directory, generated) =
+        place_base_relocation_payload(&mut mapped, &pe, Some(selected), &payload, 0x3000).unwrap();
+    assert_eq!(directory, selected);
+    assert!(generated.is_empty());
+    assert_eq!(&mapped[0x1100..0x110c], &payload);
+
+    let too_small = DataDirectory {
+        virtual_address: 0x1100,
+        size: 8,
+    };
+    let (directory, generated) =
+        place_base_relocation_payload(&mut mapped, &pe, Some(too_small), &payload, 0x3000).unwrap();
+    assert_eq!(
+        directory,
+        DataDirectory {
+            virtual_address: 0x3000,
+            size: 12,
+        }
+    );
+    assert_eq!(generated, payload);
+}
+
+#[test]
+fn authenticated_relocations_override_nonprovenant_declared_streams() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x1_4000_0000;
+    let mut image = vec![0; 0x2000];
+    let declared = DataDirectory {
+        virtual_address: 0x1400,
+        size: 12,
+    };
+    for (stream, target) in [(0x1400, 0x1200), (0x1500, 0x1210), (0x1600, 0x1220)] {
+        put_u32(&mut image, stream, 0x1000);
+        put_u32(&mut image, stream + 4, 12);
+        image[stream + 8..stream + 10]
+            .copy_from_slice(&(0xa000u16 | u16::try_from(target - 0x1000).unwrap()).to_le_bytes());
+        put_u64(
+            &mut image,
+            target,
+            pe.image_base + u64::try_from(target).unwrap(),
+        );
+    }
+    let declared_destination = 0x1400..0x140c;
+    let hidden_destination = 0x1500..0x150c;
+
+    assert_eq!(
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            declared,
+            std::slice::from_ref(&declared_destination),
+            std::slice::from_ref(&declared_destination),
+        )
+        .unwrap(),
+        Some(declared)
+    );
+
+    assert_eq!(
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            declared,
+            std::slice::from_ref(&hidden_destination),
+            std::slice::from_ref(&hidden_destination),
+        )
+        .unwrap(),
+        Some(DataDirectory {
+            virtual_address: 0x1500,
+            size: 12,
+        })
+    );
+
+    let selected = DataDirectory {
+        virtual_address: 0x1500,
+        size: 12,
+    };
+    let payload = canonical_base_relocation_payload(
+        &image,
+        &pe,
+        declared,
+        Some(selected),
+        std::slice::from_ref(&hidden_destination),
+    )
+    .unwrap();
+    assert_eq!(
+        u16::from_le_bytes(payload[8..10].try_into().unwrap()),
+        0xa200
+    );
+    assert_eq!(
+        u16::from_le_bytes(payload[10..12].try_into().unwrap()),
+        0xa210
+    );
+
+    let empty_declared = DataDirectory {
+        virtual_address: 0x1400,
+        size: BASE_RELOCATION_BLOCK_HEADER_SIZE as u32,
+    };
+    put_u32(&mut image, 0x1400, 0);
+    put_u32(&mut image, 0x1404, BASE_RELOCATION_BLOCK_HEADER_SIZE as u32);
+    assert!(
+        recover_base_relocation_directory(
+            &image,
+            &pe,
+            empty_declared,
+            &[0x1500..0x150c, 0x1600..0x160c],
+            &[0x1500..0x150c, 0x1600..0x160c],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn unwind_info_validates_chain_handlers_and_slot_encoding() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.sections[0].characteristics = 0xe000_0020;
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1100, 0x1200);
+    put_u32(&mut image, 0x1104, 0x1210);
+    put_u32(&mut image, 0x1108, 0x1300);
+    image[0x1300] = 0x21; // Version 1 with CHAININFO.
+    put_u32(&mut image, 0x1304, 0x1220);
+    put_u32(&mut image, 0x1308, 0x1230);
+    put_u32(&mut image, 0x130c, 0x1320);
+    image[0x1320] = 1;
+    validate_retained_directory(
+        &image,
+        &pe,
+        3,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 12,
+        },
+    )
+    .expect("valid chained UNWIND_INFO");
+
+    image[0x1300..0x1314].fill(0);
+    image[0x1300..0x1306].copy_from_slice(&[0x21, 8, 1, 0, 8, 0x02]);
+    put_u32(&mut image, 0x1308, 0x1220);
+    put_u32(&mut image, 0x130c, 0x1230);
+    put_u32(&mut image, 0x1310, 0x1320);
+    image[0x1320..0x1326].copy_from_slice(&[1, 8, 1, 0, 8, 0x12]);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    image[0x1300..0x1314].fill(0);
+    image[0x1300] = 0x21;
+    put_u32(&mut image, 0x1304, 0x1220);
+    put_u32(&mut image, 0x1308, 0x1230);
+    put_u32(&mut image, 0x130c, 0x1320);
+    image[0x1320..0x1326].fill(0);
+    image[0x1320] = 1;
+
+    put_u32(&mut image, 0x130c, 0x1300);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x130c, 0x1320);
+    image[0x1300] = 0x09; // Version 1 with EHANDLER.
+    put_u32(&mut image, 0x1304, 0x1200);
+    validate_retained_directory(
+        &image,
+        &pe,
+        3,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 12,
+        },
+    )
+    .expect("valid exception-handler UNWIND_INFO");
+    put_u32(&mut image, 0x1304, 0);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1304, 0x1200);
+    image[0x1300] = 0x81; // Version 1 with a reserved flag bit.
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+
+    image[0x1300..0x1304].copy_from_slice(&[1, 1, 1, 0]);
+    image[0x1304..0x1306].copy_from_slice(&[1, 0x0b]);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            3,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 12
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn unwind_info_v2_validates_epilogues_and_spare_slots() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.sections[0].characteristics = 0xe000_0020;
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1100, 0x1200);
+    put_u32(&mut image, 0x1104, 0x1210);
+    put_u32(&mut image, 0x1108, 0x1300);
+    let directory = DataDirectory {
+        virtual_address: 0x1100,
+        size: 12,
+    };
+
+    image[0x1300..0x130a].copy_from_slice(&[2, 1, 3, 0, 2, 0x16, 0, 0x06, 1, 0x70]);
+    validate_retained_directory(&image, &pe, 3, directory)
+        .expect("valid UNWIND_INFO v2 terminal epilogue");
+
+    image[0x1300] = 1;
+    assert!(validate_retained_directory(&image, &pe, 3, directory).is_err());
+    image[0x1300] = 2;
+    image[0x1304] = 0;
+    assert!(validate_retained_directory(&image, &pe, 3, directory).is_err());
+
+    image[0x1300..0x130a].copy_from_slice(&[2, 1, 3, 0, 1, 0x07, 0, 0, 0, 0]);
+    validate_retained_directory(&image, &pe, 3, directory)
+        .expect("bounded UNWIND_INFO v2 UWOP_SPARE");
+    image[0x1302] = 2;
+    assert!(validate_retained_directory(&image, &pe, 3, directory).is_err());
+}
+
+#[test]
+fn delay_import_validates_paired_tables_and_terminators() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1100, 1);
+    put_u32(&mut image, 0x1104, 0x1200);
+    put_u32(&mut image, 0x1108, 0x1240);
+    put_u32(&mut image, 0x110c, 0x1250);
+    put_u32(&mut image, 0x1110, 0x1260);
+    put_u32(&mut image, 0x1114, 0x1270);
+    put_u32(&mut image, 0x1118, 0x1280);
+    image[0x1200..0x120a].copy_from_slice(b"delay.dll\0");
+    put_u32(&mut image, 0x1250, 0x1300);
+    put_u32(&mut image, 0x1260, 0x1300);
+    put_u32(&mut image, 0x1270, 0x7654_3210);
+    put_u32(&mut image, 0x1280, 0x1300);
+    image[0x1302..0x1307].copy_from_slice(b"Func\0");
+    validate_retained_directory(
+        &image,
+        &pe,
+        13,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 64,
+        },
+    )
+    .expect("valid delay-import descriptor");
+
+    put_u32(&mut image, 0x1274, 1);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            13,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 64
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1274, 0);
+
+    put_u32(&mut image, 0x1264, 0x1300);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            13,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 64
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1264, 0);
+    put_u32(&mut image, 0x1100, 2);
+    assert!(
+        validate_retained_directory(
+            &image,
+            &pe,
+            13,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 64
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn delay_import_honors_va_descriptor_and_thunk_semantics() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1104, 0x401200);
+    put_u32(&mut image, 0x1108, 0x401240);
+    put_u32(&mut image, 0x110c, 0x401250);
+    put_u32(&mut image, 0x1110, 0x401260);
+    image[0x1200..0x120a].copy_from_slice(b"delay.dll\0");
+    put_u32(&mut image, 0x1250, 0x401300);
+    put_u32(&mut image, 0x1260, 0x401300);
+    image[0x1302..0x1307].copy_from_slice(b"Func\0");
+    validate_retained_directory(
+        &image,
+        &pe,
+        13,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 64,
+        },
+    )
+    .expect("valid VA-mode delay-import descriptor");
+}
+#[test]
+fn export_forwarder_after_initial_closure_extends_directory_size() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    standard_export(&mut image, 0x1300);
+    put_u32(&mut image, 0x1350, 0x1500);
+    image[0x1500..0x150a].copy_from_slice(b"other.#12\0");
+    let export = scan_export(&image, &pe).unwrap().unwrap();
+    assert_eq!(export.size, 0x20a);
+}
+
+#[test]
+fn cloned_import_graph_at_disjoint_rva_is_rejected() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    standard_import(&mut image, 0x1100, 0);
+    let descriptor = image[0x1100..0x1114].to_vec();
+    image[0x1500..0x1514].copy_from_slice(&descriptor);
+    assert!(select_import_candidate(scan_import_candidates(&image, &pe).unwrap()).is_err());
+}
+
+#[test]
+fn tls_callback_array_must_terminate() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    // PE32 AddressOfCallbacks points to a non-terminated array of valid VAs.
+    put_u32(&mut image, 0x1100 + 12, 0x401180);
+    for cell in (0x1180..0x2000).step_by(4) {
+        put_u32(&mut image, cell, 0x401100);
+    }
+    assert!(
+        validate_tls_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 24
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn tls_raw_data_requires_both_endpoints() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1100, 0x401100);
+    assert!(
+        validate_tls_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 24
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn tls_validates_characteristics_and_pe32_plus_index_width() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    put_u32(&mut image, 0x1114, 1);
+    assert!(
+        validate_tls_directory(
+            &image,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 24
+            }
+        )
+        .is_err()
+    );
+    put_u32(&mut image, 0x1114, 0x0010_0000);
+    validate_tls_directory(
+        &image,
+        &pe,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 24,
+        },
+    )
+    .expect("TLS alignment characteristics are legal");
+
+    let mut pe64 = test_pe();
+    pe64.machine = Machine::Amd64;
+    let mut image64 = vec![0; 0x2000];
+    put_u64(&mut image64, 0x1110, 0x401ffc);
+    validate_tls_directory(
+        &image64,
+        &pe64,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 40,
+        },
+    )
+    .expect("PE32+ TLS index needs only its writable DWORD");
+}
+
+#[test]
+fn serializer_normalizes_image_section_and_header_fields() {
+    let mut pe = test_pe();
+    pe.sections[0].characteristics = 0x6000_0020;
+    let mut mapped = vec![0; 0x2000];
+    mapped[..0x200].fill(0);
+    put_u32(&mut mapped, pe.coff_symbol_table_offset(), 0xdead_beef);
+    put_u32(&mut mapped, pe.coff_symbol_table_offset() + 4, 7);
+    put_u32(&mut mapped, pe.win32_version_value_offset(), 1);
+    put_u32(&mut mapped, pe.loader_flags_offset(), 1);
+    mapped[0x1f0] = 0xa5;
+    let output = serialize_sections(
+        &mapped,
+        &pe,
+        0x2000,
+        0x1000,
+        &[],
+        0x2000,
+        0x1000,
+        None,
+        0,
+        0x3000,
+        &[],
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 4,
+        },
+        DataDirectory {
+            virtual_address: 0,
+            size: 0,
+        },
+    )
+    .unwrap();
+    let characteristics = u32::from_le_bytes(output[0x178 + 36..0x178 + 40].try_into().unwrap());
+    assert_eq!(characteristics, 0x6000_0020);
+    assert_eq!(characteristics & 0x8000_0000, 0);
+    let import_header = 0x178 + SECTION_HEADER_SIZE;
+    assert_eq!(
+        u32::from_le_bytes(
+            output[import_header + 20..import_header + 24]
+                .try_into()
+                .unwrap()
+        ),
+        0
+    );
+    assert_eq!(
+        u32::from_le_bytes(
+            output[import_header + 36..import_header + 40]
+                .try_into()
+                .unwrap()
+        ),
+        IMPORT_SECTION_CHARACTERISTICS
+    );
+    assert_eq!(u32_at(&output, pe.coff_symbol_table_offset()).unwrap(), 0);
+    assert_eq!(
+        u32_at(&output, pe.coff_symbol_table_offset() + 4).unwrap(),
+        0
+    );
+    assert_eq!(u32_at(&output, pe.win32_version_value_offset()).unwrap(), 0);
+    assert_eq!(u32_at(&output, pe.loader_flags_offset()).unwrap(), 0);
+    assert_eq!(output[0x1f0], 0);
+}
+
+#[test]
+fn serializer_translates_debug_pointer_for_nonidentity_raw_layout() {
+    let pe = test_pe();
+    let mut mapped = vec![0; 0x2000];
+    // IMAGE_DEBUG_DIRECTORY at RVA 0x1100: SizeOfData=4, AddressOfRawData=0x1180,
+    // deliberately stale PointerToRawData=0xdeadbeef.
+    put_u32(&mut mapped, 0x1100 + 16, 4);
+    put_u32(&mut mapped, 0x1100 + 20, 0x1180);
+    put_u32(&mut mapped, 0x1100 + 24, 0xdead_beef);
+    let debug = DataDirectory {
+        virtual_address: 0x1100,
+        size: 28,
+    };
+    let output = serialize_sections(
+        &mapped,
+        &pe,
+        0x2000,
+        0x1000,
+        &[],
+        0x2000,
+        0x1000,
+        None,
+        0,
+        0x3000,
+        &[(6, debug)],
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 4,
+        },
+        DataDirectory {
+            virtual_address: 0,
+            size: 0,
+        },
+    )
+    .unwrap();
+    // Headers take 0x200 bytes; the section is laid out at raw 0x200, so RVA 0x1100 maps to 0x300.
+    assert_eq!(
+        u32::from_le_bytes(output[0x300 + 24..0x300 + 28].try_into().unwrap()),
+        0x380
+    );
+}
+
+#[test]
+fn iat_envelope_covers_holes_within_one_owner_section() {
+    let pe = test_pe();
+    let discovery = LoaderDiscovery {
+        table_rva: 0,
+        metadata_ranges: Vec::new(),
+        image_size: pe.size_of_image,
+        modules: vec![
+            ImportModule {
+                dll: "a.dll".into(),
+                destination_rva: 0x1100,
+                symbols: vec![ImportSymbol::Ordinal(1)],
+            },
+            ImportModule {
+                dll: "b.dll".into(),
+                destination_rva: 0x1180,
+                symbols: vec![ImportSymbol::Ordinal(2)],
+            },
+        ],
+        function_count: 2,
+        named_count: 0,
+        ordinal_count: 2,
+    };
+    assert_eq!(
+        iat_directory(&pe, &discovery).unwrap(),
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 0x88
+        }
+    );
+}
+
+#[test]
+fn emitted_lookup_tables_initialize_standard_iat_cells() {
+    let pe = test_pe();
+    let discovery = LoaderDiscovery {
+        table_rva: 0,
+        metadata_ranges: Vec::new(),
+        image_size: pe.size_of_image,
+        modules: vec![ImportModule {
+            dll: "a.dll".into(),
+            destination_rva: 0x1100,
+            symbols: vec![ImportSymbol::Ordinal(7)],
+        }],
+        function_count: 1,
+        named_count: 0,
+        ordinal_count: 1,
+    };
+    let import_rva = 0x2000;
+    let emission = emit_imports(&pe, &discovery, import_rva).unwrap();
+    let lookup_rva = u32_at(&emission.bytes, 0).unwrap();
+    let lookup_offset = usize::try_from(lookup_rva - import_rva).unwrap();
+    let mut mapped = vec![0xaa; usize::try_from(pe.size_of_image).unwrap()];
+
+    initialize_iat_cells(&mut mapped, &pe, &discovery, import_rva, &emission.bytes).unwrap();
+    assert_eq!(
+        &mapped[0x1100..0x1108],
+        &emission.bytes[lookup_offset..lookup_offset + 8]
+    );
+    assert_eq!(
+        u32::from_le_bytes(mapped[0x1100..0x1104].try_into().unwrap()),
+        0x8000_0007
+    );
+    assert_eq!(&mapped[0x1104..0x1108], &[0; 4]);
+
+    let mut mismatched = emission.bytes;
+    put_u32(&mut mismatched, 16, 0x1180);
+    assert!(initialize_iat_cells(&mut mapped, &pe, &discovery, import_rva, &mismatched).is_err());
+}
+
+#[test]
+fn iat_envelope_rejects_cross_section_and_missing_slot() {
+    let mut pe = test_pe();
+    pe.sections.push(Section {
+        index: 1,
+        header_offset: 0x1a0,
+        name_bytes: *b".next\0\0\0",
+        virtual_size: 0x1000,
+        virtual_address: 0x2000,
+        raw_size: 0x1000,
+        raw_pointer: 0x1200,
+        characteristics: 0xc0000040,
+    });
+    pe.section_count = 2;
+    pe.size_of_image = 0x3000;
+    let discovery = LoaderDiscovery {
+        table_rva: 0,
+        metadata_ranges: Vec::new(),
+        image_size: pe.size_of_image,
+        modules: vec![
+            ImportModule {
+                dll: "a.dll".into(),
+                destination_rva: 0x1100,
+                symbols: vec![ImportSymbol::Ordinal(1)],
+            },
+            ImportModule {
+                dll: "b.dll".into(),
+                destination_rva: 0x2000,
+                symbols: vec![ImportSymbol::Ordinal(2)],
+            },
+        ],
+        function_count: 2,
+        named_count: 0,
+        ordinal_count: 2,
+    };
+    assert!(iat_directory(&pe, &discovery).is_err());
+    pe.directories.truncate(IAT_DIRECTORY);
+    assert!(
+        serialize_sections(
+            &vec![0; 0x3000],
+            &pe,
+            0x3000,
+            0x1000,
+            &[],
+            0x3000,
+            0x1000,
+            None,
+            0,
+            0x4000,
+            &[],
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 4
+            },
+            DataDirectory {
+                virtual_address: 0,
+                size: 0
+            },
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn section_aggregate_sizes_sum_mixed_flags_by_pe_rules() {
+    let actual = section_aggregate_sizes([
+        Ok((
+            0x200,
+            0x100,
+            IMAGE_SCN_CNT_CODE | IMAGE_SCN_CNT_INITIALIZED_DATA,
+        )),
+        Ok((
+            0x400,
+            0x300,
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_CNT_UNINITIALIZED_DATA,
+        )),
+        Ok((0x800, 0x500, IMAGE_SCN_CNT_UNINITIALIZED_DATA)),
+    ])
+    .unwrap();
+    assert_eq!(actual, (0x200, 0x600, 0x800));
+}
+
+#[test]
+fn section_aggregate_sizes_reject_overflow() {
+    assert!(
+        section_aggregate_sizes([
+            Ok((u32::MAX, 0, IMAGE_SCN_CNT_CODE)),
+            Ok((1, 0, IMAGE_SCN_CNT_CODE))
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn compact_raw_layout_trims_nonzero_prefix_to_file_alignment() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    image[0x1357] = 1;
+    let layout = compact_raw_layout(&image, &pe, &[]).unwrap();
+    assert_eq!(layout[0].raw_size, 0x400);
+}
+
+#[test]
+fn compact_raw_layout_allows_zero_raw_sections_and_keeps_late_data() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    assert_eq!(compact_raw_layout(&image, &pe, &[]).unwrap()[0].raw_size, 0);
+    image[0x1fff] = 0x7f;
+    assert_eq!(
+        compact_raw_layout(&image, &pe, &[]).unwrap()[0].raw_size,
+        0x1000
+    );
+}
+
+#[test]
+fn compact_raw_layout_keeps_zeroed_debug_payload_in_the_raw_prefix() {
+    let mut pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    pe.directories[6] = DataDirectory {
+        virtual_address: 0x1100,
+        size: 28,
+    };
+    put_u32(&mut image, 0x1100 + 16, 0x20);
+    put_u32(&mut image, 0x1100 + 20, 0x1800);
+    assert_eq!(
+        compact_raw_layout(&image, &pe, &[(6, pe.directories[6])]).unwrap()[0].raw_size,
+        0xa00
+    );
+}
+
+#[test]
+fn serializer_maps_trimmed_zero_tail_back_to_the_original_image() {
+    let pe = test_pe();
+    let mut mapped = vec![0; 0x2000];
+    mapped[0x1357] = 1;
+    mapped[..2].copy_from_slice(b"MZ");
+    put_u32(&mut mapped, 0x3c, 0x80);
+    mapped[0x80..0x84].copy_from_slice(b"PE\0\0");
+    mapped[0x84..0x86].copy_from_slice(&0x14cu16.to_le_bytes());
+    mapped[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+    mapped[0x94..0x96].copy_from_slice(&0xe0u16.to_le_bytes());
+    mapped[0x96..0x98].copy_from_slice(&0x102u16.to_le_bytes());
+    mapped[0x98..0x9a].copy_from_slice(&0x10bu16.to_le_bytes());
+    put_u32(&mut mapped, 0x98 + 16, 0x1000);
+    put_u32(&mut mapped, 0x98 + 28, 0x400000);
+    put_u32(&mut mapped, 0x98 + 32, 0x1000);
+    put_u32(&mut mapped, 0x98 + 36, 0x200);
+    put_u32(&mut mapped, 0x98 + 56, 0x3000);
+    put_u32(&mut mapped, 0x98 + 60, 0x200);
+    put_u32(&mut mapped, 0x98 + 92, 16);
+    let output = serialize_sections(
+        &mapped,
+        &pe,
+        0x2000,
+        0x1000,
+        &[],
+        0x2000,
+        0x1000,
+        None,
+        0,
+        0x3000,
+        &[],
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 4,
+        },
+        DataDirectory {
+            virtual_address: 0,
+            size: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        u32::from_le_bytes(output[0x178 + 8..0x178 + 12].try_into().unwrap()),
+        0x1000
+    );
+    assert_eq!(
+        u32::from_le_bytes(output[0x178 + 16..0x178 + 20].try_into().unwrap()),
+        0x400
+    );
+    assert_eq!(&output[0x200..0x600], &mapped[0x1000..0x1400]);
+    let emitted = Pe::parse(&output).unwrap();
+    let remapped = emitted.map_image(&output).unwrap();
+    assert_eq!(&remapped[0x1000..0x2000], &mapped[0x1000..0x2000]);
+}
+
+#[test]
+fn retained_exception_directory_reuses_amd64_runtime_validation() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x0000_0001_4000_0000;
+    pe.sections[0].name_bytes = *b".text\0\0\0";
+    pe.sections[0].characteristics = 0x6000_0020;
+    pe.sections.push(Section {
+        index: 1,
+        header_offset: 0x1a0,
+        name_bytes: *b".pdata\0\0",
+        virtual_size: 0x1000,
+        virtual_address: 0x2000,
+        raw_size: 0x1000,
+        raw_pointer: 0x1200,
+        characteristics: 0x4000_0040,
+    });
+    pe.section_count = 2;
+    pe.size_of_image = 0x3000;
+    pe.file_len = 0x2200;
+    let directory = DataDirectory {
+        virtual_address: 0x2000,
+        size: AMD64_RUNTIME_FUNCTION_LEN as u32,
+    };
+    pe.directories[EXCEPTION_DIRECTORY] = directory;
+    let mut image = vec![0; 0x3000];
+    put_u32(&mut image, 0x2000, 0x1000);
+    put_u32(&mut image, 0x2004, 0x1020);
+    put_u32(&mut image, 0x2008, 0x2020);
+    image[0x2020] = 1;
+
+    validate_retained_directory(&image, &pe, EXCEPTION_DIRECTORY, directory).unwrap();
+    put_u32(&mut image, 0x2004, 0x1000);
+    assert!(validate_retained_directory(&image, &pe, EXCEPTION_DIRECTORY, directory).is_err());
+}
+
+#[test]
+fn base_relocation_validator_accepts_empty_and_machine_specific_blocks() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    let mut directory = DataDirectory {
+        virtual_address: 0x1100,
+        size: BASE_RELOCATION_BLOCK_HEADER_SIZE as u32,
+    };
+    put_u32(&mut image, 0x1104, BASE_RELOCATION_BLOCK_HEADER_SIZE as u32);
+    validate_retained_directory(&image, &pe, BASE_RELOCATION_DIRECTORY, directory).unwrap();
+
+    directory.size = (BASE_RELOCATION_BLOCK_HEADER_SIZE + 4) as u32;
+    put_u32(&mut image, 0x1100, 0x1000);
+    put_u32(&mut image, 0x1104, directory.size);
+    image[0x1108..0x110a].copy_from_slice(&((IMAGE_REL_BASED_HIGHLOW << 12) | 0x200).to_le_bytes());
+    validate_retained_directory(&image, &pe, BASE_RELOCATION_DIRECTORY, directory).unwrap();
+
+    image[0x1108..0x110a].copy_from_slice(&((IMAGE_REL_BASED_DIR64 << 12) | 0x200).to_le_bytes());
+    assert!(
+        validate_retained_directory(&image, &pe, BASE_RELOCATION_DIRECTORY, directory).is_err()
+    );
+}
+
+#[test]
+fn delay_import_validator_requires_rva_descriptors_and_valid_thunks() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    let directory = DataDirectory {
+        virtual_address: 0x1100,
+        size: (DELAY_IMPORT_DESCRIPTOR_SIZE * 2) as u32,
+    };
+    put_u32(&mut image, 0x1100, 1);
+    put_u32(&mut image, 0x1104, 0x1180);
+    put_u32(&mut image, 0x1108, 0x1190);
+    put_u32(&mut image, 0x110c, 0x11a0);
+    put_u32(&mut image, 0x1110, 0x11b0);
+    image[0x1180..0x1188].copy_from_slice(b"foo.dll\0");
+    put_u32(&mut image, 0x11b0, 0x11c0);
+    image[0x11c2..0x11c7].copy_from_slice(b"Func\0");
+
+    validate_retained_directory(&image, &pe, DELAY_IMPORT_DIRECTORY, directory).unwrap();
+    put_u32(&mut image, 0x1100, 0);
+    assert!(validate_retained_directory(&image, &pe, DELAY_IMPORT_DIRECTORY, directory).is_err());
+}

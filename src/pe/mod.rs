@@ -1,8 +1,10 @@
+mod address;
 mod checksum;
 mod image;
 mod model;
 mod parse;
 
+pub use address::{FileOffset, FileRange, Rva, RvaRange};
 pub use checksum::{align_up, pe_checksum};
 pub use image::write_u32;
 #[cfg(test)]
