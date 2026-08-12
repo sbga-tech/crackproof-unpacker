@@ -2,7 +2,8 @@ use super::{
     DESCRIPTOR_SIZE, DiscoveryBudget, ImportModule, ImportProfile, ImportSymbol, MAX_API_NAME_LEN,
     MAX_ATTEMPTED_LOADER_STRING_BYTES, MAX_PARSED_DESCRIPTORS, MAX_PARSED_FUNCTIONS,
     MAX_REFERENCED_METADATA_BYTES, MAX_SCANNED_DESCRIPTOR_STARTS, MAX_VALID_CANDIDATES,
-    discover_imports_in_image, named_thunk_rva, ordinal_flag, pointer_size_rva,
+    discover_imports_in_image, discover_native_dll_imports_in_image, named_thunk_rva, ordinal_flag,
+    pointer_size_rva,
 };
 use crate::pe::{DataDirectory, PointerWidth};
 use crate::pipeline::stages::imports::test_support::*;
@@ -88,6 +89,9 @@ fn standard_discovery_accepts_tagged_pe32_plus_shared_iat() {
             .iter()
             .all(|range| range.end <= iat_rva || iat_rva + 16 <= range.start)
     );
+    let (profile, fallback) = discover_native_dll_imports_in_image(&mapped, &pe).unwrap();
+    assert_eq!(profile, ImportProfile::Standard);
+    assert_eq!(fallback, discovery);
 }
 
 #[test]

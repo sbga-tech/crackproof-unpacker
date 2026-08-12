@@ -58,6 +58,45 @@ pub(crate) fn discover_i386_semantic_entry(mapped: &[u8], pe: &Pe) -> Result<Sem
         };
 
         match predecessors.count {
+            0 if veneer.entry_rva == pe.entry_rva => {
+                let Some((cookie_rva, cookie_complement_rva)) = i386_security_cookie_evidence(
+                    mapped,
+                    pe,
+                    &executable_ranges,
+                    veneer.veneer_helper_target_rva,
+                    false,
+                )?
+                else {
+                    continue;
+                };
+                if !i386_seh_startup_helper_evidence(
+                    mapped,
+                    pe,
+                    &executable_ranges,
+                    veneer.crt_helper_target_rva,
+                    cookie_rva,
+                )? {
+                    continue;
+                }
+                entries
+                    .try_reserve(1)
+                    .context("reserving header-selected I386 semantic entry")?;
+                entries.push(SemanticEntry {
+                    entry_rva: veneer.entry_rva,
+                    predecessor_rva: None,
+                    veneer_call_target_rva: veneer.veneer_call_target_rva,
+                    veneer_helper_target_rva: veneer.veneer_helper_target_rva,
+                    startup_rva: veneer.startup_rva,
+                    crt_call_target_rva: veneer.crt_call_target_rva,
+                    crt_helper_target_rva: veneer.crt_helper_target_rva,
+                    startup_data_rva: veneer.startup_data_rva,
+                    startup_data_len: veneer.startup_data_len,
+                    evidence: SemanticEvidence::I386MsvcStandalone {
+                        cookie_rva,
+                        cookie_complement_rva,
+                    },
+                });
+            }
             0 => {}
             1 => {
                 entries
@@ -257,6 +296,30 @@ fn standalone_msvc_veneers(
     Ok(veneers)
 }
 
+fn has_absolute_register_store(bytes: &[u8], address: u32) -> bool {
+    let address = address.to_le_bytes();
+    bytes
+        .windows(6)
+        .any(|window| window[0] == 0x89 && window[1] & 0xc7 == 0x05 && window[2..] == address)
+        || bytes
+            .windows(5)
+            .any(|window| window[0] == 0xa3 && window[1..] == address)
+}
+
+fn has_not_then_absolute_store(bytes: &[u8], address: u32) -> bool {
+    let address = address.to_le_bytes();
+    bytes.windows(8).any(|window| {
+        let register = window[1].wrapping_sub(0xd0);
+        window[0] == 0xf7
+            && register < 8
+            && window[2] == 0x89
+            && window[3] == 0x05 | (register << 3)
+            && window[4..] == address
+    }) || bytes
+        .windows(7)
+        .any(|window| window[..3] == [0xf7, 0xd0, 0xa3] && window[3..] == address)
+}
+
 fn i386_security_cookie_evidence(
     mapped: &[u8],
     pe: &Pe,
@@ -268,19 +331,15 @@ fn i386_security_cookie_evidence(
     const DEFAULT_COOKIE_HIGH_WORD_GUARD: u32 = 0xffff_0000;
 
     let bytes = mapped_bytes(mapped, initializer_rva, I386_COOKIE_EVIDENCE_LEN)?;
-    if bytes[..5] != [0x55, 0x8b, 0xec, 0x83, 0xec]
-        || !bytes
-            .windows(5)
-            .any(|window| window == [0xbf, 0x4e, 0xe6, 0x40, 0xbb])
+    let standard_prologue = bytes[..5] == [0x55, 0x8b, 0xec, 0x83, 0xec];
+    let hotpatch_prologue = bytes[..7] == [0x8b, 0xff, 0x55, 0x8b, 0xec, 0x83, 0xec];
+    if (!standard_prologue && !hotpatch_prologue)
         || !bytes.windows(5).any(|window| {
-            window
-                == [
-                    0xbe,
-                    DEFAULT_COOKIE_HIGH_WORD_GUARD.to_le_bytes()[0],
-                    DEFAULT_COOKIE_HIGH_WORD_GUARD.to_le_bytes()[1],
-                    DEFAULT_COOKIE_HIGH_WORD_GUARD.to_le_bytes()[2],
-                    DEFAULT_COOKIE_HIGH_WORD_GUARD.to_le_bytes()[3],
-                ]
+            (0xb8..=0xbf).contains(&window[0]) && window[1..] == DEFAULT_COOKIE.to_le_bytes()
+        })
+        || !bytes.windows(5).any(|window| {
+            (0xb8..=0xbf).contains(&window[0])
+                && window[1..] == DEFAULT_COOKIE_HIGH_WORD_GUARD.to_le_bytes()
         })
     {
         return Ok(None);
@@ -309,19 +368,7 @@ fn i386_security_cookie_evidence(
             continue;
         }
 
-        let cookie_store = [
-            0x89,
-            0x0d,
-            cookie_va.to_le_bytes()[0],
-            cookie_va.to_le_bytes()[1],
-            cookie_va.to_le_bytes()[2],
-            cookie_va.to_le_bytes()[3],
-        ];
-        if require_cookie_store
-            && !bytes
-                .windows(cookie_store.len())
-                .any(|window| window == cookie_store)
-        {
+        if require_cookie_store && !has_absolute_register_store(bytes, cookie_va) {
             continue;
         }
         for complement_window in bytes.windows(7) {
@@ -346,20 +393,7 @@ fn i386_security_cookie_evidence(
             {
                 continue;
             }
-            let complement_store = [
-                0xf7,
-                0xd1,
-                0x89,
-                0x0d,
-                complement_va.to_le_bytes()[0],
-                complement_va.to_le_bytes()[1],
-                complement_va.to_le_bytes()[2],
-                complement_va.to_le_bytes()[3],
-            ];
-            if bytes
-                .windows(complement_store.len())
-                .any(|window| window == complement_store)
-            {
+            if has_not_then_absolute_store(bytes, complement_va) {
                 return Ok(Some((cookie_rva, complement_rva)));
             }
         }

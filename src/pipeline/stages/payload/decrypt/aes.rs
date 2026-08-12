@@ -310,21 +310,30 @@ fn scan_aes_contexts_in_range_impl(
     Ok(matches)
 }
 
-pub(crate) fn aes256_cbc_decrypt_full_blocks_in_place(
-    data: &mut [u8],
-    key: &[u8; AES_256_KEY_SIZE],
-) {
-    let cipher = Aes256::new_from_slice(key).expect("AES-256 key length is fixed");
-    let mut previous = [0u8; 16];
-    let complete_length = data.len() & !0x0f;
-    for bytes in data[..complete_length].chunks_exact_mut(16) {
-        let ciphertext: [u8; 16] = bytes
-            .try_into()
-            .expect("AES-CBC chunk is exactly one block");
-        cipher.decrypt_block(Block::<Aes256>::from_mut_slice(bytes));
-        for (byte, previous_ciphertext_byte) in bytes.iter_mut().zip(previous) {
-            *byte ^= previous_ciphertext_byte;
+pub(crate) struct Aes256CbcDecryptor {
+    cipher: Aes256,
+}
+
+impl Aes256CbcDecryptor {
+    pub(crate) fn new(key: &[u8; AES_256_KEY_SIZE]) -> Self {
+        Self {
+            cipher: Aes256::new_from_slice(key).expect("AES-256 key length is fixed"),
         }
-        previous = ciphertext;
+    }
+
+    pub(crate) fn decrypt_full_blocks_in_place(&self, data: &mut [u8]) {
+        let mut previous = [0u8; 16];
+        let complete_length = data.len() & !0x0f;
+        for bytes in data[..complete_length].chunks_exact_mut(16) {
+            let ciphertext: [u8; 16] = bytes
+                .try_into()
+                .expect("AES-CBC chunk is exactly one block");
+            self.cipher
+                .decrypt_block(Block::<Aes256>::from_mut_slice(bytes));
+            for (byte, previous_ciphertext_byte) in bytes.iter_mut().zip(previous) {
+                *byte ^= previous_ciphertext_byte;
+            }
+            previous = ciphertext;
+        }
     }
 }

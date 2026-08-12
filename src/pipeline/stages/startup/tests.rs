@@ -501,6 +501,44 @@ fn amd64_dll_fixture() -> (Vec<u8>, Pe, Amd64DllLayout) {
     (image, pe, layout)
 }
 
+fn place_amd64_dispatch_dll_entry(
+    image: &mut [u8],
+    entry_rva: u32,
+    dispatcher_rva: u32,
+    resolver_rva: u32,
+) {
+    write_rel32(image, entry_rva, 0xe8, dispatcher_rva);
+    image[offset(entry_rva) + 5] = 0xc3;
+    for selector in 0..3u32 {
+        let selector_rva = entry_rva + 6 + selector * 8;
+        image[offset(selector_rva)..offset(selector_rva) + 2]
+            .copy_from_slice(&[0x6a, u8::try_from(selector).unwrap()]);
+        write_rel32(image, selector_rva + 2, 0xe8, dispatcher_rva);
+        image[offset(selector_rva) + 7] = 0xc3;
+    }
+    const PREFIX: [u8; 30] = [
+        0x58, 0x51, 0x52, 0x53, 0x55, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,
+        0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0xc8,
+    ];
+    const SUFFIX: [u8; 34] = [
+        0x48, 0x83, 0xc4, 0x28, 0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x41, 0x5b, 0x41,
+        0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5d, 0x5b, 0x5a, 0x59, 0x48, 0x85, 0xc0, 0x74,
+        0x02, 0x50, 0xc3, 0xc3,
+    ];
+    let dispatcher = offset(dispatcher_rva);
+    image[dispatcher..dispatcher + PREFIX.len()].copy_from_slice(&PREFIX);
+    write_rel32(
+        image,
+        dispatcher_rva + u32::try_from(PREFIX.len()).unwrap(),
+        0xe8,
+        resolver_rva,
+    );
+    image[dispatcher + PREFIX.len() + 5..dispatcher + PREFIX.len() + 5 + SUFFIX.len()]
+        .copy_from_slice(&SUFFIX);
+    image[offset(resolver_rva)..offset(resolver_rva) + 6]
+        .copy_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3]);
+}
+
 #[test]
 fn discovers_standard_amd64_msvc_startup_from_cookie_and_runtime_evidence() {
     let (mut image, mut pe, _) = amd64_fixture();
@@ -1170,6 +1208,38 @@ fn native_dll_entry_profile_recovers_authenticated_crt_startup() {
 }
 
 #[test]
+fn native_dll_entry_profile_recovers_authenticated_header_dispatch() {
+    let (mut image, pe, layout) = amd64_dll_fixture();
+    image[offset(layout.entry)..offset(layout.entry) + 0x3d].fill(0xcc);
+    place_amd64_dispatch_dll_entry(&mut image, layout.header_aep, 0x1100, 0x1180);
+
+    let profile = discover_output_entry(&image, &pe).unwrap();
+
+    assert_eq!(
+        profile,
+        OutputEntry::NativeDll {
+            entry_rva: layout.header_aep
+        }
+    );
+    assert_eq!(profile.protected_ranges(&pe).unwrap(), vec![0x1000..0x2000]);
+}
+
+#[test]
+fn native_dll_entry_profile_rejects_split_dispatch_selector_family() {
+    let (mut image, pe, layout) = amd64_dll_fixture();
+    image[offset(layout.entry)..offset(layout.entry) + 0x3d].fill(0xcc);
+    place_amd64_dispatch_dll_entry(&mut image, layout.header_aep, 0x1100, 0x1180);
+    write_rel32(&mut image, layout.header_aep + 16, 0xe8, 0x1180);
+
+    let error = discover_output_entry(&image, &pe).unwrap_err().to_string();
+
+    assert!(
+        error.contains("authenticated header dispatch entry"),
+        "{error}"
+    );
+}
+
+#[test]
 fn native_i386_dll_entry_profile_fails_closed() {
     let (image, mut pe, _) = fixture(0);
     pe.coff_characteristics |= crate::pe::IMAGE_FILE_DLL;
@@ -1235,23 +1305,53 @@ fn managed_dll_entry_profile_discards_protector_native_bootstrap() {
 
     let profile = discover_output_entry(&image, &pe).unwrap();
 
-    assert_eq!(profile, OutputEntry::Managed { entry_rva: 0 });
+    assert_eq!(
+        profile,
+        OutputEntry::Managed {
+            entry_rva: 0,
+            kind: ManagedKind::Dll,
+        }
+    );
     assert!(profile.protected_ranges(&pe).unwrap().is_empty());
 }
 
 #[test]
-fn managed_entry_profile_rejects_non_dll_images() {
-    let (image, mut pe, layout) = fixture(0);
+fn managed_exe_entry_profile_uses_method_def_token() {
+    let (mut image, mut pe, layout) = fixture(0);
     pe.directories[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR] = DataDirectory {
         virtual_address: layout.non_executable,
         size: 0x48,
     };
+    let header_offset = usize::try_from(layout.non_executable).unwrap();
+    image[header_offset..header_offset + 4].copy_from_slice(&0x48u32.to_le_bytes());
+    image[header_offset + 20..header_offset + 24].copy_from_slice(&0x0600_0001u32.to_le_bytes());
+
+    let profile = discover_output_entry(&image, &pe).unwrap();
+
+    assert_eq!(
+        profile,
+        OutputEntry::Managed {
+            entry_rva: 0,
+            kind: ManagedKind::Exe,
+        }
+    );
+    assert!(profile.protected_ranges(&pe).unwrap().is_empty());
+}
+
+#[test]
+fn managed_exe_entry_profile_rejects_non_method_token() {
+    let (mut image, mut pe, layout) = fixture(0);
+    pe.directories[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR] = DataDirectory {
+        virtual_address: layout.non_executable,
+        size: 0x48,
+    };
+    let header_offset = usize::try_from(layout.non_executable).unwrap();
+    image[header_offset..header_offset + 4].copy_from_slice(&0x48u32.to_le_bytes());
+    image[header_offset + 20..header_offset + 24].copy_from_slice(&0x0200_0001u32.to_le_bytes());
 
     let error = discover_output_entry(&image, &pe).unwrap_err().to_string();
-    assert!(
-        error.contains("managed EXE output profiles are unsupported"),
-        "{error}"
-    );
+
+    assert!(error.contains("nonzero MethodDef token"), "{error}");
 }
 
 #[derive(Clone, Copy)]
@@ -1412,6 +1512,82 @@ fn recognizes_standalone_i386_msvc_oep_without_predecessor() {
         &(layout.cookie_complement..layout.cookie_complement + I386_COOKIE_CELL_LEN as u32)
     ));
     assert!(!ranges.iter().any(|range| range.start == 0x1200));
+}
+
+#[test]
+fn recognizes_header_selected_hotpatch_i386_oep_with_register_variant_stores() {
+    const ALTERNATE_STARTUP_RVA: u32 = 0x1600;
+    let (mut image, pe, layout) = standalone_i386_fixture();
+    let original_startup_rva = layout.entry + SEMANTIC_VENEER_LEN as u32;
+    let original_startup = offset(original_startup_rva);
+    let alternate_startup = offset(ALTERNATE_STARTUP_RVA);
+    image.copy_within(
+        original_startup..original_startup + CRT_STARTUP_PROLOGUE_LEN,
+        alternate_startup,
+    );
+    write_rel32(
+        &mut image,
+        ALTERNATE_STARTUP_RVA + 7,
+        0xe8,
+        layout.seh_helper,
+    );
+    write_rel32(
+        &mut image,
+        layout.entry + DIRECT_REL32_LEN as u32,
+        0xe9,
+        ALTERNATE_STARTUP_RVA,
+    );
+
+    let cookie_va = u32::try_from(pe.rva_to_va(layout.cookie).unwrap()).unwrap();
+    let complement_va = u32::try_from(pe.rva_to_va(layout.cookie_complement).unwrap()).unwrap();
+    let initializer = offset(layout.cookie_initializer);
+    image[initializer..initializer + I386_COOKIE_EVIDENCE_LEN].fill(0);
+    image[initializer..initializer + 7]
+        .copy_from_slice(&[0x8b, 0xff, 0x55, 0x8b, 0xec, 0x83, 0xec]);
+    image[initializer + 8] = 0xa1;
+    image[initializer + 9..initializer + 13].copy_from_slice(&cookie_va.to_le_bytes());
+    image[initializer + 16..initializer + 21].copy_from_slice(&[0xbf, 0x4e, 0xe6, 0x40, 0xbb]);
+    image[initializer + 24..initializer + 29].copy_from_slice(&[0xbb, 0x00, 0x00, 0xff, 0xff]);
+    image[initializer + 32..initializer + 38].copy_from_slice(&[
+        0x89,
+        0x35,
+        cookie_va.to_le_bytes()[0],
+        cookie_va.to_le_bytes()[1],
+        cookie_va.to_le_bytes()[2],
+        cookie_va.to_le_bytes()[3],
+    ]);
+    image[initializer + 48..initializer + 55].copy_from_slice(&[
+        0xf7,
+        0xd0,
+        0xa3,
+        complement_va.to_le_bytes()[0],
+        complement_va.to_le_bytes()[1],
+        complement_va.to_le_bytes()[2],
+        complement_va.to_le_bytes()[3],
+    ]);
+    image[initializer + 64..initializer + 72].copy_from_slice(&[
+        0xf7,
+        0xd6,
+        0x89,
+        0x35,
+        complement_va.to_le_bytes()[0],
+        complement_va.to_le_bytes()[1],
+        complement_va.to_le_bytes()[2],
+        complement_va.to_le_bytes()[3],
+    ]);
+
+    let entry = discover_semantic_entry(&image, &pe).unwrap();
+
+    assert_eq!(entry.entry_rva, layout.entry);
+    assert_eq!(entry.predecessor_rva, None);
+    assert_eq!(entry.startup_rva, ALTERNATE_STARTUP_RVA);
+    assert!(matches!(
+        entry.evidence,
+        SemanticEvidence::I386MsvcStandalone { .. }
+    ));
+
+    write_u32_at(&mut image, layout.cookie_complement, 0);
+    assert!(discover_semantic_entry(&image, &pe).is_err());
 }
 
 #[test]

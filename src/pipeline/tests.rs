@@ -1,4 +1,5 @@
 use super::*;
+use sha2::Digest as _;
 
 use crate::pe::{DataDirectory, IMAGE_DIRECTORY_ENTRY_SECURITY, Machine, Section};
 use crate::pipeline::stages::detect::{
@@ -100,6 +101,153 @@ fn invalid_pe_fails_at_the_typed_input_boundary() {
     );
     assert_eq!(observer.terminal_events, 1);
     assert!(observer.failure_had_input_artifact);
+}
+
+#[test]
+fn reconstructs_polymorphic_pe32_staged_table_fixture() {
+    let input =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packed/maimai_SDEY_1.99.exe");
+    let request = PipelineRequest {
+        input,
+        output: None,
+        dry_run: true,
+        hash_artifacts: true,
+    };
+    let mut observer = RecordingObserver::default();
+    let cancellation = CancellationToken::default();
+
+    let output = Pipeline::new(&mut observer, &cancellation)
+        .run(&request)
+        .unwrap();
+    let summary = &output.summary;
+    let input_artifact = summary.input_artifact.as_ref().unwrap();
+    assert_eq!(
+        input_artifact.sha256.as_deref(),
+        Some("81d359eeb029c881311a4ab770c1d350b068f9ef9d05dfa7ff0bd5d7456b2daa")
+    );
+
+    let decryption = summary.decryption.as_ref().unwrap();
+    assert_eq!(
+        decryption.payload_grammar,
+        Some(crate::pipeline::outcome::PayloadGrammar::StagedTable)
+    );
+    assert_eq!(decryption.chunk_count, 2_264);
+    assert_eq!(decryption.copied_chunk_count, 93);
+    let staged = decryption.selected_staged_table.as_ref().unwrap();
+    assert_eq!(staged.shell_table_rva, 0x00c0_3790);
+    assert_eq!(staged.seven_stage_rva, 0x00c0_4f70);
+    assert_eq!(staged.eighth_stage_rva, 0x00c0_5ef8);
+    assert_eq!(staged.file_decoder_rva, 0x00c3_8c00);
+    assert_eq!(staged.stage_decoder_rva, 0x00c3_9bbe);
+    assert_eq!(staged.file_aes_context_rva, 0x00c3_9aca);
+    assert_eq!(staged.stage_aes_context_rva, 0x00c3_a7be);
+    assert_eq!(staged.custom_program_offset, 0x0f00);
+    assert_eq!(staged.custom_program_length, 71);
+    assert_eq!(staged.custom_byte_map.len(), 256);
+    assert_eq!(
+        staged.stage_raw_key_hex,
+        "214aa5f2ed74c698a91f1b8f7506bcb53121d15bfdcb754eb9f29674459d2b1b"
+    );
+    assert_eq!(staged.file_program_offset, 0x4de0);
+    assert_eq!(staged.file_program_length, 67);
+    assert_eq!(
+        staged.file_raw_key_hex,
+        "600c7cd4a476dfc2e85fba282c40151570a9f103b4934c68f8f42f563cdd8abc"
+    );
+    assert_eq!(staged.file_byte_map.len(), 256);
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&staged.file_byte_map)),
+        "70b8563af257c2c7a972288eda61d2ec42673cd50957807948a99119a70393cc"
+    );
+
+    let recovered = summary.recovered_program.as_ref().unwrap();
+    assert_eq!(recovered.startup_rva, 0x0055_909d);
+    assert_eq!(recovered.handoff_rva, None);
+    assert_eq!(
+        recovered.code_transform,
+        crate::pipeline::outcome::CodeTransform::Unchanged
+    );
+    assert_eq!(
+        recovered.startup_kind,
+        crate::pipeline::outcome::StartupKind::I386MsvcStandalone
+    );
+
+    let imports = summary.imports.as_ref().unwrap();
+    assert_eq!(
+        imports.source,
+        crate::pipeline::outcome::ImportSource::CrackproofLoader
+    );
+    assert_eq!((imports.module_count, imports.function_count), (21, 814));
+    let artifact = summary.output_artifact.as_ref().unwrap();
+    assert_eq!(artifact.size, 9_822_208);
+    assert_eq!(
+        artifact.sha256.as_deref(),
+        Some("100e65c9326cf3de4b0a74eb2dad221cf590af4255088251b328a4d81bb67511")
+    );
+    assert!(!artifact.written);
+    assert_eq!(output.image.len(), artifact.size);
+    assert_eq!(observer.terminal_events, 1);
+}
+
+#[test]
+fn staged_table_prefilter_cannot_hide_authenticated_a_records() {
+    let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packed/chusanApp_2.25.exe");
+    let request = PipelineRequest {
+        input,
+        output: None,
+        dry_run: true,
+        hash_artifacts: true,
+    };
+    let mut observer = RecordingObserver::default();
+    let cancellation = CancellationToken::default();
+
+    let output = Pipeline::new(&mut observer, &cancellation)
+        .run(&request)
+        .unwrap();
+    let summary = &output.summary;
+    let input_artifact = summary.input_artifact.as_ref().unwrap();
+    assert_eq!(
+        input_artifact.sha256.as_deref(),
+        Some("16061383b2bf2dc2773ee8379d16581201d517c347a60706f0c0e104fb800beb")
+    );
+
+    let decryption = summary.decryption.as_ref().unwrap();
+    assert_eq!(
+        decryption.payload_grammar,
+        Some(crate::pipeline::outcome::PayloadGrammar::ARecord)
+    );
+    assert_eq!(decryption.chunk_count, 7_485);
+    assert_eq!(decryption.copied_chunk_count, 16);
+    assert_eq!(decryption.decoded_chunk_count, 7_469);
+    assert_eq!(decryption.aes_key_candidates, 2);
+    assert_eq!(decryption.decoder_candidates, 2);
+    assert_eq!(decryption.byte_transform_candidates, 3);
+    assert!(decryption.selected_chain.is_some());
+    assert!(decryption.selected_staged_table.is_none());
+
+    let recovered = summary.recovered_program.as_ref().unwrap();
+    assert_eq!(recovered.startup_rva, 0x00a2_ce71);
+    assert_eq!(recovered.handoff_rva, None);
+    assert_eq!(
+        recovered.code_transform,
+        crate::pipeline::outcome::CodeTransform::PageRvaRol { rotation: 3 }
+    );
+    assert_eq!(
+        recovered.startup_kind,
+        crate::pipeline::outcome::StartupKind::I386MsvcStandalone
+    );
+
+    let imports = summary.imports.as_ref().unwrap();
+    assert_eq!(
+        imports.source,
+        crate::pipeline::outcome::ImportSource::CrackproofLoader
+    );
+    assert_eq!((imports.module_count, imports.function_count), (22, 836));
+    let artifact = summary.output_artifact.as_ref().unwrap();
+    assert_eq!(artifact.size, 32_067_584);
+    assert!(!artifact.written);
+    assert_eq!(output.image.len(), artifact.size);
+    assert_eq!(observer.terminal_events, 1);
 }
 
 #[test]
@@ -335,6 +483,26 @@ fn descriptor_prefix_marker_need_not_cover_the_source_length() {
 }
 
 #[test]
+fn descriptor_destination_may_cross_an_image_gap() {
+    let shift = 0x3000;
+    let pe = synthetic_pe(shift);
+    let mut packed = vec![0; pe.file_len];
+    let mut decoded = decode_konn_words(encrypted_descriptor(shift));
+    decoded[3] = shift + 0x3f80;
+    decoded[5] = 0x180;
+    place_words(&mut packed, 0x100, encode_konn_words(decoded));
+
+    let found = scan_konn_descriptors(&packed, &pe).expect("bounded cross-section destination");
+    assert_eq!(
+        found
+            .iter()
+            .map(|descriptor| (descriptor.file_offset, descriptor.destination_section_index))
+            .collect::<Vec<_>>(),
+        [(0x100, 1)]
+    );
+}
+
+#[test]
 fn shifted_unaligned_descriptors_are_found_and_decoys_rejected() {
     for (shift, offset) in [(0x2000, 19usize), (0x9000, 57usize)] {
         let pe = synthetic_pe(shift);
@@ -347,13 +515,13 @@ fn shifted_unaligned_descriptors_are_found_and_decoys_rejected() {
         entry_mismatch = encode_konn_words(decoded);
         place_words(&mut packed, offset + 101, entry_mismatch);
 
-        let mut crossing_destination = decode_konn_words(encrypted_descriptor(shift));
-        crossing_destination[3] = shift + 0x5700;
-        crossing_destination[5] = 0x200;
+        let mut destination_outside_image = decode_konn_words(encrypted_descriptor(shift));
+        destination_outside_image[3] = shift + 0x5f00;
+        destination_outside_image[5] = 0x200;
         place_words(
             &mut packed,
             offset + 202,
-            encode_konn_words(crossing_destination),
+            encode_konn_words(destination_outside_image),
         );
 
         let mut null_source = decode_konn_words(encrypted_descriptor(shift));

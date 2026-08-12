@@ -7,7 +7,7 @@ use super::super::*;
 const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
 const AMD64_DEFAULT_SECURITY_COOKIE: u64 = 0x0000_2b99_2ddf_a232;
 const MAX_SEMANTIC_VENEERS: usize = 4_096;
-const MAX_EXECUTABLE_JUMPS: usize = 65_536;
+const MAX_EXECUTABLE_JUMPS: usize = 1 << 20;
 const MAX_RUNTIME_FUNCTIONS: usize = 1 << 20;
 const AMD64_DLL_STARTUP_LEN: usize = 0x3d;
 const AMD64_DLL_STARTUP_PREFIX: [u8; 28] = [
@@ -62,14 +62,163 @@ struct Amd64UnwindOperation {
     stack_size: Option<usize>,
     save_offset: Option<usize>,
 }
+#[derive(Clone, Copy, Debug)]
+struct Amd64RuntimeFunction {
+    record_rva: u32,
+    begin_rva: u32,
+    end_rva: u32,
+}
+
+#[derive(Debug)]
+struct Amd64RuntimeFunctionIndex {
+    records: Vec<Amd64RuntimeFunction>,
+}
+
+impl Amd64RuntimeFunctionIndex {
+    fn parse(mapped: &[u8], pe: &Pe, executable_ranges: &[Range<u32>]) -> Result<Option<Self>> {
+        let Some(directory) = pe.directories.get(IMAGE_DIRECTORY_ENTRY_EXCEPTION).copied() else {
+            return Ok(None);
+        };
+        let Some(range) = directory
+            .checked_rva_range()
+            .context("validating AMD64 Exception Directory")?
+        else {
+            return Ok(None);
+        };
+        let size = usize::try_from(directory.size)
+            .context("AMD64 Exception Directory size does not fit usize")?;
+        ensure!(
+            size.is_multiple_of(AMD64_RUNTIME_FUNCTION_LEN),
+            "AMD64 Exception Directory size {size:#x} is not a multiple of {AMD64_RUNTIME_FUNCTION_LEN}"
+        );
+        let count = size / AMD64_RUNTIME_FUNCTION_LEN;
+        ensure!(
+            count <= MAX_RUNTIME_FUNCTIONS,
+            "AMD64 Exception Directory has {count} runtime functions, exceeding the {MAX_RUNTIME_FUNCTIONS} record cap"
+        );
+        let directory_section = pe
+            .section_for_rva_range(range.start, size)
+            .context("locating AMD64 Exception Directory owner")?;
+        ensure!(
+            directory_section.characteristics & IMAGE_SCN_MEM_READ != 0
+                && directory_section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0,
+            "AMD64 Exception Directory belongs to section {} without readable non-executable ownership",
+            directory_section.index
+        );
+        mapped_bytes(mapped, range.start, size)
+            .context("reading AMD64 Exception Directory from mapped image")?;
+
+        let mut records = Vec::<Amd64RuntimeFunction>::new();
+        records
+            .try_reserve_exact(count)
+            .context("reserving AMD64 runtime-function index")?;
+        for index in 0..count {
+            let record_rva = range
+                .start
+                .checked_add(
+                    u32::try_from(
+                        index
+                            .checked_mul(AMD64_RUNTIME_FUNCTION_LEN)
+                            .context("AMD64 runtime-function record offset overflows")?,
+                    )
+                    .context("AMD64 runtime-function record offset exceeds u32")?,
+                )
+                .context("AMD64 runtime-function record RVA overflows")?;
+            let begin_rva = read_u32_rva(mapped, record_rva)?;
+            let end_rva = read_u32_rva(
+                mapped,
+                record_rva
+                    .checked_add(4)
+                    .context("AMD64 runtime-function EndAddress RVA overflows")?,
+            )?;
+            let unwind_rva = read_u32_rva(
+                mapped,
+                record_rva
+                    .checked_add(8)
+                    .context("AMD64 runtime-function UnwindInfo RVA overflows")?,
+            )?;
+            ensure!(
+                begin_rva < end_rva,
+                "AMD64 runtime function at {record_rva:#x} has invalid {begin_rva:#x}..{end_rva:#x} code bounds"
+            );
+            if let Some(previous) = records.last() {
+                ensure!(
+                    previous.end_rva <= begin_rva,
+                    "AMD64 runtime functions at {:#x} and {record_rva:#x} overlap or are out of order",
+                    previous.record_rva
+                );
+            }
+            let function_len = usize::try_from(end_rva - begin_rva)
+                .context("AMD64 runtime-function length does not fit usize")?;
+            ensure!(
+                is_executable_range(executable_ranges, begin_rva, function_len)?,
+                "AMD64 runtime function at {record_rva:#x} does not own executable code bounds {begin_rva:#x}..{end_rva:#x}"
+            );
+            ensure!(
+                unwind_rva != 0,
+                "AMD64 runtime function at {record_rva:#x} has a null UnwindInfoAddress"
+            );
+            let unwind_section = pe.section_for_rva_range(unwind_rva, 4).with_context(|| {
+                format!(
+                    "locating AMD64 unwind info at {unwind_rva:#x} for runtime function {record_rva:#x}"
+                )
+            })?;
+            ensure!(
+                unwind_section.characteristics & IMAGE_SCN_MEM_READ != 0
+                    && unwind_section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0,
+                "AMD64 unwind info at {unwind_rva:#x} belongs to section {} without readable non-executable ownership",
+                unwind_section.index
+            );
+            mapped_bytes(mapped, unwind_rva, 4).with_context(|| {
+                format!(
+                    "reading AMD64 unwind info at {unwind_rva:#x} for runtime function {record_rva:#x}"
+                )
+            })?;
+            records.push(Amd64RuntimeFunction {
+                record_rva,
+                begin_rva,
+                end_rva,
+            });
+        }
+        Ok(Some(Self { records }))
+    }
+
+    fn record_containing(
+        &self,
+        function_rva: u32,
+        evidence_len: usize,
+    ) -> Result<Option<Amd64RuntimeFunction>> {
+        let function_end = function_rva
+            .checked_add(
+                u32::try_from(evidence_len)
+                    .context("AMD64 function evidence length exceeds u32")?,
+            )
+            .context("AMD64 function evidence range overflows")?;
+        let insertion = self
+            .records
+            .partition_point(|record| record.begin_rva <= function_rva);
+        let Some(record) = insertion
+            .checked_sub(1)
+            .and_then(|index| self.records.get(index))
+            .copied()
+        else {
+            return Ok(None);
+        };
+        Ok((function_end <= record.end_rva).then_some(record))
+    }
+}
 
 pub(crate) fn discover_amd64_semantic_entry(mapped: &[u8], pe: &Pe) -> Result<SemanticEntry> {
+    if let Some(entry) = discover_amd64_msvc_semantic_entry(mapped, pe)? {
+        return Ok(entry);
+    }
+
     let executable_ranges = executable_section_ranges(mapped, pe)?;
     ensure_executable_scan_bound(&executable_ranges)?;
     let veneer_starts = amd64_veneer_starts(mapped, &executable_ranges)?;
     let jumps = amd64_executable_jumps(mapped, &executable_ranges, &veneer_starts)?;
 
-    let mut entries = amd64_msvc_semantic_entries(mapped, pe, &executable_ranges)?;
+    let mut entries = Vec::new();
     let mut incomplete_candidate = None;
     for entry_rva in veneer_starts {
         let Some(predecessors) = jumps.get(&entry_rva) else {
@@ -91,10 +240,6 @@ pub(crate) fn discover_amd64_semantic_entry(mapped: &[u8], pe: &Pe) -> Result<Se
             entry_rva: veneer.entry_rva,
             predecessor_rva: Some(predecessors.source_rva),
             veneer_call_target_rva: veneer.veneer_call_target_rva,
-            // An import thunk has no in-image control-flow destination.  Keep
-            // this legacy executable slot on the independently proven startup
-            // helper target; the FF25 instruction and IAT cell live in the
-            // AMD64 protected evidence profile.
             veneer_helper_target_rva: veneer.crt_helper_target_rva,
             startup_rva: veneer.startup_rva,
             crt_call_target_rva: veneer.crt_call_target_rva,
@@ -123,6 +268,104 @@ pub(crate) fn discover_amd64_semantic_entry(mapped: &[u8], pe: &Pe) -> Result<Se
             entries.len()
         ),
     }
+}
+
+pub(crate) fn discover_amd64_msvc_semantic_entry(
+    mapped: &[u8],
+    pe: &Pe,
+) -> Result<Option<SemanticEntry>> {
+    let executable_ranges = executable_section_ranges(mapped, pe)?;
+    ensure_executable_scan_bound(&executable_ranges)?;
+    let Some(runtime_functions) = Amd64RuntimeFunctionIndex::parse(mapped, pe, &executable_ranges)?
+    else {
+        return Ok(None);
+    };
+    let entries = amd64_msvc_semantic_entries(mapped, pe, &executable_ranges, &runtime_functions)?;
+    match entries.as_slice() {
+        [] => Ok(None),
+        [entry] => Ok(Some(*entry)),
+        _ => bail!(
+            "found {} structurally valid AMD64 MSVC semantic entries",
+            entries.len()
+        ),
+    }
+}
+
+/// Authenticates CrackProof's header-selected AMD64 DLL dispatch family.
+///
+/// The decrypted header AEP is accepted only when it is a `CALL dispatcher;
+/// RET` thunk followed by selectors 0, 1, and 2 that call the same dispatcher.
+/// The dispatcher must preserve every non-RAX general register around a
+/// callsite resolver and tail-transfer only a nonzero resolved target. This is
+/// deliberately rooted at the recovered header AEP; it never scans for a bare
+/// thunk or trusts the packed header value without its complete closure.
+fn discover_amd64_header_dispatch_dll_entry(mapped: &[u8], pe: &Pe) -> Result<Option<u32>> {
+    const ENTRY_FAMILY_LEN: usize = 30;
+    const DISPATCHER_PREFIX: [u8; 30] = [
+        0x58, 0x51, 0x52, 0x53, 0x55, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,
+        0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0xc8,
+    ];
+    const DISPATCHER_SUFFIX: [u8; 34] = [
+        0x48, 0x83, 0xc4, 0x28, 0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x41, 0x5b, 0x41,
+        0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5d, 0x5b, 0x5a, 0x59, 0x48, 0x85, 0xc0, 0x74,
+        0x02, 0x50, 0xc3, 0xc3,
+    ];
+    const DISPATCHER_LEN: usize = DISPATCHER_PREFIX.len() + 5 + DISPATCHER_SUFFIX.len();
+
+    let entry_rva = pe.entry_rva;
+    if entry_rva == 0 {
+        return Ok(None);
+    }
+    let executable_ranges = executable_section_ranges(mapped, pe)?;
+    if !is_executable_range(&executable_ranges, entry_rva, ENTRY_FAMILY_LEN)? {
+        return Ok(None);
+    }
+    let entry = mapped_bytes(mapped, entry_rva, 6)?;
+    if entry[0] != 0xe8 || entry[5] != 0xc3 {
+        return Ok(None);
+    }
+    let Some(dispatcher_rva) = direct_rel32_target(mapped, entry_rva, 0xe8)? else {
+        return Ok(None);
+    };
+
+    for selector in 0..3u32 {
+        let selector_rva = entry_rva
+            .checked_add(6 + selector * 8)
+            .context("AMD64 DLL selector RVA overflows")?;
+        let bytes = mapped_bytes(mapped, selector_rva, 8)?;
+        if bytes[0] != 0x6a
+            || bytes[1] != u8::try_from(selector).expect("selector fits u8")
+            || bytes[2] != 0xe8
+            || bytes[7] != 0xc3
+            || direct_rel32_target(mapped, selector_rva + 2, 0xe8)? != Some(dispatcher_rva)
+        {
+            return Ok(None);
+        }
+    }
+
+    if !is_executable_range(&executable_ranges, dispatcher_rva, DISPATCHER_LEN)? {
+        return Ok(None);
+    }
+    let dispatcher = mapped_bytes(mapped, dispatcher_rva, DISPATCHER_LEN)?;
+    if dispatcher[..DISPATCHER_PREFIX.len()] != DISPATCHER_PREFIX
+        || dispatcher[DISPATCHER_PREFIX.len()] != 0xe8
+        || dispatcher[DISPATCHER_PREFIX.len() + 5..] != DISPATCHER_SUFFIX
+    {
+        return Ok(None);
+    }
+    let resolver_call_rva = dispatcher_rva
+        .checked_add(u32::try_from(DISPATCHER_PREFIX.len()).expect("prefix length fits u32"))
+        .context("AMD64 DLL resolver CALL RVA overflows")?;
+    let Some(resolver_rva) = direct_rel32_target(mapped, resolver_call_rva, 0xe8)? else {
+        return Ok(None);
+    };
+    if resolver_rva == entry_rva
+        || resolver_rva == dispatcher_rva
+        || !is_executable_range(&executable_ranges, resolver_rva, 1)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(entry_rva))
 }
 
 /// Locates the canonical MSVC AMD64 DLL entry wrapper that initializes the
@@ -232,7 +475,11 @@ pub(crate) fn discover_amd64_dll_entry(mapped: &[u8], pe: &Pe) -> Result<u32> {
     }
 
     match entries.as_slice() {
-        [] => bail!("found no structurally valid AMD64 MSVC DLL entry"),
+        [] => discover_amd64_header_dispatch_dll_entry(mapped, pe)?.map_or_else(
+            || bail!("found no structurally valid AMD64 MSVC DLL entry or authenticated header dispatch entry"),
+
+            Ok,
+        ),
         [entry_rva] => Ok(*entry_rva),
         _ => bail!(
             "found {} structurally valid AMD64 MSVC DLL entries",
@@ -245,105 +492,95 @@ fn amd64_msvc_semantic_entries(
     mapped: &[u8],
     pe: &Pe,
     executable_ranges: &[Range<u32>],
+    runtime_functions: &Amd64RuntimeFunctionIndex,
 ) -> Result<Vec<SemanticEntry>> {
     let mut entries = Vec::new();
-    for range in executable_ranges {
-        let Some(last_rva) = range.end.checked_sub(AMD64_MSVC_ENTRY_LEN as u32) else {
+    for function in &runtime_functions.records {
+        let entry_rva = function.begin_rva;
+        let Some(entry_end) = entry_rva.checked_add(AMD64_MSVC_ENTRY_LEN as u32) else {
             continue;
         };
-        for entry_rva in range.start..=last_rva {
-            let bytes = mapped_bytes(mapped, entry_rva, AMD64_MSVC_ENTRY_LEN)?;
-            if bytes[..4] != [0x48, 0x83, 0xec, 0x28]
-                || bytes[4] != 0xe8
-                || bytes[9..13] != [0x48, 0x83, 0xc4, 0x28]
-                || bytes[13] != 0xe9
-            {
-                continue;
-            }
-            let Some(cookie_initializer_rva) = direct_rel32_target(
-                mapped,
-                entry_rva
-                    .checked_add(4)
-                    .context("AMD64 MSVC cookie CALL RVA overflows")?,
-                0xe8,
-            )?
-            else {
-                continue;
-            };
-            let Some(startup_rva) = direct_rel32_target(
-                mapped,
-                entry_rva
-                    .checked_add(13)
-                    .context("AMD64 MSVC startup JMP RVA overflows")?,
-                0xe9,
-            )?
-            else {
-                continue;
-            };
-            if !is_executable_range(
-                executable_ranges,
-                cookie_initializer_rva,
-                AMD64_COOKIE_EVIDENCE_LEN,
-            )? || !is_executable_range(executable_ranges, startup_rva, AMD64_CRT_EVIDENCE_LEN)?
-            {
-                continue;
-            }
-            let Some(cookie_rva) = amd64_security_cookie_evidence(
-                mapped,
-                pe,
-                executable_ranges,
-                cookie_initializer_rva,
-            )?
-            else {
-                continue;
-            };
-            if !amd64_crt_startup_evidence(mapped, executable_ranges, startup_rva)? {
-                continue;
-            }
-            let Some(entry_runtime_function_rva) =
-                amd64_runtime_function_evidence(mapped, pe, executable_ranges, entry_rva)?
-            else {
-                continue;
-            };
-            let Some(cookie_runtime_function_rva) = amd64_runtime_function_evidence(
-                mapped,
-                pe,
-                executable_ranges,
-                cookie_initializer_rva,
-            )?
-            else {
-                continue;
-            };
-            let Some(startup_runtime_function_rva) =
-                amd64_runtime_function_evidence(mapped, pe, executable_ranges, startup_rva)?
-            else {
-                continue;
-            };
-
-            ensure!(
-                entries.len() < MAX_SEMANTIC_VENEERS,
-                "AMD64 MSVC entry candidate budget of {MAX_SEMANTIC_VENEERS} exceeded"
-            );
-            entries
-                .try_reserve(1)
-                .context("reserving AMD64 MSVC semantic entry candidate")?;
-            entries.push(SemanticEntry {
-                entry_rva,
-                predecessor_rva: None,
-                veneer_call_target_rva: cookie_initializer_rva,
-                veneer_helper_target_rva: cookie_initializer_rva,
-                startup_rva,
-                crt_call_target_rva: startup_rva,
-                crt_helper_target_rva: startup_rva,
-                startup_data_rva: cookie_rva,
-                startup_data_len: AMD64_POINTER_CELL_LEN as u32,
-                evidence: SemanticEvidence::Amd64Msvc {
-                    entry_runtime_function_rva,
-                    cookie_runtime_function_rva,
-                    startup_runtime_function_rva,
-                },
-            });
+        if entry_end > function.end_rva {
+            continue;
         }
+        let bytes = mapped_bytes(mapped, entry_rva, AMD64_MSVC_ENTRY_LEN)?;
+        if bytes[..4] != [0x48, 0x83, 0xec, 0x28]
+            || bytes[4] != 0xe8
+            || bytes[9..13] != [0x48, 0x83, 0xc4, 0x28]
+            || bytes[13] != 0xe9
+        {
+            continue;
+        }
+        let Some(cookie_initializer_rva) = direct_rel32_target(
+            mapped,
+            entry_rva
+                .checked_add(4)
+                .context("AMD64 MSVC cookie CALL RVA overflows")?,
+            0xe8,
+        )?
+        else {
+            continue;
+        };
+        let Some(startup_rva) = direct_rel32_target(
+            mapped,
+            entry_rva
+                .checked_add(13)
+                .context("AMD64 MSVC startup JMP RVA overflows")?,
+            0xe9,
+        )?
+        else {
+            continue;
+        };
+        if !is_executable_range(
+            executable_ranges,
+            cookie_initializer_rva,
+            AMD64_COOKIE_EVIDENCE_LEN,
+        )? || !is_executable_range(executable_ranges, startup_rva, AMD64_CRT_EVIDENCE_LEN)?
+        {
+            continue;
+        }
+        let Some(cookie_rva) =
+            amd64_security_cookie_evidence(mapped, pe, executable_ranges, cookie_initializer_rva)?
+        else {
+            continue;
+        };
+        if !amd64_crt_startup_evidence(mapped, executable_ranges, startup_rva)? {
+            continue;
+        }
+        let Some(cookie_runtime_function) =
+            runtime_functions.record_containing(cookie_initializer_rva, AMD64_STARTUP_LEN)?
+        else {
+            continue;
+        };
+        let Some(startup_runtime_function) =
+            runtime_functions.record_containing(startup_rva, AMD64_STARTUP_LEN)?
+        else {
+            continue;
+        };
+
+        ensure!(
+            entries.len() < MAX_SEMANTIC_VENEERS,
+            "AMD64 MSVC entry candidate budget of {MAX_SEMANTIC_VENEERS} exceeded"
+        );
+        entries
+            .try_reserve(1)
+            .context("reserving AMD64 MSVC semantic entry candidate")?;
+        entries.push(SemanticEntry {
+            entry_rva,
+            predecessor_rva: None,
+            veneer_call_target_rva: cookie_initializer_rva,
+            veneer_helper_target_rva: cookie_initializer_rva,
+            startup_rva,
+            crt_call_target_rva: startup_rva,
+            crt_helper_target_rva: startup_rva,
+            startup_data_rva: cookie_rva,
+            startup_data_len: AMD64_POINTER_CELL_LEN as u32,
+            evidence: SemanticEvidence::Amd64Msvc {
+                entry_runtime_function_rva: function.record_rva,
+                cookie_runtime_function_rva: cookie_runtime_function.record_rva,
+                startup_runtime_function_rva: startup_runtime_function.record_rva,
+            },
+        });
     }
     Ok(entries)
 }
@@ -999,117 +1236,20 @@ fn validate_amd64_exception_directory_with_ranges(
     executable_ranges: &[Range<u32>],
     startup_rva: Option<u32>,
 ) -> Result<Option<u32>> {
-    let Some(directory) = pe.directories.get(IMAGE_DIRECTORY_ENTRY_EXCEPTION).copied() else {
-        return Ok(None);
-    };
-    let Some(range) = directory
-        .checked_rva_range()
-        .context("validating AMD64 Exception Directory")?
+    let Some(runtime_functions) = Amd64RuntimeFunctionIndex::parse(mapped, pe, executable_ranges)?
     else {
         return Ok(None);
     };
-    let size = usize::try_from(directory.size)
-        .context("AMD64 Exception Directory size does not fit usize")?;
-    ensure!(
-        size.is_multiple_of(AMD64_RUNTIME_FUNCTION_LEN),
-        "AMD64 Exception Directory size {size:#x} is not a multiple of {AMD64_RUNTIME_FUNCTION_LEN}"
-    );
-    let count = size / AMD64_RUNTIME_FUNCTION_LEN;
-    ensure!(
-        count <= MAX_RUNTIME_FUNCTIONS,
-        "AMD64 Exception Directory has {count} runtime functions, exceeding the {MAX_RUNTIME_FUNCTIONS} record cap"
-    );
-    let directory_section = pe
-        .section_for_rva_range(range.start, size)
-        .context("locating AMD64 Exception Directory owner")?;
-    ensure!(
-        directory_section.characteristics & IMAGE_SCN_MEM_READ != 0
-            && directory_section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0,
-        "AMD64 Exception Directory belongs to section {} without readable non-executable ownership",
-        directory_section.index
-    );
-    mapped_bytes(mapped, range.start, size)
-        .context("reading AMD64 Exception Directory from mapped image")?;
-
-    let startup_end = startup_rva
-        .map(|rva| {
-            rva.checked_add(AMD64_STARTUP_LEN as u32)
-                .context("AMD64 startup range overflows while checking runtime function")
-        })
-        .transpose()?;
-    let mut matching_rva = None;
-    for index in 0usize..count {
-        let record_rva = range
-            .start
-            .checked_add(
-                u32::try_from(
-                    index
-                        .checked_mul(AMD64_RUNTIME_FUNCTION_LEN)
-                        .context("AMD64 runtime-function record offset overflows")?,
-                )
-                .context("AMD64 runtime-function record offset exceeds u32")?,
-            )
-            .context("AMD64 runtime-function record RVA overflows")?;
-        let begin_rva = read_u32_rva(mapped, record_rva)?;
-        let end_rva = read_u32_rva(
-            mapped,
-            record_rva
-                .checked_add(4)
-                .context("AMD64 runtime-function EndAddress RVA overflows")?,
-        )?;
-        let unwind_rva = read_u32_rva(
-            mapped,
-            record_rva
-                .checked_add(8)
-                .context("AMD64 runtime-function UnwindInfo RVA overflows")?,
-        )?;
-        ensure!(
-            begin_rva < end_rva,
-            "AMD64 runtime function at {record_rva:#x} has invalid {begin_rva:#x}..{end_rva:#x} code bounds"
-        );
-        let function_len = usize::try_from(end_rva - begin_rva)
-            .context("AMD64 runtime-function length does not fit usize")?;
-        ensure!(
-            is_executable_range(executable_ranges, begin_rva, function_len)?,
-            "AMD64 runtime function at {record_rva:#x} does not own executable code bounds {begin_rva:#x}..{end_rva:#x}"
-        );
-        ensure!(
-            unwind_rva != 0,
-            "AMD64 runtime function at {record_rva:#x} has a null UnwindInfoAddress"
-        );
-        let unwind_section = pe.section_for_rva_range(unwind_rva, 4).with_context(|| {
-            format!(
-                "locating AMD64 unwind info at {unwind_rva:#x} for runtime function {record_rva:#x}"
-            )
-        })?;
-        ensure!(
-            unwind_section.characteristics & IMAGE_SCN_MEM_READ != 0
-                && unwind_section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0,
-            "AMD64 unwind info at {unwind_rva:#x} belongs to section {} without readable non-executable ownership",
-            unwind_section.index
-        );
-        mapped_bytes(mapped, unwind_rva, 4).with_context(|| {
-            format!(
-                "reading AMD64 unwind info at {unwind_rva:#x} for runtime function {record_rva:#x}"
-            )
-        })?;
-
-        if let (Some(startup_rva), Some(startup_end)) = (startup_rva, startup_end)
-            && begin_rva <= startup_rva
-            && startup_end <= end_rva
-        {
-            ensure!(
-                matching_rva.replace(record_rva).is_none(),
-                "AMD64 startup at {startup_rva:#x} belongs to multiple runtime functions"
-            );
-        }
-    }
-    match startup_rva {
-        None => Ok(None),
-        Some(startup_rva) => matching_rva.map(Some).ok_or_else(|| {
+    let Some(startup_rva) = startup_rva else {
+        return Ok(None);
+    };
+    runtime_functions
+        .record_containing(startup_rva, AMD64_STARTUP_LEN)?
+        .map(|record| record.record_rva)
+        .map(Some)
+        .ok_or_else(|| {
             anyhow::anyhow!("AMD64 startup at {startup_rva:#x} has no owning runtime function")
-        }),
-    }
+        })
 }
 
 fn decode_amd64_instruction(mapped: &[u8], rva: u32) -> Result<Option<Amd64Instruction>> {

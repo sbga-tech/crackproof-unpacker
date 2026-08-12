@@ -126,6 +126,9 @@ pub(crate) fn decode_sparse_text_pages_in_place(
             let block = u32::try_from(block).expect("sparse page block count fits u32");
             let selected = key.rotate_left(17).wrapping_add(block);
             key = selected.wrapping_add(block);
+            if block == 0 {
+                continue;
+            }
             let byte_offset =
                 usize::try_from(selected & 0x0f).expect("sparse block byte offset fits usize");
             let offset = page_start

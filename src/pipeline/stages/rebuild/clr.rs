@@ -459,8 +459,10 @@ fn validate_user_heap(metadata: &Metadata<'_>) -> Result<BTreeSet<usize>> {
         let (length, next) = compressed(metadata.bytes, cursor, metadata.heaps.user.end)?;
         if length == 0 {
             ensure!(
-                next == metadata.heaps.user.end,
-                "zero-length #US record is not terminal padding"
+                metadata.bytes[next..metadata.heaps.user.end]
+                    .iter()
+                    .all(|&byte| byte == 0),
+                "nonzero data follows #US tail padding"
             );
             break;
         }
@@ -983,12 +985,14 @@ fn parse_streams(metadata: &[u8]) -> Result<(Heap, Heap, Heap, Heap, Heap)> {
 }
 
 /// Validates all present ECMA-335 tables and all nonzero MethodDef bodies.
-/// Method RVAs must belong entirely to executable PE sections.
+/// Method RVAs must belong entirely to executable PE sections. When supplied,
+/// `entry_point_token` must select a nonempty MethodDef row with a body.
 pub(crate) fn authenticated_method_defs(
     mapped: &[u8],
     pe: &Pe,
     metadata_rva: usize,
     metadata_size: usize,
+    entry_point_token: Option<u32>,
 ) -> Result<()> {
     let data = bytes(mapped, metadata_rva, metadata_size)?;
     let (tables, strings, blob, guid, user) = parse_streams(data)?;
@@ -1092,6 +1096,21 @@ pub(crate) fn authenticated_method_defs(
         methods.len() == usize::try_from(rows[6])?,
         "MethodDef count mismatch"
     );
+    if let Some(token) = entry_point_token {
+        ensure!(
+            token & 0xff00_0000 == 0x0600_0000,
+            "CLR entry point is not a MethodDef token"
+        );
+        let row = token & 0x00ff_ffff;
+        ensure!(
+            row != 0 && row <= rows[6],
+            "CLR entry MethodDef row is outside the metadata table"
+        );
+        ensure!(
+            methods[usize::try_from(row - 1)?] != 0,
+            "CLR entry MethodDef has no method body"
+        );
+    }
     let metadata_end = metadata_rva
         .checked_add(metadata_size)
         .context("metadata RVA range overflows")?;
@@ -1180,7 +1199,7 @@ mod tests {
         let mut image = vec![0; 0x2000];
         image[0x1100..0x1140].copy_from_slice(&metadata);
 
-        authenticated_method_defs(&image, &method_test_pe(0x6000_0020), 0x1100, 64)
+        authenticated_method_defs(&image, &method_test_pe(0x6000_0020), 0x1100, 64, None)
             .expect("minimal unoptimized metadata");
     }
     #[test]
@@ -1289,6 +1308,44 @@ mod tests {
                 },
             },
         };
+        assert!(validate_user_heap(&metadata).is_err());
+    }
+
+    #[test]
+    fn accepts_multiple_zero_bytes_as_user_heap_tail_padding() {
+        let bytes = [0, 3, b'A', 0, 0, 0, 0];
+        let metadata = Metadata {
+            bytes: &bytes,
+            heaps: Heaps {
+                strings: Heap { start: 0, end: 0 },
+                blob: Heap { start: 0, end: 0 },
+                guid: Heap { start: 0, end: 0 },
+                user: Heap {
+                    start: 0,
+                    end: bytes.len(),
+                },
+            },
+        };
+
+        assert_eq!(validate_user_heap(&metadata).unwrap(), BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn rejects_nonzero_data_after_user_heap_tail_padding() {
+        let bytes = [0, 3, b'A', 0, 0, 0, 1];
+        let metadata = Metadata {
+            bytes: &bytes,
+            heaps: Heaps {
+                strings: Heap { start: 0, end: 0 },
+                blob: Heap { start: 0, end: 0 },
+                guid: Heap { start: 0, end: 0 },
+                user: Heap {
+                    start: 0,
+                    end: bytes.len(),
+                },
+            },
+        };
+
         assert!(validate_user_heap(&metadata).is_err());
     }
 

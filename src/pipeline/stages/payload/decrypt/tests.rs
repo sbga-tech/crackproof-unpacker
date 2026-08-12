@@ -1,15 +1,20 @@
 use std::ops::Range;
 
 use super::decoder::CustomDecoderSource;
+use super::grammar::{
+    BoundPayloadSource, derive_payload_stream_provenance, select_payload_grammar,
+};
 use super::replay::NestedTransformedSource;
 use super::*;
 use crate::pe::{DataDirectory, Machine, Pe, Section};
 use crate::pipeline::stages::payload::bootstrap::{
-    MAX_OUTER_SOURCE_BYTES, OUTER_ENCRYPTED_PREFIX_RVA_BIAS, PackedBootstrap, derive_outer_source,
+    MAX_OUTER_SOURCE_BYTES, OUTER_ENCRYPTED_PREFIX_RVA_BIAS, PackedBootstrap,
+    bootstrap_source_file_range, derive_outer_source,
 };
 use crate::pipeline::stages::payload::nested::{
     MAX_AL_PROGRAM_BYTES, amd64_runtime_header_checksums, crackproof_checksum, crc32_table,
-    lfsr_al_maps, lfsr_decode_program, nested_transform_dwords_into, parse_al_byte_map,
+    lfsr_al_map_candidates, lfsr_al_maps, lfsr_decode_program, nested_transform_dwords_into,
+    parse_al_byte_map,
 };
 use crate::pipeline::stages::startup::{
     SparsePageKey, decode_sparse_text_pages_in_place, unique_sparse_page_keys,
@@ -23,6 +28,73 @@ fn lfsr_encode_program(program: &[u8]) -> [u8; MAX_AL_PROGRAM_BYTES] {
     let mut plaintext = [0u8; MAX_AL_PROGRAM_BYTES];
     plaintext[..program.len()].copy_from_slice(program);
     lfsr_decode_program(&plaintext)
+}
+
+fn bound_fixture_source<'a>(packed: &'a [u8], pe: &'a Pe) -> BoundPayloadSource<'a> {
+    let family = crate::pipeline::stages::detect::detect_family(packed, pe).unwrap();
+    let bootstrap = PackedBootstrap::from(&family.descriptor);
+    let source_file_range = bootstrap_source_file_range(packed, bootstrap).unwrap();
+    let (source_start, outer) = derive_outer_source(packed, bootstrap).unwrap();
+    let stream =
+        derive_payload_stream_provenance(packed, bootstrap, &source_file_range, None).unwrap();
+    BoundPayloadSource {
+        packed,
+        pe,
+        payload_source: packed,
+        bootstrap,
+        source_security_range: None,
+        source_file_range,
+        source_start,
+        stream,
+        outer,
+    }
+}
+
+#[test]
+fn shallow_staged_shape_does_not_preempt_a_record_authentication() {
+    let packed = include_bytes!("../../../../../packed/chusanApp_2.25.exe");
+    let pe = Pe::parse(packed).unwrap();
+    let source = bound_fixture_source(packed, &pe);
+    assert!(super::staged::recognizes_staged_table_payload(&source));
+
+    let recovered = select_payload_grammar(&source, None).unwrap();
+    assert_eq!(
+        recovered.decryption_details.payload_grammar,
+        Some(crate::pipeline::outcome::PayloadGrammar::ARecord)
+    );
+    assert_eq!(recovered.decryption_details.chunk_count, 7_485);
+    assert!(recovered.decryption_details.selected_staged_table.is_none());
+}
+
+#[test]
+fn complete_staged_table_replay_remains_authoritative() {
+    let packed = include_bytes!("../../../../../packed/maimai_SDEY_1.99.exe");
+    let pe = Pe::parse(packed).unwrap();
+    let source = bound_fixture_source(packed, &pe);
+    assert!(super::staged::recognizes_staged_table_payload(&source));
+
+    let recovered = select_payload_grammar(&source, None).unwrap();
+    assert_eq!(
+        recovered.decryption_details.payload_grammar,
+        Some(crate::pipeline::outcome::PayloadGrammar::StagedTable)
+    );
+    assert_eq!(recovered.decryption_details.chunk_count, 2_264);
+    assert!(recovered.decryption_details.selected_staged_table.is_some());
+}
+
+#[test]
+fn complete_staged_table_replay_wins_a_record_overlap() {
+    let packed = include_bytes!("../../../../../packed/chusanApp_2.50.exe");
+    let pe = Pe::parse(packed).unwrap();
+    let source = bound_fixture_source(packed, &pe);
+    assert!(super::staged::recognizes_staged_table_payload(&source));
+
+    let recovered = select_payload_grammar(&source, None).unwrap();
+    assert_eq!(
+        recovered.decryption_details.payload_grammar,
+        Some(crate::pipeline::outcome::PayloadGrammar::StagedTable)
+    );
+    assert!(recovered.decryption_details.selected_staged_table.is_some());
 }
 
 #[test]
@@ -92,7 +164,7 @@ fn sparse_text_page_decoder_matches_all_key_profiles_and_is_involutive() {
     let mut rotated_page_rva = original.clone();
     decode_sparse_text_pages_in_place(&mut rotated_page_rva, &pe, SparsePageKey::PageRvaRol(3))
         .unwrap();
-    assert_eq!(rotated_page_rva[0x1001], original[0x1001] ^ 0x01);
+    assert_eq!(rotated_page_rva[0x1001], original[0x1001]);
     assert_eq!(rotated_page_rva[0x1011], original[0x1011] ^ 0x02);
     assert_eq!(rotated_page_rva[0x1026], original[0x1026] ^ 0x08);
     decode_sparse_text_pages_in_place(&mut rotated_page_rva, &pe, SparsePageKey::PageRvaRol(3))
@@ -247,6 +319,27 @@ fn discovers_short_semantic_al_program() {
             .iter()
             .any(|(length, map)| { *length == PROGRAM.len() && map == &expected })
     );
+}
+
+#[test]
+fn retains_lfsr_program_offset_with_generated_map() {
+    const PROGRAM: [u8; 11] = [
+        0xfe, 0xc0, 0xfe, 0xc0, 0xc0, 0xc0, 0x07, 0xc0, 0xc0, 0x03, 0xc3,
+    ];
+    const PROGRAM_OFFSET: usize = 37;
+    let encoded = lfsr_encode_program(&PROGRAM);
+    let expected = parse_al_byte_map(&PROGRAM).unwrap().1;
+    let mut source = vec![0x5a; PROGRAM_OFFSET + MAX_AL_PROGRAM_BYTES + 17];
+    source[PROGRAM_OFFSET..PROGRAM_OFFSET + MAX_AL_PROGRAM_BYTES].copy_from_slice(&encoded);
+
+    let matching = lfsr_al_map_candidates(&source)
+        .into_iter()
+        .filter(|candidate| candidate.map == expected)
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 1);
+    assert_eq!(matching[0].offset, PROGRAM_OFFSET);
+    assert_eq!(matching[0].length, PROGRAM.len());
 }
 
 fn mwemu_al_map(program: &[u8], static_map: &[u8; 256]) -> [u8; 256] {
@@ -492,6 +585,7 @@ fn lazy_nested_transform_matches_materialized_bytes() {
 struct FixtureOptions {
     descriptor_file_offset: usize,
     source_offset: u32,
+    stream_gap: usize,
     destination_rva: u32,
     key: u32,
     prefix_length: usize,
@@ -514,6 +608,7 @@ struct Fixture {
     custom_destination: usize,
     source_start: usize,
     table_offset: usize,
+    stream_base: usize,
     context_range: Range<usize>,
     encoded_context: [u8; AES_CONTEXT_SIZE],
 }
@@ -761,7 +856,7 @@ fn build_fixture(options: FixtureOptions) -> Fixture {
         &[(options.precursor_offset, precursor)],
     );
 
-    let stream_base = source_start + options.source_length;
+    let stream_base = source_start + options.source_length + options.stream_gap;
     let context_start = source_start
         .checked_add(options.context_source_offset)
         .expect("test context start");
@@ -775,7 +870,16 @@ fn build_fixture(options: FixtureOptions) -> Fixture {
         .expect("test stream length")
         .max(context_end);
     let mut packed = vec![0; packed_length];
-    packed[source_start..stream_base].copy_from_slice(&source);
+    let source_end = source_start + options.source_length;
+    packed[source_start..source_end].copy_from_slice(&source);
+    let locator_offset = options.descriptor_file_offset + 0x80;
+    let descriptor_offset =
+        u32::try_from(options.descriptor_file_offset).expect("test descriptor offset");
+    let relative_stream_base = u32::try_from(stream_base)
+        .expect("test stream base")
+        .wrapping_sub(descriptor_offset);
+    packed[locator_offset..locator_offset + 4]
+        .copy_from_slice(&(!relative_stream_base).to_le_bytes());
     let mut direct_encoded = direct_output
         .iter()
         .copied()
@@ -796,6 +900,7 @@ fn build_fixture(options: FixtureOptions) -> Fixture {
         direct_destination,
         custom_destination,
         source_start,
+        stream_base,
         table_offset: options.table_offset,
         context_range,
         encoded_context,
@@ -805,7 +910,8 @@ fn build_fixture(options: FixtureOptions) -> Fixture {
 fn options_a() -> FixtureOptions {
     FixtureOptions {
         descriptor_file_offset: 0x40,
-        source_offset: 0x80,
+        source_offset: 0x100,
+        stream_gap: 0,
         destination_rva: 0x4100,
         key: 0x91a2_b3c4,
         prefix_length: 0x2000,
@@ -823,7 +929,8 @@ fn options_a() -> FixtureOptions {
 fn options_b() -> FixtureOptions {
     FixtureOptions {
         descriptor_file_offset: 0x180,
-        source_offset: 0x44,
+        source_offset: 0x100,
+        stream_gap: 0x280,
         destination_rva: 0x6200,
         key: 0x1726_35e4,
         prefix_length: 0x2040,
@@ -836,6 +943,87 @@ fn options_b() -> FixtureOptions {
         context_seed: 0x8e,
         aes_key: std::array::from_fn(|index| 0x3cu8.wrapping_add((index * 11) as u8)),
     }
+}
+#[test]
+fn payload_stream_provenance_uses_the_descriptor_locator_gap() {
+    let fixture = build_fixture(options_b());
+    let source_file_range =
+        bootstrap_source_file_range(&fixture.packed, fixture.bootstrap).unwrap();
+
+    let provenance = derive_payload_stream_provenance(
+        &fixture.packed,
+        fixture.bootstrap,
+        &source_file_range,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        provenance,
+        super::grammar::PayloadStreamProvenance {
+            locator_file_offset: fixture.bootstrap.descriptor_file_offset + 0x80,
+            base_file_offset: fixture.stream_base,
+            gap_after_outer_source: options_b().stream_gap,
+        }
+    );
+}
+
+#[test]
+fn payload_stream_provenance_rejects_a_locator_overlapping_the_outer_source() {
+    let fixture = build_fixture(options_a());
+    let bootstrap = PackedBootstrap {
+        source_offset: 0x80,
+        ..fixture.bootstrap
+    };
+    let source_file_range = bootstrap_source_file_range(&fixture.packed, bootstrap).unwrap();
+
+    assert!(
+        derive_payload_stream_provenance(&fixture.packed, bootstrap, &source_file_range, None)
+            .is_err()
+    );
+}
+
+#[test]
+fn payload_stream_provenance_rejects_a_base_before_the_outer_source_end() {
+    let mut fixture = build_fixture(options_a());
+    let source_file_range =
+        bootstrap_source_file_range(&fixture.packed, fixture.bootstrap).unwrap();
+    let invalid_base = source_file_range.end - 1;
+    let descriptor_offset = u32::try_from(fixture.bootstrap.descriptor_file_offset).unwrap();
+    let encoded = !(u32::try_from(invalid_base)
+        .unwrap()
+        .wrapping_sub(descriptor_offset));
+    let locator = fixture.bootstrap.descriptor_file_offset + 0x80;
+    fixture.packed[locator..locator + 4].copy_from_slice(&encoded.to_le_bytes());
+
+    assert!(
+        derive_payload_stream_provenance(
+            &fixture.packed,
+            fixture.bootstrap,
+            &source_file_range,
+            None,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn payload_stream_provenance_rejects_a_locator_in_the_security_directory() {
+    let fixture = build_fixture(options_a());
+    let source_file_range =
+        bootstrap_source_file_range(&fixture.packed, fixture.bootstrap).unwrap();
+    let locator = fixture.bootstrap.descriptor_file_offset + 0x80;
+    let security = locator..locator + 4;
+
+    assert!(
+        derive_payload_stream_provenance(
+            &fixture.packed,
+            fixture.bootstrap,
+            &source_file_range,
+            Some(&security),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1438,6 +1626,73 @@ fn decryption_replay_budget_is_independent_per_candidate_chain() {
 }
 
 #[test]
+fn parallel_candidate_replay_matches_single_thread_selection() {
+    let key = [0x3c; AES_256_KEY_SIZE];
+    let stream_base = AES_CONTEXT_SIZE;
+    let mut packed = vec![0; stream_base + 2];
+    packed[..stream_base].copy_from_slice(&encode_context(&key, 0x39));
+    packed[stream_base] = inverse_f8(b'D');
+    packed[stream_base + 1] = inverse_f8(0);
+    let records = [
+        ARecord {
+            source_offset: 0,
+            encoded_length: 1,
+            destination_rva: 0,
+            destination_length: 1,
+        },
+        ARecord {
+            source_offset: 1,
+            encoded_length: 1,
+            destination_rva: 1,
+            destination_length: 2,
+        },
+    ];
+    let mapped = [0; 3];
+    let accepting_table = root_literal_table(0);
+    let select = |threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| {
+                select_decryption_plan(
+                    &packed,
+                    0..stream_base,
+                    stream_base,
+                    &mapped,
+                    &records,
+                    vec![
+                        DecoderCandidate {
+                            source_file_offset: 1,
+                            phase: 0,
+                            table: root_table_for_tokens(&[0], &[0x203]),
+                        },
+                        DecoderCandidate {
+                            source_file_offset: 2,
+                            phase: 0,
+                            table: accepting_table.clone(),
+                        },
+                    ],
+                    &[PayloadPostTransform::F8],
+                )
+            })
+            .unwrap()
+    };
+
+    let (single_plan, single_details) = select(1);
+    let (parallel_plan, parallel_details) = select(4);
+    assert_eq!(parallel_plan.aes_key, single_plan.aes_key);
+    assert_eq!(
+        parallel_plan.decoder.source_file_offset,
+        single_plan.decoder.source_file_offset
+    );
+    assert_eq!(parallel_plan.decoder.phase, single_plan.decoder.phase);
+    assert_eq!(parallel_plan.decoder.table, single_plan.decoder.table);
+    assert_eq!(parallel_plan.post_transform, single_plan.post_transform);
+    assert_eq!(parallel_details, single_details);
+}
+
+#[test]
 fn decryption_selection_failure_reports_bounded_custom_rejections() {
     let key = [0x3c; AES_256_KEY_SIZE];
     let stream_base = AES_CONTEXT_SIZE;
@@ -1613,7 +1868,7 @@ fn rejects_corruption_truncation_and_missing_a_candidate_without_mutation() {
     let fixture = build_fixture(options_b());
     let mut mapped = vec![0x6d; 0x7000];
     let original = mapped.clone();
-    let stream_base = fixture.source_start + options_b().source_length;
+    let stream_base = fixture.stream_base;
     let truncated = &fixture.packed[..stream_base + 16];
     assert!(decrypt_bootstrap_into(truncated, fixture.bootstrap, &mut mapped).is_err());
     assert_eq!(mapped, original);

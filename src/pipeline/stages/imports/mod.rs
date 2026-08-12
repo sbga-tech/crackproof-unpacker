@@ -366,6 +366,24 @@ pub(crate) fn discover_imports_in_image(
     }
 }
 
+/// Prefers CrackProof's encoded loader graph but accepts an ordinary PE import
+/// directory when a native DLL retained no encoded descriptor run.
+pub(crate) fn discover_native_dll_imports_in_image(
+    mapped: &[u8],
+    pe: &Pe,
+) -> Result<(ImportProfile, LoaderDiscovery)> {
+    let encoded_error = match loader::discover_imports_in_image(mapped, pe) {
+        Ok(discovery) => return Ok((ImportProfile::EncodedLoader, discovery)),
+        Err(error) => error,
+    };
+    let discovery = standard::discover_imports_in_image(mapped, pe).with_context(|| {
+        format!(
+            "native DLL has neither a valid encoded loader graph nor a standard import table; encoded loader discovery failed: {encoded_error:#}"
+        )
+    })?;
+    Ok((ImportProfile::Standard, discovery))
+}
+
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]

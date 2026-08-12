@@ -1,9 +1,9 @@
-//! Generic semantic reconstruction for CrackProof-managed DLL payloads.
+//! Generic semantic reconstruction for CrackProof-managed DLL and EXE payloads.
 //!
 //! CrackProof leaves an AMD64 or I386 native loader prefix in front of a valid
 //! CLR payload. Reconstruction discards only that authenticated prefix, keeps
 //! every CLR-owned mapped section at its original RVA, and appends fresh PE32
-//! `_CorDllMain` import, bootstrap, and relocation sections.
+//! `mscoree` import, bootstrap, and relocation sections.
 
 use std::ops::Range;
 
@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::pe::{self, DataDirectory, Machine, Pe, pe_checksum};
 use crate::pipeline::outcome::{GeneratedSemanticClrContainer, ManagedSemanticClrSource};
 use crate::pipeline::stages::imports::LoaderDiscovery;
+use crate::pipeline::stages::startup::ManagedKind;
 
 const FILE_ALIGNMENT: u32 = 0x200;
 const DIRECTORY_COUNT: usize = 16;
@@ -42,6 +43,7 @@ struct ClrLayout {
     cor20: DataDirectory,
     metadata: DataDirectory,
     source_flags: u32,
+    entry_point_token: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -136,8 +138,11 @@ fn validate_subdirectory(
 
 /// Validates the dynamic COR20/metadata contract without pinning any sample
 /// address, section count, runtime version, or optional managed resource.
-fn validate_clr_container(mapped: &[u8], pe: &Pe) -> Result<ClrLayout> {
-    ensure!(pe.is_dll(), "semantic CLR reconstruction requires a DLL");
+fn validate_clr_container(mapped: &[u8], pe: &Pe, kind: ManagedKind) -> Result<ClrLayout> {
+    ensure!(
+        pe.is_dll() == kind.is_dll(),
+        "managed source kind differs from the selected entry contract"
+    );
     let cor20 = pe
         .directory(COR20_DIRECTORY)
         .context("reading COM Descriptor")?;
@@ -179,9 +184,27 @@ fn validate_clr_container(mapped: &[u8], pe: &Pe) -> Result<ClrLayout> {
         "COR20 header contains unknown flags {source_flags:#x}"
     );
     ensure!(
-        source_flags & COMIMAGE_FLAGS_NATIVE_ENTRYPOINT == 0 && get32(header, 20)? == 0,
-        "managed DLL has a native or managed entry point"
+        source_flags & COMIMAGE_FLAGS_NATIVE_ENTRYPOINT == 0,
+        "managed image has a native entry point"
     );
+    let entry_point_token = get32(header, 20)?;
+    let authenticated_entry = match kind {
+        ManagedKind::Dll => {
+            ensure!(
+                entry_point_token == 0,
+                "managed DLL has a nonzero entry token"
+            );
+            None
+        }
+        ManagedKind::Exe => {
+            ensure!(
+                entry_point_token & 0xff00_0000 == 0x0600_0000
+                    && entry_point_token & 0x00ff_ffff != 0,
+                "managed EXE entry is not a nonzero MethodDef token"
+            );
+            Some(entry_point_token)
+        }
+    };
 
     let resources = directory_at(header, 24)?;
     let strong_name = directory_at(header, 32)?;
@@ -204,11 +227,13 @@ fn validate_clr_container(mapped: &[u8], pe: &Pe) -> Result<ClrLayout> {
         pe,
         usize::try_from(metadata.virtual_address)?,
         usize::try_from(metadata.size)?,
+        authenticated_entry,
     )?;
     Ok(ClrLayout {
         cor20,
         metadata,
         source_flags,
+        entry_point_token,
     })
 }
 
@@ -224,12 +249,16 @@ fn authenticate_source(
     mapped: &[u8],
     pe: &Pe,
     discovery: &LoaderDiscovery,
+    kind: ManagedKind,
 ) -> Result<SourceProfile> {
     ensure!(
         mapped.len() == usize::try_from(pe.size_of_image)?,
         "managed mapped length differs from SizeOfImage"
     );
-    ensure!(pe.is_dll(), "managed source is not a DLL");
+    ensure!(
+        pe.is_dll() == kind.is_dll(),
+        "managed source kind differs from selected output kind"
+    );
     ensure!(
         discovery.image_size == pe.size_of_image,
         "managed loader graph image size mismatch"
@@ -238,7 +267,7 @@ fn authenticate_source(
         pe.directories.len() >= DIRECTORY_COUNT,
         "managed source has fewer than 16 data-directory slots"
     );
-    let clr = validate_clr_container(mapped, pe)?;
+    let clr = validate_clr_container(mapped, pe, kind)?;
     let first = pe
         .sections
         .first()
@@ -333,7 +362,7 @@ fn authenticate_source(
     })
 }
 
-fn import_payload(import_rva: u32, iat_rva: u32) -> Result<Vec<u8>> {
+fn import_payload(import_rva: u32, iat_rva: u32, kind: ManagedKind) -> Result<Vec<u8>> {
     const DESCRIPTOR_BYTES: usize = 40;
     const ILT_OFFSET: u32 = 40;
     const IAT_OFFSET: u32 = 48;
@@ -355,8 +384,16 @@ fn import_payload(import_rva: u32, iat_rva: u32) -> Result<Vec<u8>> {
     )?;
     range_mut(&mut payload, usize::try_from(DLL_OFFSET)?, 12)?.copy_from_slice(b"mscoree.dll\0");
     put16(&mut payload, usize::try_from(NAME_OFFSET)?, 0)?;
-    range_mut(&mut payload, usize::try_from(NAME_OFFSET + 2)?, 12)?
-        .copy_from_slice(b"_CorDllMain\0");
+    let symbol = match kind {
+        ManagedKind::Dll => b"_CorDllMain\0",
+        ManagedKind::Exe => b"_CorExeMain\0",
+    };
+    range_mut(
+        &mut payload,
+        usize::try_from(NAME_OFFSET + 2)?,
+        symbol.len(),
+    )?
+    .copy_from_slice(symbol);
     ensure!(
         payload[20..DESCRIPTOR_BYTES].iter().all(|byte| *byte == 0),
         "generated import terminator is nonzero"
@@ -505,7 +542,11 @@ fn write_headers(
     put16(output, coff, 0x14c)?;
     put16(output, coff + 2, u16::try_from(sections.len())?)?;
     put16(output, coff + 16, 0xe0)?;
-    put16(output, coff + 18, 0x2102)?;
+    put16(
+        output,
+        coff + 18,
+        0x0102 | if pe.is_dll() { 0x2000 } else { 0 },
+    )?;
 
     put16(output, OPTIONAL_OFFSET, 0x10b)?;
     let mut code_size = 0u32;
@@ -654,10 +695,15 @@ fn verify_output(
     generated: &GeneratedSemanticClrContainer,
     changes: &[Range<u32>],
 ) -> Result<()> {
+    let kind = if source_pe.is_dll() {
+        ManagedKind::Dll
+    } else {
+        ManagedKind::Exe
+    };
     let pe = Pe::parse(output).context("parsing generated semantic CLR container")?;
     ensure!(
-        pe.machine_kind() == Machine::I386 && pe.is_dll(),
-        "generated semantic CLR container is not a PE32/I386 DLL"
+        pe.machine_kind() == Machine::I386 && pe.is_dll() == kind.is_dll(),
+        "generated semantic CLR container has the wrong PE32/I386 kind"
     );
     ensure!(
         pe.entry_rva == generated.entry_rva,
@@ -694,6 +740,33 @@ fn verify_output(
     let remapped = pe
         .map_image(output)
         .context("mapping generated semantic CLR container")?;
+    let expected_import = import_payload(generated.import_rva, generated.iat_rva, kind)?;
+    ensure!(
+        range(
+            &remapped,
+            usize::try_from(generated.import_rva)?,
+            expected_import.len(),
+        )? == expected_import.as_slice(),
+        "generated CLR import payload differs from selected runtime entry"
+    );
+    let expected_stub = stub_payload(generated.iat_rva)?;
+    ensure!(
+        range(
+            &remapped,
+            usize::try_from(generated.entry_rva)?,
+            expected_stub.len(),
+        )? == expected_stub.as_slice(),
+        "generated CLR startup stub does not jump through the runtime IAT"
+    );
+    let expected_relocation = relocation_payload(generated.entry_rva)?;
+    ensure!(
+        range(
+            &remapped,
+            usize::try_from(generated.reloc_rva)?,
+            expected_relocation.len(),
+        )? == expected_relocation.as_slice(),
+        "generated CLR startup relocation differs from the entry stub"
+    );
     let mut permitted_changes = changes.to_vec();
     permitted_changes.push(
         source_profile.clr.cor20.virtual_address + 16
@@ -710,12 +783,13 @@ fn verify_output(
             );
         }
     }
-    let rebuilt_clr = validate_clr_container(&remapped, &pe)?;
+    let rebuilt_clr = validate_clr_container(&remapped, &pe, kind)?;
     ensure!(
         rebuilt_clr.metadata == source_profile.clr.metadata
+            && rebuilt_clr.entry_point_token == source_profile.clr.entry_point_token
             && rebuilt_clr.source_flags
                 == (source_profile.clr.source_flags | COMIMAGE_FLAGS_ILONLY),
-        "generated CLR metadata/flags contract mismatch"
+        "generated CLR metadata/entry/flags contract mismatch"
     );
     ensure!(
         get32(output, pe.checksum_offset)? == pe_checksum(output, pe.checksum_offset)?,
@@ -735,15 +809,16 @@ fn source_architecture(machine: Machine) -> &'static str {
     }
 }
 
-/// Emits a deterministic PE32 CLR DLL after authenticating only structural
-/// CrackProof-prefix and ECMA-335 invariants. No sample RVA, section size,
-/// import symbol, resource shape, or metadata address is assumed.
+/// Emits a deterministic PE32 CLR DLL or EXE after authenticating only
+/// structural CrackProof-prefix and ECMA-335 invariants. No sample RVA,
+/// section size, import symbol, resource shape, or metadata address is assumed.
 pub(crate) fn rebuild_semantic_clr(
     mapped: &[u8],
     pe: &Pe,
     discovery: &LoaderDiscovery,
+    kind: ManagedKind,
 ) -> Result<ManagedRebuild> {
-    let source_profile = authenticate_source(mapped, pe, discovery)?;
+    let source_profile = authenticate_source(mapped, pe, discovery, kind)?;
     let mut sections = source_sections(mapped, pe, source_profile.payload_start)?;
     let source_ranges = sections
         .iter()
@@ -776,7 +851,7 @@ pub(crate) fn rebuild_semantic_clr(
         *b".clrimp\0",
         import_rva,
         IMPORT_CHARACTERISTICS,
-        import_payload(import_rva, iat_rva)?,
+        import_payload(import_rva, iat_rva, kind)?,
     )?;
     push_generated_section(
         &mut sections,
@@ -916,9 +991,35 @@ mod tests {
         .expect("source standard import graph")
     }
 
+    fn managed_exe_source() -> (Vec<u8>, Pe, LoaderDiscovery) {
+        let source = source_pe();
+        let mut mapped = SDDT_MAPPED.to_vec();
+        let characteristics_offset = source.opt.checked_sub(2).unwrap();
+        let characteristics =
+            get16(&mapped, characteristics_offset).unwrap() & !crate::pe::IMAGE_FILE_DLL;
+        put16(&mut mapped, characteristics_offset, characteristics).unwrap();
+        let cor20_rva = source.directory(COR20_DIRECTORY).unwrap().virtual_address;
+        put32(
+            &mut mapped,
+            usize::try_from(cor20_rva + 20).unwrap(),
+            0x0600_0001,
+        )
+        .unwrap();
+        let pe = Pe::parse_mapped(&mapped).unwrap();
+        let discovery = crate::pipeline::stages::imports::discover_imports_in_image(
+            &mapped,
+            &pe,
+            crate::pipeline::stages::imports::ImportProfile::Standard,
+        )
+        .unwrap();
+        (mapped, pe, discovery)
+    }
+
     #[test]
     fn builder_emits_structural_semantic_container() {
-        let rebuilt = rebuild_semantic_clr(SDDT_MAPPED, &source_pe(), &discovery()).unwrap();
+        let rebuilt =
+            rebuild_semantic_clr(SDDT_MAPPED, &source_pe(), &discovery(), ManagedKind::Dll)
+                .unwrap();
         let output_pe = Pe::parse(&rebuilt.output).unwrap();
         assert_eq!(output_pe.machine_kind(), Machine::I386);
         assert_eq!(output_pe.sections.len(), source_pe().sections.len() + 3);
@@ -926,17 +1027,86 @@ mod tests {
             output_pe.directory(COR20_DIRECTORY).unwrap(),
             source_pe().directory(COR20_DIRECTORY).unwrap()
         );
+        assert!(
+            rebuilt
+                .output
+                .windows(b"_CorDllMain\0".len())
+                .any(|window| window == b"_CorDllMain\0")
+        );
+    }
+
+    #[test]
+    fn builder_emits_managed_exe_with_authenticated_entry_token() {
+        let (mapped, pe, discovery) = managed_exe_source();
+        let source_cor20 = pe.directory(COR20_DIRECTORY).unwrap();
+
+        let rebuilt = rebuild_semantic_clr(&mapped, &pe, &discovery, ManagedKind::Exe).unwrap();
+        let output_pe = Pe::parse(&rebuilt.output).unwrap();
+        let remapped = output_pe.map_image(&rebuilt.output).unwrap();
+
+        assert_eq!(output_pe.machine_kind(), Machine::I386);
+        assert!(!output_pe.is_dll());
+        assert_eq!(output_pe.directory(COR20_DIRECTORY).unwrap(), source_cor20);
+        assert_eq!(
+            get32(
+                &remapped,
+                usize::try_from(source_cor20.virtual_address + 20).unwrap(),
+            )
+            .unwrap(),
+            0x0600_0001
+        );
+        assert!(
+            rebuilt
+                .output
+                .windows(b"_CorExeMain\0".len())
+                .any(|window| window == b"_CorExeMain\0")
+        );
+        assert!(
+            rebuilt
+                .output
+                .windows(b"_CorDllMain\0".len())
+                .all(|window| window != b"_CorDllMain\0")
+        );
+    }
+
+    #[test]
+    fn managed_exe_rejects_entry_token_outside_method_table() {
+        let (mut mapped, _, _) = managed_exe_source();
+        let source = source_pe();
+        let cor20_rva = source.directory(COR20_DIRECTORY).unwrap().virtual_address;
+        put32(
+            &mut mapped,
+            usize::try_from(cor20_rva + 20).unwrap(),
+            0x06ff_ffff,
+        )
+        .unwrap();
+        let pe = Pe::parse_mapped(&mapped).unwrap();
+        let discovery = crate::pipeline::stages::imports::discover_imports_in_image(
+            &mapped,
+            &pe,
+            crate::pipeline::stages::imports::ImportProfile::Standard,
+        )
+        .unwrap();
+
+        let error = rebuild_semantic_clr(&mapped, &pe, &discovery, ManagedKind::Exe)
+            .err()
+            .expect("out-of-range managed entry token must be rejected")
+            .to_string();
+
+        assert!(error.contains("outside the metadata table"), "{error}");
     }
 
     #[test]
     fn source_authentication_is_not_tied_to_konn_bytes_or_generated_zero_fill() {
         let pe = source_pe();
-        let profile = authenticate_source(SDDT_MAPPED, &pe, &discovery()).unwrap();
+        let profile =
+            authenticate_source(SDDT_MAPPED, &pe, &discovery(), ManagedKind::Dll).unwrap();
         let mut changed = SDDT_MAPPED.to_vec();
         changed[0x1131] ^= 1;
         changed[usize::try_from(profile.payload_start).unwrap()] = 0x5a;
         let changed_pe = Pe::parse_mapped(&changed).unwrap();
-        let rebuilt = rebuild_semantic_clr(&changed, &changed_pe, &discovery()).unwrap();
+        let rebuilt =
+            rebuild_semantic_clr(&changed, &changed_pe, &discovery(), ManagedKind::Dll).unwrap();
         let output_pe = Pe::parse(&rebuilt.output).unwrap();
         let remapped = output_pe.map_image(&rebuilt.output).unwrap();
         assert_eq!(
@@ -948,9 +1118,12 @@ mod tests {
     #[test]
     fn rejects_native_loader_state_crossing_into_clr_payload() {
         let mut discovery = discovery();
-        let profile = authenticate_source(SDDT_MAPPED, &source_pe(), &discovery).unwrap();
+        let profile =
+            authenticate_source(SDDT_MAPPED, &source_pe(), &discovery, ManagedKind::Dll).unwrap();
         discovery.modules[0].destination_rva = profile.payload_start;
-        assert!(rebuild_semantic_clr(SDDT_MAPPED, &source_pe(), &discovery).is_err());
+        assert!(
+            rebuild_semantic_clr(SDDT_MAPPED, &source_pe(), &discovery, ManagedKind::Dll,).is_err()
+        );
     }
 
     #[test]
@@ -960,6 +1133,6 @@ mod tests {
         let metadata_rva = get32(SDDT_MAPPED, usize::try_from(metadata).unwrap() + 8).unwrap();
         let mut mapped = SDDT_MAPPED.to_vec();
         mapped[usize::try_from(metadata_rva).unwrap()] ^= 1;
-        assert!(rebuild_semantic_clr(&mapped, &pe, &discovery()).is_err());
+        assert!(rebuild_semantic_clr(&mapped, &pe, &discovery(), ManagedKind::Dll).is_err());
     }
 }

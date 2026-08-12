@@ -48,7 +48,7 @@ struct CompleteCandidateReplayer {
 }
 
 impl NestedRecordReplayer for CompleteCandidateReplayer {
-    fn begin_graph(&mut self, _extended_profile: bool) -> Result<()> {
+    fn begin_graph(&mut self, _extended_profile: bool, _exhaustive_rotations: bool) -> Result<()> {
         Ok(())
     }
 
@@ -139,12 +139,73 @@ fn legacy_profile_keeps_direct_ambiguity_terminal() {
     assert_eq!(replayer.calls, 1);
 }
 
+struct NoMatchDirectReplayer {
+    calls: Vec<Vec<u32>>,
+}
+
+impl NestedRecordReplayer for NoMatchDirectReplayer {
+    fn begin_graph(&mut self, _extended_profile: bool, _exhaustive_rotations: bool) -> Result<()> {
+        Ok(())
+    }
+
+    fn replay(
+        &mut self,
+        _staged_outer: &[u8],
+        _bootstrap: PackedBootstrap,
+        _record: &NestedRecord,
+        keys: &[u32],
+        _byte_maps: &[(usize, Box<[u8; 256]>)],
+    ) -> Result<NestedReplay> {
+        self.calls.push(keys.to_vec());
+        if keys == [1] {
+            Ok(NestedReplay::NoMatch)
+        } else {
+            Ok(NestedReplay::Unique(vec![2], 2))
+        }
+    }
+}
+
+#[test]
+fn direct_no_match_is_not_replayed_in_the_fallback_tier() {
+    let bootstrap = PackedBootstrap {
+        descriptor_file_offset: 0,
+        key: 0,
+        destination_rva: 0,
+        source_offset: 0,
+        length: 0,
+        source_rva: 0,
+    };
+    let record = NestedRecord {
+        descriptor_offset: 0,
+        source_rva: 0,
+        encoded_length: 1,
+        destination_rva: 0,
+        destination_length: 2,
+    };
+    let mut replayer = NoMatchDirectReplayer { calls: Vec::new() };
+
+    let result = replay_nested_keys(
+        &mut replayer,
+        &[],
+        bootstrap,
+        &record,
+        &[1, 2, 3],
+        1,
+        &[],
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(result, NestedReplay::Unique(vec![2], 2));
+    assert_eq!(replayer.calls, [vec![1], vec![2, 3]]);
+}
+
 struct UnstructuredFallbackReplayer {
     calls: usize,
 }
 
 impl NestedRecordReplayer for UnstructuredFallbackReplayer {
-    fn begin_graph(&mut self, _extended_profile: bool) -> Result<()> {
+    fn begin_graph(&mut self, _extended_profile: bool, _exhaustive_rotations: bool) -> Result<()> {
         Ok(())
     }
 
@@ -233,4 +294,59 @@ fn nested_map_graph_completes_after_two_nonempty_generations() {
     assert_eq!(generations, 2);
     assert_eq!(maps[0].0, 3);
     assert_eq!(maps[0].1.as_ref(), &[0x33; 256]);
+}
+
+#[test]
+fn length_complement_bases_are_an_explicit_fallback() {
+    let bootstrap = PackedBootstrap {
+        descriptor_file_offset: 0,
+        key: 0,
+        destination_rva: 0x1000,
+        source_offset: 0,
+        length: 0x100,
+        source_rva: 0,
+    };
+    let mut staged_outer = vec![0u8; 0x100];
+    staged_outer[0x10..0x14].copy_from_slice(&0x4000u32.to_le_bytes());
+    let span = NestedSpan {
+        descriptor_offset: 0,
+        rva: 0x1010,
+        length: 4,
+    };
+    let table = crc32_table();
+    let header_checksum = 0x89ab_cdef;
+    let checksum_base = header_checksum ^ crackproof_checksum(&staged_outer[0x10..0x14], &table);
+    let length_base = header_checksum ^ !span.length;
+
+    let primary = nested_checksum_bases(
+        &staged_outer,
+        bootstrap,
+        &[span],
+        header_checksum,
+        &table,
+        false,
+        false,
+    );
+    assert!(primary.contains(&checksum_base));
+    assert!(!primary.contains(&length_base));
+
+    let fallback = nested_checksum_bases(
+        &staged_outer,
+        bootstrap,
+        &[span],
+        header_checksum,
+        &table,
+        false,
+        true,
+    );
+    assert!(fallback.contains(&checksum_base));
+    assert!(fallback.contains(&length_base));
+}
+
+#[test]
+fn primary_nested_work_budget_fails_closed() {
+    let mut budget = NestedKeyWorkBudget::limited(3, 7);
+    budget.charge(1, 4).unwrap();
+    let error = budget.charge(1, 4).unwrap_err();
+    assert!(error.downcast_ref::<PrimaryNestedWorkExhausted>().is_some());
 }

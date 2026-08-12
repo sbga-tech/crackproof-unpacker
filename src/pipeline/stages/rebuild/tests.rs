@@ -107,6 +107,44 @@ fn candidate_cleanup_removes_proven_metadata_without_touching_unrelated_bytes() 
     assert_eq!(&image[0x1700..0x1709], b"unrelated");
 }
 
+#[test]
+fn selected_standard_discovery_clears_provenance_and_equivalent_clones() {
+    let pe = test_pe();
+    let mut image = vec![0; 0x2000];
+    standard_import(&mut image, 0x1100, 0);
+    standard_import(&mut image, 0x1400, 0);
+    standard_import(&mut image, 0x1700, 1);
+    let candidate = scan_import_candidates(&image, &pe)
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.start == 0x1100)
+        .unwrap();
+    let discovery = LoaderDiscovery {
+        table_rva: candidate.start,
+        metadata_ranges: candidate.metadata_ranges,
+        image_size: pe.size_of_image,
+        modules: candidate.graph.modules,
+        function_count: candidate.graph.functions,
+        named_count: 1,
+        ordinal_count: 0,
+    };
+
+    clear_discovered_imports(&mut image, &pe, &discovery).unwrap();
+
+    for range in [0x1100..0x1300, 0x1400..0x1600] {
+        assert!(
+            image[range]
+                .windows(b"mod.dll".len())
+                .all(|window| window != b"mod.dll")
+        );
+    }
+    assert!(
+        image[0x1700..0x1900]
+            .windows(b"mod.dll".len())
+            .any(|window| window == b"mod.dll")
+    );
+}
+
 fn two_module_import(image: &mut [u8], start: usize) {
     for (descriptor, lookup, dll, iat, hint_name, module, api) in [
         (
@@ -341,6 +379,37 @@ fn exception_and_relocation_directories_require_valid_native_structure() {
         },
     )
     .expect("valid AMD64 runtime function");
+    let mut padded = image.clone();
+    padded.copy_within(0x1100..0x110c, 0x1118);
+    padded[0x1100..0x1118].fill(0);
+    assert_eq!(
+        recover_exception_directory(
+            &padded,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 36,
+            },
+        )
+        .unwrap(),
+        Some(DataDirectory {
+            virtual_address: 0x1118,
+            size: 12,
+        })
+    );
+    padded[0x1300] = 0;
+    assert_eq!(
+        recover_exception_directory(
+            &padded,
+            &pe,
+            DataDirectory {
+                virtual_address: 0x1100,
+                size: 36,
+            },
+        )
+        .unwrap(),
+        None
+    );
     put_u32(&mut image, 0x1104, 0x1200);
     assert!(
         validate_retained_directory(
@@ -647,6 +716,66 @@ fn effective_unprovenant_declared_relocations_fail_closed() {
     assert!(error.to_string().contains(
         "effective declared base-relocation directory is not authenticated by recovered payload records"
     ));
+}
+fn tls_only_relocation_fixture() -> (Vec<u8>, Pe, DataDirectory) {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    pe.image_base = 0x1_4000_0000;
+    pe.sections[0].characteristics = 0xe000_0040;
+    pe.directories[TLS_DIRECTORY] = DataDirectory {
+        virtual_address: 0x1100,
+        size: 40,
+    };
+    let mut image = vec![0; 0x2000];
+    image[pe.opt + 70..pe.opt + 72].copy_from_slice(&0x0040u16.to_le_bytes());
+    for (offset, value) in [
+        (0x1100, pe.image_base + 0x1200),
+        (0x1108, pe.image_base + 0x1208),
+        (0x1110, pe.image_base + 0x1210),
+        (0x1118, pe.image_base + 0x1300),
+    ] {
+        put_u64(&mut image, offset, value);
+    }
+    let declared = DataDirectory {
+        virtual_address: 0x1500,
+        size: 16,
+    };
+    put_u32(&mut image, 0x1500, 0x1000);
+    put_u32(&mut image, 0x1504, declared.size);
+    for (index, word) in [0xa100u16, 0xa108, 0xa110, 0xa118].into_iter().enumerate() {
+        image[0x1508 + index * 2..0x150a + index * 2].copy_from_slice(&word.to_le_bytes());
+    }
+    (image, pe, declared)
+}
+
+#[test]
+fn exact_tls_only_declared_relocations_have_semantic_provenance() {
+    let (image, pe, declared) = tls_only_relocation_fixture();
+
+    assert_eq!(
+        recover_base_relocation_directory(&image, &pe, declared, &[], &[]).unwrap(),
+        Some(declared)
+    );
+}
+
+#[test]
+fn tls_only_declared_relocations_reject_an_extra_target() {
+    let (mut image, pe, mut declared) = tls_only_relocation_fixture();
+    declared.size = 20;
+    put_u32(&mut image, 0x1504, declared.size);
+    image[0x1510..0x1512].copy_from_slice(&0xa240u16.to_le_bytes());
+    image[0x1512..0x1514].copy_from_slice(&0u16.to_le_bytes());
+    put_u64(&mut image, 0x1240, pe.image_base + 0x1400);
+
+    assert!(recover_base_relocation_directory(&image, &pe, declared, &[], &[]).is_err());
+}
+
+#[test]
+fn tls_only_declared_relocations_reject_a_missing_target() {
+    let (mut image, pe, declared) = tls_only_relocation_fixture();
+    image[0x150e..0x1510].copy_from_slice(&0u16.to_le_bytes());
+
+    assert!(recover_base_relocation_directory(&image, &pe, declared, &[], &[]).is_err());
 }
 
 #[test]
@@ -1418,6 +1547,33 @@ fn iat_envelope_covers_holes_within_one_owner_section() {
             size: 0x88
         }
     );
+}
+
+#[test]
+fn loader_graph_accepts_dword_aligned_pe32_plus_iat() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    let mut discovery = LoaderDiscovery {
+        table_rva: 0,
+        metadata_ranges: Vec::new(),
+        image_size: pe.size_of_image,
+        modules: vec![ImportModule {
+            dll: "a.dll".into(),
+            destination_rva: 0x1104,
+            symbols: vec![ImportSymbol::Ordinal(1)],
+        }],
+        function_count: 1,
+        named_count: 0,
+        ordinal_count: 1,
+    };
+
+    validate_loader_graph(&pe, &discovery).unwrap();
+
+    discovery.modules[0].destination_rva = 0x1102;
+    let error = validate_loader_graph(&pe, &discovery)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("DWORD aligned"), "{error}");
 }
 
 #[test]

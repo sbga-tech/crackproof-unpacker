@@ -427,11 +427,12 @@ impl<'a> Pipeline<'a> {
 
         let stage_span = span_for_stage(Stage::ImportRecovery);
         let stage_guard = stage_span.enter();
-        let import_profile = if let Some(directory) = decrypted_pe
-            .directories
-            .get(IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR)
-            .copied()
-            .filter(|directory| !directory.is_empty())
+        if matches!(output_entry, OutputEntry::Managed { .. })
+            && let Some(directory) = decrypted_pe
+                .directories
+                .get(IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR)
+                .copied()
+                .filter(|directory| !directory.is_empty())
         {
             validate_clr_directory(&image, &decrypted_pe, directory)
                 .context("validating CLR metadata before standard import selection")
@@ -443,18 +444,33 @@ impl<'a> Pipeline<'a> {
                         error,
                     )
                 })?;
-            imports::ImportProfile::Standard
-        } else {
-            imports::ImportProfile::EncodedLoader
-        };
-        let discovery = self.run_stage(
+        }
+        let (import_profile, discovery) = self.run_stage(
             &mut summary,
             Stage::ImportRecovery,
             Operation::DiscoverImports,
             |observer| {
-                let discovery =
-                    imports::discover_imports_in_image(&image, &decrypted_pe, import_profile)
-                        .context("discovering payload imports")?;
+                let (profile, discovery) = match output_entry {
+                    OutputEntry::Managed { .. } => (
+                        imports::ImportProfile::Standard,
+                        imports::discover_imports_in_image(
+                            &image,
+                            &decrypted_pe,
+                            imports::ImportProfile::Standard,
+                        )?,
+                    ),
+                    OutputEntry::NativeDll { .. } => {
+                        imports::discover_native_dll_imports_in_image(&image, &decrypted_pe)?
+                    }
+                    OutputEntry::Native(_) => (
+                        imports::ImportProfile::EncodedLoader,
+                        imports::discover_imports_in_image(
+                            &image,
+                            &decrypted_pe,
+                            imports::ImportProfile::EncodedLoader,
+                        )?,
+                    ),
+                };
                 emit_completed_progress(
                     observer,
                     Stage::ImportRecovery,
@@ -462,7 +478,7 @@ impl<'a> Pipeline<'a> {
                     discovery.function_count,
                     ProgressUnit::Symbols,
                 )?;
-                Ok(discovery)
+                Ok((profile, discovery))
             },
         )?;
         info!(
@@ -512,28 +528,31 @@ impl<'a> Pipeline<'a> {
 
         let stage_span = span_for_stage(Stage::OutputRebuild);
         let stage_guard = stage_span.enter();
-        let managed = matches!(output_entry, OutputEntry::Managed { .. });
+        let managed_kind = match output_entry {
+            OutputEntry::Managed { kind, .. } => Some(kind),
+            _ => None,
+        };
         let rebuilt = self.run_stage(
             &mut summary,
             Stage::OutputRebuild,
             Operation::SerializeOutput,
             |observer| {
-                let rebuilt = if managed {
-                    rebuild::managed::rebuild_semantic_clr(&image, &decrypted_pe, &discovery).map(
-                        |rebuilt| {
+                let rebuilt = if let Some(kind) = managed_kind {
+                    rebuild::managed::rebuild_semantic_clr(&image, &decrypted_pe, &discovery, kind)
+                        .map(|rebuilt| {
                             (
                                 rebuilt.output,
                                 Some(rebuilt.generated),
                                 Some(rebuilt.source),
                             )
-                        },
-                    )
+                        })
                 } else {
                     rebuild::rebuild(ReconstructionInput {
                         mapped: image,
                         decrypted_pe,
                         output_entry,
                         discovery,
+                        import_profile,
                         destination_record_ranges,
                         destination_ranges,
                     })
@@ -549,7 +568,7 @@ impl<'a> Pipeline<'a> {
                     entry_rva = output_pe.entry_rva,
                     size_of_image = output_pe.size_of_image,
                     file_bytes = rebuilt.0.len(),
-                    managed,
+                    managed = managed_kind.is_some(),
                     "verified reconstructed PE output"
                 );
                 for section in &output_pe.sections {

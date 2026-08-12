@@ -360,20 +360,32 @@ impl SemanticEntry {
 ///
 /// Native executables must expose the unique CrackProof-to-CRT handoff proved
 /// by [`SemanticEntry`]. Native DLLs must expose an authenticated architecture-
-/// specific CRT entry wrapper. A CLR DLL instead derives its managed entry
+/// specific entry wrapper. CLR images instead derive their managed entry
 /// contract from the COM Descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedKind {
+    Dll,
+    Exe,
+}
+
+impl ManagedKind {
+    pub(crate) const fn is_dll(self) -> bool {
+        matches!(self, Self::Dll)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OutputEntry {
     Native(SemanticEntry),
     NativeDll { entry_rva: u32 },
-    Managed { entry_rva: u32 },
+    Managed { entry_rva: u32, kind: ManagedKind },
 }
 
 impl OutputEntry {
     pub(crate) const fn entry_rva(self) -> u32 {
         match self {
             Self::Native(entry) => entry.entry_rva,
-            Self::NativeDll { entry_rva } | Self::Managed { entry_rva } => entry_rva,
+            Self::NativeDll { entry_rva } | Self::Managed { entry_rva, .. } => entry_rva,
         }
     }
 
@@ -386,26 +398,26 @@ impl OutputEntry {
 
     /// Returns every immutable range that establishes this entry contract.
     ///
-    /// A managed DLL can legitimately have a zero native AddressOfEntryPoint;
-    /// in that case the COR20 header is its authoritative entry contract and
-    /// is retained independently by the COM Descriptor provenance. An
-    /// authenticated native DLL startup protects its executable owner section.
+    /// A managed image has no retained native entry range; its authoritative
+    /// contract is the independently retained COM Descriptor and metadata.
+    /// An authenticated native DLL startup protects its executable owner
+    /// section.
     pub(crate) fn protected_ranges(self, pe: &Pe) -> Result<Vec<Range<u32>>> {
         match self {
             Self::Native(entry) => entry.protected_ranges(),
-            Self::NativeDll { entry_rva: 0 } | Self::Managed { entry_rva: 0 } => Ok(Vec::new()),
-            Self::NativeDll { entry_rva } | Self::Managed { entry_rva } => {
+            Self::Managed { .. } | Self::NativeDll { entry_rva: 0 } => Ok(Vec::new()),
+            Self::NativeDll { entry_rva } => {
                 let section = pe
                     .section_for_rva_range(entry_rva, 1)
-                    .context("locating authenticated DLL CRT entry section")?;
+                    .context("locating authenticated DLL entry section")?;
                 ensure!(
                     section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0,
-                    "authenticated DLL CRT entry RVA {entry_rva:#x} belongs to non-executable section {}",
+                    "authenticated DLL entry RVA {entry_rva:#x} belongs to non-executable section {}",
                     section.index
                 );
                 Ok(vec![section.virtual_range().with_context(|| {
                     format!(
-                        "reading authenticated DLL CRT entry section {} range",
+                        "reading authenticated DLL entry section {} range",
                         section.index
                     )
                 })?])
@@ -415,9 +427,9 @@ impl OutputEntry {
 }
 
 /// Selects the decrypted-image entry profile without trusting the packed
-/// AddressOfEntryPoint. A nonempty COM Descriptor selects the managed DLL
+/// AddressOfEntryPoint. A nonempty COM Descriptor selects a managed DLL or EXE
 /// profile; native DLLs and executables must independently authenticate their
-/// respective CRT entry contracts.
+/// respective entry contracts.
 pub(crate) fn discover_output_entry(mapped: &[u8], pe: &Pe) -> Result<OutputEntry> {
     let com_descriptor = pe
         .directories
@@ -450,10 +462,6 @@ pub(crate) fn discover_output_entry(mapped: &[u8], pe: &Pe) -> Result<OutputEntr
         return discover_semantic_entry(mapped, pe).map(OutputEntry::Native);
     }
 
-    ensure!(
-        pe.is_dll(),
-        "managed EXE output profiles are unsupported; refusing to reinterpret a CLR entry as native startup"
-    );
     const COR20_REQUIRED_FIELDS: u32 = 24;
     const COMIMAGE_FLAGS_NATIVE_ENTRYPOINT: u32 = 0x10;
     ensure!(
@@ -477,10 +485,20 @@ pub(crate) fn discover_output_entry(mapped: &[u8], pe: &Pe) -> Result<OutputEntr
     let managed_entry =
         read_u32_rva(mapped, entry_rva).context("reading managed COM Descriptor entry")?;
     ensure!(
-        flags & COMIMAGE_FLAGS_NATIVE_ENTRYPOINT == 0 && managed_entry == 0,
-        "managed DLLs with a native or managed entry point are unsupported"
+        flags & COMIMAGE_FLAGS_NATIVE_ENTRYPOINT == 0,
+        "managed images with a native entry point are unsupported"
     );
-    Ok(OutputEntry::Managed { entry_rva: 0 })
+    let kind = if pe.is_dll() {
+        ensure!(managed_entry == 0, "managed DLL has a nonzero entry token");
+        ManagedKind::Dll
+    } else {
+        ensure!(
+            managed_entry & 0xff00_0000 == 0x0600_0000 && managed_entry & 0x00ff_ffff != 0,
+            "managed EXE entry is not a nonzero MethodDef token"
+        );
+        ManagedKind::Exe
+    };
+    Ok(OutputEntry::Managed { entry_rva: 0, kind })
 }
 
 /// Locates the unique CrackProof handoff from protected code into the original

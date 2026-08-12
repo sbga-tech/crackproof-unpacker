@@ -2,13 +2,14 @@ use anyhow::{Context, Result, bail};
 use tracing::{debug, info};
 
 use crate::{
-    pe::Pe,
+    pe::{Machine, Pe},
     pipeline::outcome::{CodeTransform, RecoveredProgram, StartupKind},
 };
 
 use super::{
     OutputEntry, SemanticEvidence, authenticate_sparse_output_entry,
-    decode_sparse_text_pages_in_place, discover_output_entry, sparse::SparsePageKey,
+    decode_sparse_text_pages_in_place, discover_output_entry,
+    native::amd64::discover_amd64_msvc_semantic_entry, sparse::SparsePageKey,
     unique_sparse_page_keys,
 };
 
@@ -45,9 +46,12 @@ impl SelectedOutputProfile {
                 startup_rva: entry_rva,
                 handoff_rva: None,
             },
-            OutputEntry::Managed { entry_rva } => RecoveredProgram {
+            OutputEntry::Managed { entry_rva, kind } => RecoveredProgram {
                 code_transform: self.code_transform,
-                startup_kind: StartupKind::ManagedDll,
+                startup_kind: match kind {
+                    super::ManagedKind::Dll => StartupKind::ManagedDll,
+                    super::ManagedKind::Exe => StartupKind::ManagedExe,
+                },
                 startup_rva: entry_rva,
                 handoff_rva: None,
             },
@@ -55,13 +59,89 @@ impl SelectedOutputProfile {
     }
 }
 
+fn select_amd64_msvc_profile(mapped: &mut [u8], pe: &Pe) -> Result<Option<SelectedOutputProfile>> {
+    if let Some(entry) = discover_amd64_msvc_semantic_entry(mapped, pe)? {
+        info!(
+            entry_rva = entry.entry_rva,
+            "selected unchanged AMD64 MSVC startup entry"
+        );
+        return Ok(Some(SelectedOutputProfile {
+            entry: OutputEntry::Native(entry),
+            code_transform: CodeTransform::Unchanged,
+        }));
+    }
+
+    let page_keys = unique_sparse_page_keys(pe)
+        .context("enumerating sparse executable-page profiles for AMD64 MSVC startup")?;
+    let mut successes = Vec::new();
+    for page_key in page_keys {
+        decode_sparse_text_pages_in_place(mapped, pe, page_key)
+            .with_context(|| format!("decoding sparse executable pages with {page_key:?}"))?;
+        let result = discover_amd64_msvc_semantic_entry(mapped, pe).and_then(|entry| {
+            let Some(entry) = entry else {
+                return Ok(None);
+            };
+            authenticate_sparse_output_entry(mapped, pe, OutputEntry::Native(entry))
+                .context("authenticating sparse AMD64 MSVC entry")?;
+            Ok(Some(entry))
+        });
+        decode_sparse_text_pages_in_place(mapped, pe, page_key).with_context(|| {
+            format!("restoring sparse executable pages after testing {page_key:?}")
+        })?;
+
+        match result {
+            Ok(Some(entry)) => {
+                debug!(
+                    ?page_key,
+                    entry_rva = entry.entry_rva,
+                    "sparse AMD64 MSVC startup profile authenticated"
+                );
+                successes.push((page_key, entry));
+            }
+            Ok(None) => {}
+            Err(error) => debug!(
+                ?page_key,
+                reason = %format!("{error:#}"),
+                "sparse AMD64 MSVC startup profile rejected"
+            ),
+        }
+    }
+
+    let [(page_key, entry)] = successes.as_slice() else {
+        if successes.is_empty() {
+            return Ok(None);
+        }
+        let profiles = successes
+            .iter()
+            .map(|(key, entry)| format!("{key:?} -> {:#x}", entry.entry_rva))
+            .collect::<Vec<_>>();
+        bail!(
+            "multiple sparse executable-page profiles produce AMD64 MSVC entries: {}",
+            profiles.join("; ")
+        );
+    };
+
+    decode_sparse_text_pages_in_place(mapped, pe, *page_key).with_context(|| {
+        format!("applying selected sparse executable-page profile {page_key:?}")
+    })?;
+    info!(
+        ?page_key,
+        entry_rva = entry.entry_rva,
+        "selected unique sparse AMD64 MSVC startup profile"
+    );
+    Ok(Some(SelectedOutputProfile {
+        entry: OutputEntry::Native(*entry),
+        code_transform: sparse_code_transform(*page_key),
+    }))
+}
+
 /// Selects the native output profile. A semantic entry in the decrypted
 /// image is authoritative; reversible sparse-page transforms are tested only
 /// as a fail-closed fallback. The selected fallback remains applied for the
 /// remainder of reconstruction.
 pub(crate) fn select_output_entry(mapped: &mut [u8], pe: &Pe) -> Result<SelectedOutputProfile> {
-    let raw = discover_output_entry(mapped, pe);
     if pe.is_dll() || has_nonempty_com_descriptor(pe) {
+        let raw = discover_output_entry(mapped, pe);
         return raw
             .map(|entry| {
                 info!(
@@ -75,6 +155,13 @@ pub(crate) fn select_output_entry(mapped: &mut [u8], pe: &Pe) -> Result<Selected
             })
             .context("selecting DLL or managed output entry profile");
     }
+    if pe.machine_kind() == Machine::Amd64
+        && let Some(profile) = select_amd64_msvc_profile(mapped, pe)?
+    {
+        return Ok(profile);
+    }
+
+    let raw = discover_output_entry(mapped, pe);
 
     let raw_error = match raw {
         Ok(entry) => {
@@ -102,6 +189,11 @@ pub(crate) fn select_output_entry(mapped: &mut [u8], pe: &Pe) -> Result<Selected
         decode_sparse_text_pages_in_place(mapped, pe, page_key)
             .with_context(|| format!("decoding sparse executable pages with {page_key:?}"))?;
         let result = discover_output_entry(mapped, pe).and_then(|entry| {
+            debug!(
+                page_key = ?page_key,
+                ?entry,
+                "diagnostic sparse semantic candidate"
+            );
             authenticate_sparse_output_entry(mapped, pe, entry)
                 .context("authenticating sparse semantic entry")?;
             Ok(entry)

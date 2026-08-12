@@ -11,8 +11,9 @@ pub use pipeline::observer::{NoopObserver, Observer, StateEvent};
 pub use pipeline::outcome::{
     ArtifactSummary, ByteTransform, CodeTransform, DecryptionDetails,
     GeneratedSemanticClrContainer, ImportSource, ImportSummary, ManagedSemanticClrSource,
-    OutputArtifactSummary, PeSummary, PipelineOutput, ProtectorInfo, RecoveredProgram, RunSummary,
-    SelectedAesContext, SelectedDecoder, SelectedDecryptionChain, StartupKind,
+    OutputArtifactSummary, PayloadGrammar, PeSummary, PipelineOutput, ProtectorInfo,
+    RecoveredProgram, RunSummary, SelectedAesContext, SelectedDecoder, SelectedDecryptionChain,
+    SelectedStagedTable, StartupKind,
 };
 pub use pipeline::progress::ProgressUnit;
 pub use pipeline::request::PipelineRequest;

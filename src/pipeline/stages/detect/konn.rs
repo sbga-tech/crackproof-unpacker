@@ -266,12 +266,37 @@ fn scan_konn_descriptors_impl(
             );
             continue;
         }
-        let Ok(destination_section) = pe.section_for_rva_range(decoded[3], source_length) else {
+        let Some(destination_end) = decoded[3].checked_add(decoded[5]) else {
             debug!(
                 file_offset,
                 destination_rva = decoded[3],
                 source_length,
-                "rejected KONN candidate: destination range is invalid"
+                "rejected KONN candidate: destination range overflows"
+            );
+            continue;
+        };
+        if destination_end > pe.size_of_image {
+            debug!(
+                file_offset,
+                destination_rva = decoded[3],
+                destination_end,
+                size_of_image = pe.size_of_image,
+                "rejected KONN candidate: destination range exceeds image"
+            );
+            continue;
+        }
+        let destination_range = decoded[3]..destination_end;
+        let Some(destination_section) = pe.sections.iter().find(|section| {
+            section.virtual_range().is_ok_and(|section_range| {
+                destination_range.start < section_range.end
+                    && section_range.start < destination_range.end
+            })
+        }) else {
+            debug!(
+                file_offset,
+                destination_rva = decoded[3],
+                destination_end,
+                "rejected KONN candidate: destination range does not intersect a section"
             );
             continue;
         };

@@ -5,17 +5,19 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::pe::{self, DataDirectory, Pe, PointerWidth};
 use crate::pipeline::stages::imports::{
-    ImportModule, ImportSymbol, LoaderDiscovery, named_thunk_rva,
+    ImportModule, ImportProfile, ImportSymbol, LoaderDiscovery, named_thunk_rva,
 };
 use crate::pipeline::stages::startup::OutputEntry;
 pub(crate) mod managed;
 
 const EXPORT_DIRECTORY: usize = 0;
 const IMPORT_DIRECTORY: usize = 1;
+const DEBUG_DIRECTORY: usize = 6;
 const RESOURCE_DIRECTORY: usize = 2;
 const EXCEPTION_DIRECTORY: usize = 3;
 const SECURITY_DIRECTORY: usize = 4;
 const BASE_RELOCATION_DIRECTORY: usize = 5;
+const TLS_DIRECTORY: usize = 9;
 const IMAGE_IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const IMAGE_EXPORT_DIRECTORY_SIZE: usize = 40;
 const IAT_DIRECTORY: usize = 12;
@@ -52,6 +54,7 @@ pub(crate) struct ReconstructionInput {
     pub(crate) decrypted_pe: Pe,
     pub(crate) output_entry: OutputEntry,
     pub(crate) discovery: LoaderDiscovery,
+    pub(crate) import_profile: ImportProfile,
     pub(crate) destination_record_ranges: Vec<Range<u32>>,
     pub(crate) destination_ranges: Vec<Range<u32>>,
 }
@@ -122,6 +125,7 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
         decrypted_pe,
         output_entry,
         discovery,
+        import_profile,
         destination_record_ranges,
         destination_ranges,
     } = input;
@@ -135,8 +139,10 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
     );
     validate_entry_evidence(&mapped, &decrypted_pe, output_entry)?;
     validate_loader_graph(&decrypted_pe, &discovery)?;
-    if let Some(recovery) = pogo::recover(&mapped, &decrypted_pe, &discovery, &destination_ranges)
-        .context("recovering native layout from authenticated POGO metadata")?
+    if import_profile == ImportProfile::EncodedLoader
+        && let Some(recovery) =
+            pogo::recover(&mapped, &decrypted_pe, &discovery, &destination_ranges)
+                .context("recovering native layout from authenticated POGO metadata")?
     {
         return rebuild_pogo(recovery, output_entry, &discovery);
     }
@@ -145,7 +151,14 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
     // A standard bootstrap import table may be present in the provisional image.
     // Only a unique parser-proven winner is stale scaffolding. Competing graphs
     // fail closed in selection; descriptor suffixes coalesce to the winner.
-    clear_selected_import_candidate(&mut mapped, &decrypted_pe)?;
+    match import_profile {
+        ImportProfile::EncodedLoader => {
+            clear_selected_import_candidate(&mut mapped, &decrypted_pe)?
+        }
+        ImportProfile::Standard => {
+            clear_discovered_imports(&mut mapped, &decrypted_pe, &discovery)?
+        }
+    }
     let mut retained_directories = recover_directories(
         &mapped,
         &decrypted_pe,
@@ -483,10 +496,9 @@ fn validate_loader_graph(pe: &Pe, discovery: &LoaderDiscovery) -> Result<()> {
     let mut ranges = Vec::with_capacity(graph.modules.len());
     for module in &graph.modules {
         let span = iat_module_span(pe, module)?;
-        let alignment = u32::try_from(pe.pointer_width().bytes())?;
         ensure!(
-            module.destination_rva.is_multiple_of(alignment),
-            "IAT is not pointer-width aligned"
+            module.destination_rva.is_multiple_of(4),
+            "IAT is not DWORD aligned"
         );
         ensure!(span.end <= pe.size_of_image, "IAT exceeds mapped image");
         pe.section_for_rva_range(span.start, usize::try_from(span.end - span.start)?)
@@ -619,10 +631,15 @@ fn initialize_iat_cells(
     }
     Ok(())
 }
-fn clear_candidate(mapped: &mut [u8], pe: &Pe, candidate: &ImportCandidate) -> Result<()> {
-    let mut ranges = candidate.metadata_ranges.clone();
+fn clear_import_ranges(
+    mapped: &mut [u8],
+    pe: &Pe,
+    metadata_ranges: &[Range<u32>],
+    modules: &[ImportModule],
+) -> Result<()> {
+    let mut ranges = metadata_ranges.to_vec();
     let width = pe.pointer_width().bytes();
-    for module in &candidate.graph.modules {
+    for module in modules {
         let len = (module.symbols.len() + 1)
             .checked_mul(width)
             .context("stale IAT length overflows")?;
@@ -656,9 +673,65 @@ fn clear_candidate(mapped: &mut [u8], pe: &Pe, candidate: &ImportCandidate) -> R
     Ok(())
 }
 
+fn clear_candidate(mapped: &mut [u8], pe: &Pe, candidate: &ImportCandidate) -> Result<()> {
+    clear_import_ranges(
+        mapped,
+        pe,
+        &candidate.metadata_ranges,
+        &candidate.graph.modules,
+    )
+}
+
+fn same_import_contract(left: &ImportGraph, right: &ImportGraph) -> bool {
+    left.modules.len() == right.modules.len()
+        && left
+            .modules
+            .iter()
+            .zip(&right.modules)
+            .all(|(left, right)| {
+                left.dll.eq_ignore_ascii_case(&right.dll) && left.symbols == right.symbols
+            })
+}
+
+fn clear_discovered_imports(mapped: &mut [u8], pe: &Pe, discovery: &LoaderDiscovery) -> Result<()> {
+    let selected = canonical_import_graph(discovery)?;
+    let clones = scan_import_candidates(mapped, pe)?
+        .into_iter()
+        .filter(|candidate| same_import_contract(&candidate.graph, &selected))
+        .collect::<Vec<_>>();
+    for candidate in &clones {
+        clear_candidate(mapped, pe, candidate)?;
+    }
+    clear_import_ranges(mapped, pe, &discovery.metadata_ranges, &discovery.modules)
+}
+
 fn clear_selected_import_candidate(mapped: &mut [u8], pe: &Pe) -> Result<()> {
-    if let Some(candidate) = select_import_candidate(scan_import_candidates(mapped, pe)?)? {
-        clear_candidate(mapped, pe, &candidate)?;
+    let mut candidates = scan_import_candidates(mapped, pe)?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .graph
+            .modules
+            .len()
+            .cmp(&left.graph.modules.len())
+            .then(left.start.cmp(&right.start))
+    });
+    let winner = &candidates[0];
+    for candidate in &candidates[1..] {
+        let candidate_len = candidate.graph.modules.len();
+        ensure!(
+            winner
+                .graph
+                .modules
+                .windows(candidate_len)
+                .any(|modules| modules == candidate.graph.modules),
+            "disjoint or competing standard import graphs were found while clearing stale imports"
+        );
+    }
+    for candidate in &candidates {
+        clear_candidate(mapped, pe, candidate)?;
     }
     Ok(())
 }
@@ -1358,6 +1431,27 @@ fn recover_directories(
         if directory.is_empty() {
             continue;
         }
+        if index == EXCEPTION_DIRECTORY {
+            if let Some(recovered) = recover_exception_directory(mapped, pe, directory)? {
+                result.push((index, recovered));
+            }
+            continue;
+        }
+        if index == DEBUG_DIRECTORY {
+            let range = directory
+                .checked_rva_range()?
+                .context("Debug Directory is partial")?;
+            let bytes = rva_slice(
+                mapped,
+                pe,
+                range.start,
+                usize::try_from(range.end - range.start)?,
+            )
+            .context("Debug Directory is not section-backed")?;
+            if bytes.iter().all(|byte| *byte == 0) {
+                continue;
+            }
+        }
         let directory = if index == 2 {
             scan_resource_root(mapped, pe)?
                 .context("nonempty Resource Directory has no unique valid root")?
@@ -1391,7 +1485,7 @@ fn validate_retained_directory(
         BASE_RELOCATION_DIRECTORY => {
             validate_base_relocation_directory(mapped, pe, directory).map(|_| ())
         }
-        6 => validate_debug_directory(mapped, pe, directory),
+        DEBUG_DIRECTORY => validate_debug_directory(mapped, pe, directory),
         9 => validate_tls_directory(mapped, pe, directory),
         DELAY_IMPORT_DIRECTORY => validate_delay_import_directory(mapped, pe, directory),
         14 => validate_clr_directory(mapped, pe, directory),
@@ -1418,6 +1512,51 @@ fn saved_gpr(register: u8) -> bool {
 
 fn valid_frame_gpr(register: u8) -> bool {
     nonvolatile_gpr(register) || matches!(register, 10 | 11)
+}
+
+fn recover_exception_directory(
+    mapped: &[u8],
+    pe: &Pe,
+    directory: DataDirectory,
+) -> Result<Option<DataDirectory>> {
+    let range = directory
+        .checked_rva_range()?
+        .context("partial exception directory")?;
+    ensure!(
+        directory.size.is_multiple_of(12),
+        "exception directory has a partial runtime-function entry"
+    );
+    let bytes = rva_slice(
+        mapped,
+        pe,
+        range.start,
+        usize::try_from(range.end - range.start)?,
+    )
+    .context("exception directory is not section-backed")?;
+    let leading_zero_records = bytes
+        .chunks_exact(12)
+        .take_while(|record| record.iter().all(|byte| *byte == 0))
+        .count();
+    let skipped = u32::try_from(leading_zero_records)?
+        .checked_mul(12)
+        .context("exception-directory trim overflows")?;
+    if skipped == directory.size {
+        return Ok(None);
+    }
+    let recovered = DataDirectory {
+        virtual_address: directory
+            .virtual_address
+            .checked_add(skipped)
+            .context("exception-directory RVA overflows")?,
+        size: directory.size - skipped,
+    };
+    if let Err(error) = validate_exception_directory(mapped, pe, recovered) {
+        if skipped != 0 {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    Ok(Some(recovered))
 }
 
 fn validate_exception_directory(mapped: &[u8], pe: &Pe, directory: DataDirectory) -> Result<()> {
@@ -1781,15 +1920,19 @@ fn recover_base_relocation_directory(
     )? {
         return Ok(Some(produced));
     }
+    if declared_relocations != 0 && declared_relocations_match_tls_closure(mapped, pe, declared)? {
+        return Ok(Some(declared));
+    }
 
     ensure!(
         declared_relocations == 0,
-        "effective declared base-relocation directory is not authenticated by recovered payload records, and no authenticated relocation producer closure was found"
+        "effective declared base-relocation directory is not authenticated by recovered payload records"
     );
+
     Ok(None)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BaseRelocationSlot {
     target_rva: u32,
     kind: u16,
@@ -1880,11 +2023,7 @@ fn has_effective_relocation(entries: &[BaseRelocationSlot], target_rva: u32) -> 
         .is_ok()
 }
 
-fn validate_tls_relocation_closure(
-    mapped: &[u8],
-    pe: &Pe,
-    entries: &[BaseRelocationSlot],
-) -> Result<()> {
+fn required_tls_relocation_slots(mapped: &[u8], pe: &Pe) -> Result<Vec<BaseRelocationSlot>> {
     let characteristics = u16::from_le_bytes(
         mapped
             .get(pe.opt + 70..pe.opt + 72)
@@ -1893,39 +2032,46 @@ fn validate_tls_relocation_closure(
             .expect("two bytes"),
     );
     if characteristics & 0x0040 == 0 {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let directory = pe.directory(9)?;
+    let directory = pe.directory(TLS_DIRECTORY)?;
     if directory.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     validate_tls_directory(mapped, pe, directory)?;
     let width = pe.pointer_width().bytes();
+    let kind = match pe.pointer_width() {
+        PointerWidth::U32 => IMAGE_REL_BASED_HIGHLOW,
+        PointerWidth::U64 => IMAGE_REL_BASED_DIR64,
+    };
     let header = rva_slice(mapped, pe, directory.virtual_address, width * 4)
         .context("TLS VA fields are not section-backed")?;
     let read_pointer = |bytes: &[u8]| match pe.pointer_width() {
         PointerWidth::U32 => u64::from(u32::from_le_bytes(bytes.try_into().expect("four bytes"))),
         PointerWidth::U64 => u64::from_le_bytes(bytes.try_into().expect("eight bytes")),
     };
+    let mut required = Vec::new();
+    required
+        .try_reserve(4)
+        .context("reserving TLS header relocation slots")?;
     for index in 0..4usize {
         let value = read_pointer(&header[index * width..(index + 1) * width]);
         if value == 0 {
             continue;
         }
         va_to_rva(pe, value)?.context("TLS field VA is unexpectedly null")?;
-        let field_rva = directory
-            .virtual_address
-            .checked_add(u32::try_from(index * width)?)
-            .context("TLS field RVA overflows")?;
-        ensure!(
-            has_effective_relocation(entries, field_rva),
-            "dynamic-base TLS field at RVA {field_rva:#x} lacks a base relocation"
-        );
+        required.push(BaseRelocationSlot {
+            target_rva: directory
+                .virtual_address
+                .checked_add(u32::try_from(index * width)?)
+                .context("TLS field RVA overflows")?,
+            kind,
+        });
     }
 
     let callbacks_va = read_pointer(&header[3 * width..4 * width]);
     let Some(callbacks_rva) = va_to_rva(pe, callbacks_va)? else {
-        return Ok(());
+        return Ok(required);
     };
     for index in 0..4096usize {
         let cell_rva = callbacks_rva
@@ -1934,14 +2080,56 @@ fn validate_tls_relocation_closure(
         let cell = rva_slice(mapped, pe, cell_rva, width)
             .context("TLS callback cell is not section-backed")?;
         if read_pointer(cell) == 0 {
-            return Ok(());
+            return Ok(required);
         }
-        ensure!(
-            has_effective_relocation(entries, cell_rva),
-            "TLS callback cell at RVA {cell_rva:#x} lacks a base relocation"
-        );
+        required
+            .try_reserve(1)
+            .context("reserving TLS callback relocation slot")?;
+        required.push(BaseRelocationSlot {
+            target_rva: cell_rva,
+            kind,
+        });
     }
     bail!("TLS callback array has no bounded terminator")
+}
+
+fn declared_relocations_match_tls_closure(
+    mapped: &[u8],
+    pe: &Pe,
+    declared: DataDirectory,
+) -> Result<bool> {
+    let mut declared_slots = base_relocation_slots(mapped, pe, declared)?
+        .into_iter()
+        .filter(|slot| slot.kind != IMAGE_REL_BASED_ABSOLUTE)
+        .collect::<Vec<_>>();
+    for &slot in &declared_slots {
+        validate_preferred_relocation_value(mapped, pe, slot)?;
+    }
+    declared_slots.sort_unstable_by_key(|slot| (slot.target_rva, slot.kind));
+    if declared_slots
+        .windows(2)
+        .any(|pair| pair[0].target_rva == pair[1].target_rva)
+    {
+        return Ok(false);
+    }
+    let mut required = required_tls_relocation_slots(mapped, pe)?;
+    required.sort_unstable_by_key(|slot| (slot.target_rva, slot.kind));
+    Ok(!required.is_empty() && declared_slots == required)
+}
+
+fn validate_tls_relocation_closure(
+    mapped: &[u8],
+    pe: &Pe,
+    entries: &[BaseRelocationSlot],
+) -> Result<()> {
+    for required in required_tls_relocation_slots(mapped, pe)? {
+        ensure!(
+            has_effective_relocation(entries, required.target_rva),
+            "dynamic-base TLS field or callback at RVA {:#x} lacks a base relocation",
+            required.target_rva
+        );
+    }
+    Ok(())
 }
 
 fn emit_base_relocation_payload(entries: &[BaseRelocationSlot]) -> Result<Vec<u8>> {
@@ -2551,7 +2739,6 @@ fn validate_delay_import_tables(
         let _ = bound_value;
         if let Some(value) = unload_value {
             ensure!(value != 0, "delay-import unload IAT ends before INT");
-            validate_delay_thunk(mapped, pe, value, rva_mode, "unload IAT")?;
         }
     }
     bail!("delay-import thunk array exceeds {MAX_IMPORT_THUNKS} entries")
@@ -2905,7 +3092,27 @@ fn select_import_candidate(
             candidate.end == winner.end
                 && candidate.start == expected_start
                 && winner.graph.modules.ends_with(&candidate.graph.modules),
-            "disjoint, cloned, or competing standard import graphs were found"
+            "disjoint, cloned, or competing standard import graphs were found: winner={:#x}..{:#x} modules={} functions={} names={:?}; competing={:#x}..{:#x} modules={} functions={} names={:?}",
+            winner.start,
+            winner.end,
+            winner.graph.modules.len(),
+            winner.graph.functions,
+            winner
+                .graph
+                .modules
+                .iter()
+                .map(|module| (&module.dll, module.destination_rva))
+                .collect::<Vec<_>>(),
+            candidate.start,
+            candidate.end,
+            candidate.graph.modules.len(),
+            candidate.graph.functions,
+            candidate
+                .graph
+                .modules
+                .iter()
+                .map(|module| (&module.dll, module.destination_rva))
+                .collect::<Vec<_>>()
         );
     }
     Ok(Some(winner))
