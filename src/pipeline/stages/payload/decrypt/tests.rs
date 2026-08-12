@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use super::decoder::CustomDecoderSource;
 use super::grammar::{
-    BoundPayloadSource, derive_payload_stream_provenance, select_payload_grammar,
+    BoundPayloadSource, derive_payload_stream_provenance, select_payload_plan_provider,
 };
 use super::replay::NestedTransformedSource;
 use super::*;
@@ -51,50 +51,65 @@ fn bound_fixture_source<'a>(packed: &'a [u8], pe: &'a Pe) -> BoundPayloadSource<
 }
 
 #[test]
-fn shallow_staged_shape_does_not_preempt_a_record_authentication() {
+fn shallow_staged_shape_does_not_preempt_evidence_search_authentication() {
     let packed = include_bytes!("../../../../../packed/chusanApp_2.25.exe");
     let pe = Pe::parse(packed).unwrap();
     let source = bound_fixture_source(packed, &pe);
-    assert!(super::staged::recognizes_staged_table_payload(&source));
+    assert!(super::staged::recognizes_staged_controller(&source));
 
-    let recovered = select_payload_grammar(&source, None).unwrap();
+    let recovered = select_payload_plan_provider(&source, None).unwrap();
     assert_eq!(
-        recovered.decryption_details.payload_grammar,
-        Some(crate::pipeline::outcome::PayloadGrammar::ARecord)
+        recovered.decryption_details.plan_provenance,
+        Some(crate::pipeline::outcome::PayloadPlanProvenance::EvidenceSearch)
     );
-    assert_eq!(recovered.decryption_details.chunk_count, 7_485);
-    assert!(recovered.decryption_details.selected_staged_table.is_none());
+    assert_eq!(recovered.decryption_details.block_count, 7_485);
+    assert!(
+        recovered
+            .decryption_details
+            .selected_staged_controller
+            .is_none()
+    );
 }
 
 #[test]
-fn complete_staged_table_replay_remains_authoritative() {
+fn complete_staged_controller_replay_remains_authoritative() {
     let packed = include_bytes!("../../../../../packed/maimai_SDEY_1.99.exe");
     let pe = Pe::parse(packed).unwrap();
     let source = bound_fixture_source(packed, &pe);
-    assert!(super::staged::recognizes_staged_table_payload(&source));
+    assert!(super::staged::recognizes_staged_controller(&source));
 
-    let recovered = select_payload_grammar(&source, None).unwrap();
+    let recovered = select_payload_plan_provider(&source, None).unwrap();
     assert_eq!(
-        recovered.decryption_details.payload_grammar,
-        Some(crate::pipeline::outcome::PayloadGrammar::StagedTable)
+        recovered.decryption_details.plan_provenance,
+        Some(crate::pipeline::outcome::PayloadPlanProvenance::StagedController)
     );
-    assert_eq!(recovered.decryption_details.chunk_count, 2_264);
-    assert!(recovered.decryption_details.selected_staged_table.is_some());
+    assert_eq!(recovered.decryption_details.block_count, 2_264);
+    assert!(
+        recovered
+            .decryption_details
+            .selected_staged_controller
+            .is_some()
+    );
 }
 
 #[test]
-fn complete_staged_table_replay_wins_a_record_overlap() {
+fn complete_staged_controller_replay_wins_payload_block_overlap() {
     let packed = include_bytes!("../../../../../packed/chusanApp_2.50.exe");
     let pe = Pe::parse(packed).unwrap();
     let source = bound_fixture_source(packed, &pe);
-    assert!(super::staged::recognizes_staged_table_payload(&source));
+    assert!(super::staged::recognizes_staged_controller(&source));
 
-    let recovered = select_payload_grammar(&source, None).unwrap();
+    let recovered = select_payload_plan_provider(&source, None).unwrap();
     assert_eq!(
-        recovered.decryption_details.payload_grammar,
-        Some(crate::pipeline::outcome::PayloadGrammar::StagedTable)
+        recovered.decryption_details.plan_provenance,
+        Some(crate::pipeline::outcome::PayloadPlanProvenance::StagedController)
     );
-    assert!(recovered.decryption_details.selected_staged_table.is_some());
+    assert!(
+        recovered
+            .decryption_details
+            .selected_staged_controller
+            .is_some()
+    );
 }
 
 #[test]
@@ -666,29 +681,29 @@ fn encode_context(key: &[u8; AES_256_KEY_SIZE], seed: u8) -> [u8; AES_CONTEXT_SI
 }
 
 fn put_record(bytes: &mut [u8], index: usize, words: [u32; 4]) {
-    let offset = index * A_RECORD_SIZE;
+    let offset = index * PAYLOAD_BLOCK_DESCRIPTOR_SIZE;
     for (word_index, word) in words.into_iter().enumerate() {
         bytes[offset + word_index * 4..offset + word_index * 4 + 4]
             .copy_from_slice(&word.to_le_bytes());
     }
 }
 
-fn encode_a_record_run(
+fn encode_payload_block_table(
     record_count: usize,
     bootstrap: PackedBootstrap,
     initial_phase: u8,
 ) -> Vec<u8> {
-    encode_a_record_run_at(record_count, bootstrap, initial_phase, 0)
+    encode_payload_block_table_at(record_count, bootstrap, initial_phase, 0)
 }
 
-fn encode_a_record_run_at(
+fn encode_payload_block_table_at(
     record_count: usize,
     bootstrap: PackedBootstrap,
     initial_phase: u8,
     start_offset: usize,
 ) -> Vec<u8> {
     assert!(record_count >= 2);
-    let mut bytes = vec![0; record_count * A_RECORD_SIZE];
+    let mut bytes = vec![0; record_count * PAYLOAD_BLOCK_DESCRIPTOR_SIZE];
     for index in 0..record_count - 1 {
         put_record(&mut bytes, index, [0, 1, 0, 1]);
     }
@@ -697,16 +712,21 @@ fn encode_a_record_run_at(
         record_count - 1,
         [bootstrap.destination_rva, 0, 0, 0],
     );
-    for (index, record) in bytes.chunks_exact_mut(A_RECORD_SIZE).enumerate() {
+    for (index, record) in bytes
+        .chunks_exact_mut(PAYLOAD_BLOCK_DESCRIPTOR_SIZE)
+        .enumerate()
+    {
         let record_offset = start_offset
-            .checked_add(index * A_RECORD_SIZE)
-            .expect("test A record offset");
+            .checked_add(index * PAYLOAD_BLOCK_DESCRIPTOR_SIZE)
+            .expect("test payload block offset");
         inverse_f710(
             record,
             bootstrap
                 .destination_rva
-                .checked_add(u32::try_from(record_offset).expect("test A record offset fits u32"))
-                .expect("test A record target RVA"),
+                .checked_add(
+                    u32::try_from(record_offset).expect("test payload block offset fits u32"),
+                )
+                .expect("test payload block target RVA"),
         );
     }
     inverse_f2a0(&mut bytes, initial_phase);
@@ -814,7 +834,7 @@ fn build_fixture(options: FixtureOptions) -> Fixture {
     let custom_output = 0x5a;
     let direct_destination = 0x180;
     let custom_destination = 0x240;
-    let mut records = vec![0; options.records * A_RECORD_SIZE];
+    let mut records = vec![0; options.records * PAYLOAD_BLOCK_DESCRIPTOR_SIZE];
     put_record(
         &mut records,
         0,
@@ -835,10 +855,15 @@ fn build_fixture(options: FixtureOptions) -> Fixture {
         options.records - 1,
         [options.destination_rva, 0, 0, 0],
     );
-    for (index, record) in records.chunks_exact_mut(A_RECORD_SIZE).enumerate() {
+    for (index, record) in records
+        .chunks_exact_mut(PAYLOAD_BLOCK_DESCRIPTOR_SIZE)
+        .enumerate()
+    {
         inverse_f710(
             record,
-            options.destination_rva + options.table_offset as u32 + (index * A_RECORD_SIZE) as u32,
+            options.destination_rva
+                + options.table_offset as u32
+                + (index * PAYLOAD_BLOCK_DESCRIPTOR_SIZE) as u32,
         );
     }
     inverse_f2a0(&mut records, 0x6d);
@@ -1348,11 +1373,11 @@ fn discovers_long_a_run_without_cumulative_suffix_rescans() {
         length: 0,
         source_rva: 0,
     };
-    let outer = encode_a_record_run(RECORD_COUNT, bootstrap, 0x6d);
+    let outer = encode_payload_block_table(RECORD_COUNT, bootstrap, 0x6d);
     let candidate_count = RECORD_COUNT
-        .checked_mul(A_RECORD_PHASES)
+        .checked_mul(PAYLOAD_BLOCK_PHASES)
         .expect("test candidate count");
-    assert!(candidate_count <= MAX_A_DISCOVERY_CANDIDATES);
+    assert!(candidate_count <= MAX_PAYLOAD_BLOCK_DISCOVERY_CANDIDATES);
     let old_cumulative_record_work = candidate_count
         .checked_add(
             RECORD_COUNT
@@ -1361,18 +1386,18 @@ fn discovers_long_a_run_without_cumulative_suffix_rescans() {
                 / 2,
         )
         .expect("test cumulative work");
-    assert!(old_cumulative_record_work > MAX_A_RECORD_CHECKS);
+    assert!(old_cumulative_record_work > MAX_PAYLOAD_BLOCK_CHECKS);
 
-    let run = discover_a_record_run(&outer, bootstrap, 0, 1, 1, None)
+    let run = discover_payload_block_table(&outer, bootstrap, 0, 1, 1, None)
         .expect("linear state propagation finds the unique long run");
-    assert_eq!(run.records.len(), RECORD_COUNT - 1);
-    assert!(run.records.iter().all(|record| record.source_offset == 0
-        && record.encoded_length == 1
-        && record.destination_rva == 0
-        && record.destination_length == 1));
+    assert_eq!(run.blocks.len(), RECORD_COUNT - 1);
+    assert!(run.blocks.iter().all(|block| block.source_offset == 0
+        && block.encoded_length == 1
+        && block.destination_rva == 0
+        && block.destination_length == 1));
 }
 #[test]
-fn rejects_a_record_sources_overlapping_the_security_directory() {
+fn rejects_payload_block_sources_overlapping_the_security_directory() {
     let bootstrap = PackedBootstrap {
         descriptor_file_offset: 0,
         key: 0,
@@ -1381,16 +1406,16 @@ fn rejects_a_record_sources_overlapping_the_security_directory() {
         length: 0,
         source_rva: 0,
     };
-    let outer = encode_a_record_run(5, bootstrap, 0x6d);
-    assert!(discover_a_record_run(&outer, bootstrap, 0, 1, 1, None).is_ok());
+    let outer = encode_payload_block_table(5, bootstrap, 0x6d);
+    assert!(discover_payload_block_table(&outer, bootstrap, 0, 1, 1, None).is_ok());
     let security_range = 0..1;
 
-    let error = discover_a_record_run(&outer, bootstrap, 0, 1, 1, Some(&security_range))
-        .expect_err("certificate bytes cannot authenticate an A-record source");
+    let error = discover_payload_block_table(&outer, bootstrap, 0, 1, 1, Some(&security_range))
+        .expect_err("certificate bytes cannot authenticate an payload-block source");
     assert!(
         error
             .to_string()
-            .contains("no structurally valid A descriptor run"),
+            .contains("no structurally valid payload block descriptor run"),
         "unexpected Security Directory overlap error: {error:#}"
     );
 }
@@ -1403,7 +1428,7 @@ fn rejects_descriptor_source_ranges_overlapping_the_security_directory() {
 }
 
 #[test]
-fn accepts_shorter_a_record_runs_that_are_exact_suffixes() {
+fn accepts_shorter_payload_block_tables_that_are_exact_suffixes() {
     let bootstrap = PackedBootstrap {
         descriptor_file_offset: 0,
         key: 0,
@@ -1412,15 +1437,15 @@ fn accepts_shorter_a_record_runs_that_are_exact_suffixes() {
         length: 0,
         source_rva: 0,
     };
-    let outer = encode_a_record_run(5, bootstrap, 0x6d);
+    let outer = encode_payload_block_table(5, bootstrap, 0x6d);
 
-    let run = discover_a_record_run(&outer, bootstrap, 0, 1, 1, None)
+    let run = discover_payload_block_table(&outer, bootstrap, 0, 1, 1, None)
         .expect("all shorter structural runs are true suffixes");
-    assert_eq!(run.records.len(), 4);
+    assert_eq!(run.blocks.len(), 4);
 }
 
 #[test]
-fn rejects_an_independent_shorter_a_record_run() {
+fn rejects_an_independent_shorter_payload_block_table() {
     let bootstrap = PackedBootstrap {
         descriptor_file_offset: 0,
         key: 0,
@@ -1429,15 +1454,20 @@ fn rejects_an_independent_shorter_a_record_run() {
         length: 0,
         source_rva: 0,
     };
-    let mut outer = encode_a_record_run(5, bootstrap, 0x6d);
+    let mut outer = encode_payload_block_table(5, bootstrap, 0x6d);
     let decoy_offset = outer.len();
-    outer.extend(encode_a_record_run_at(3, bootstrap, 0x91, decoy_offset));
+    outer.extend(encode_payload_block_table_at(
+        3,
+        bootstrap,
+        0x91,
+        decoy_offset,
+    ));
 
-    let error = discover_a_record_run(&outer, bootstrap, 0, 1, 1, None)
+    let error = discover_payload_block_table(&outer, bootstrap, 0, 1, 1, None)
         .expect_err("independent shorter structural run must be rejected");
     assert!(
         error.to_string().contains("independent shorter"),
-        "unexpected A-record ambiguity error: {error:#}"
+        "unexpected payload-block ambiguity error: {error:#}"
     );
 }
 
@@ -1460,13 +1490,13 @@ fn decrypts_structurally_discovered_direct_and_custom_records() {
 #[test]
 fn decryption_preserves_native_ordered_destination_overlaps() {
     let records = vec![
-        ARecord {
+        PayloadBlock {
             source_offset: 0,
             encoded_length: 2,
             destination_rva: 0,
             destination_length: 2,
         },
-        ARecord {
+        PayloadBlock {
             source_offset: 2,
             encoded_length: 2,
             destination_rva: 1,
@@ -1474,7 +1504,7 @@ fn decryption_preserves_native_ordered_destination_overlaps() {
         },
     ];
     assert_eq!(
-        merged_a_record_destination_ranges(&records).expect("merged coverage"),
+        merged_payload_block_destination_ranges(&records).expect("merged coverage"),
         vec![0..3]
     );
 
@@ -1484,8 +1514,11 @@ fn decryption_preserves_native_ordered_destination_overlaps() {
         inverse_f8(b'C'),
         inverse_f8(b'D'),
     ];
-    let plan = DecryptionPlan {
-        records,
+    let plan = PayloadMaterializationPlan {
+        block_table: PayloadBlockTable {
+            stream_base: 0,
+            blocks: records,
+        },
         aes_key: [0; AES_256_KEY_SIZE],
         decoder: DecoderCandidate {
             source_file_offset: 0,
@@ -1495,20 +1528,20 @@ fn decryption_preserves_native_ordered_destination_overlaps() {
         post_transform: PayloadPostTransform::F8,
     };
     let mut mapped = [0; 3];
-    apply_decryption_plan(&packed, 0, &mut mapped, plan).expect("ordered direct writes");
+    materialize_payload_plan(&packed, &mut mapped, &plan, None).expect("ordered direct writes");
     assert_eq!(mapped, *b"ACD");
 }
 
 #[test]
 fn decryption_rejects_a_direct_only_chain_before_mutation() {
-    let direct = ARecord {
+    let direct = PayloadBlock {
         source_offset: 0,
         encoded_length: 1,
         destination_rva: 0,
         destination_length: 1,
     };
     assert!(
-        select_decryption_plan(
+        select_payload_plan(
             &[],
             0..0,
             0,
@@ -1524,7 +1557,7 @@ fn decryption_rejects_a_direct_only_chain_before_mutation() {
 #[test]
 fn decryption_work_bound_includes_direct_records_once() {
     let oversized_half = MAX_DECRYPTION_REPLAY_WORK / 2 + 1;
-    let direct = ARecord {
+    let direct = PayloadBlock {
         source_offset: 0,
         encoded_length: oversized_half,
         destination_rva: 0,
@@ -1539,7 +1572,7 @@ fn decryption_work_bound_includes_direct_records_once() {
 #[test]
 fn aggregate_replay_work_is_bounded_before_candidate_loops() {
     let encoded_length = MAX_DECRYPTION_REPLAY_WORK / 4;
-    let custom = ARecord {
+    let custom = PayloadBlock {
         source_offset: 0,
         encoded_length,
         destination_rva: 0,
@@ -1564,13 +1597,13 @@ fn decryption_replay_budget_is_independent_per_candidate_chain() {
     packed[stream_base + direct_length] = inverse_f8(0);
 
     let records = [
-        ARecord {
+        PayloadBlock {
             source_offset: 0,
             encoded_length: direct_length,
             destination_rva: 0,
             destination_length: direct_length,
         },
-        ARecord {
+        PayloadBlock {
             source_offset: direct_length,
             encoded_length: 1,
             destination_rva: 0,
@@ -1579,7 +1612,7 @@ fn decryption_replay_budget_is_independent_per_candidate_chain() {
     ];
     let accepting_table = root_literal_table(0);
     let mapped = vec![0; direct_length];
-    let (plan, decryption_details) = select_decryption_plan(
+    let (plan, decryption_details) = select_payload_plan(
         &packed,
         0..stream_base,
         stream_base,
@@ -1604,9 +1637,9 @@ fn decryption_replay_budget_is_independent_per_candidate_chain() {
     assert_eq!(plan.aes_key, key);
     assert_eq!(plan.decoder.table, accepting_table);
     assert_eq!(plan.post_transform, PayloadPostTransform::F8);
-    assert_eq!(decryption_details.chunk_count, 2);
-    assert_eq!(decryption_details.copied_chunk_count, 1);
-    assert_eq!(decryption_details.decoded_chunk_count, 1);
+    assert_eq!(decryption_details.block_count, 2);
+    assert_eq!(decryption_details.copied_block_count, 1);
+    assert_eq!(decryption_details.decoded_block_count, 1);
     assert_eq!(decryption_details.aes_key_candidates, 1);
     assert_eq!(decryption_details.decoder_candidates, 2);
     assert_eq!(decryption_details.byte_transform_candidates, 1);
@@ -1634,13 +1667,13 @@ fn parallel_candidate_replay_matches_single_thread_selection() {
     packed[stream_base] = inverse_f8(b'D');
     packed[stream_base + 1] = inverse_f8(0);
     let records = [
-        ARecord {
+        PayloadBlock {
             source_offset: 0,
             encoded_length: 1,
             destination_rva: 0,
             destination_length: 1,
         },
-        ARecord {
+        PayloadBlock {
             source_offset: 1,
             encoded_length: 1,
             destination_rva: 1,
@@ -1655,7 +1688,7 @@ fn parallel_candidate_replay_matches_single_thread_selection() {
             .build()
             .unwrap()
             .install(|| {
-                select_decryption_plan(
+                select_payload_plan(
                     &packed,
                     0..stream_base,
                     stream_base,
@@ -1701,13 +1734,13 @@ fn decryption_selection_failure_reports_bounded_custom_rejections() {
     packed[stream_base] = inverse_f8(b'D');
     packed[stream_base + 1] = inverse_f8(0);
     let records = [
-        ARecord {
+        PayloadBlock {
             source_offset: 0,
             encoded_length: 1,
             destination_rva: 0,
             destination_length: 1,
         },
-        ARecord {
+        PayloadBlock {
             source_offset: 1,
             encoded_length: 1,
             destination_rva: 1,
@@ -1723,7 +1756,7 @@ fn decryption_selection_failure_reports_bounded_custom_rejections() {
         })
         .collect::<Vec<_>>();
 
-    let error = select_decryption_plan(
+    let error = select_payload_plan(
         &packed,
         0..stream_base,
         stream_base,
@@ -1735,13 +1768,13 @@ fn decryption_selection_failure_reports_bounded_custom_rejections() {
     .err()
     .expect("all candidate chains reject the custom record");
     let failure = error
-        .downcast_ref::<DecryptionSelectionError>()
+        .downcast_ref::<PayloadPlanSelectionError>()
         .expect("no-winner failure exposes decryption evidence");
     let decryption_details = &failure.decryption_details;
 
-    assert_eq!(decryption_details.chunk_count, 2);
-    assert_eq!(decryption_details.copied_chunk_count, 1);
-    assert_eq!(decryption_details.decoded_chunk_count, 1);
+    assert_eq!(decryption_details.block_count, 2);
+    assert_eq!(decryption_details.copied_block_count, 1);
+    assert_eq!(decryption_details.decoded_block_count, 1);
     assert_eq!(decryption_details.aes_key_candidates, 1);
     assert_eq!(decryption_details.decoder_candidates, 9);
     assert_eq!(decryption_details.byte_transform_candidates, 1);
@@ -1752,7 +1785,7 @@ fn decryption_selection_failure_reports_bounded_custom_rejections() {
 fn decryption_rejects_excess_candidate_pairs_before_replay() {
     let key = [0x3c; AES_256_KEY_SIZE];
     let packed = encode_context(&key, 0x39).to_vec();
-    let record = ARecord {
+    let record = PayloadBlock {
         source_offset: 0,
         encoded_length: 1,
         destination_rva: 0,
@@ -1767,7 +1800,7 @@ fn decryption_rejects_excess_candidate_pairs_before_replay() {
         .collect();
 
     let mapped = [0; 2];
-    let error = select_decryption_plan(
+    let error = select_payload_plan(
         &packed,
         0..AES_CONTEXT_SIZE,
         AES_CONTEXT_SIZE,
@@ -1898,17 +1931,22 @@ fn rejects_equal_length_descriptor_ambiguity_without_mutation() {
         .1;
     let first = options.table_offset;
     let second = 0x500;
-    let span = options.records * A_RECORD_SIZE;
+    let span = options.records * PAYLOAD_BLOCK_DESCRIPTOR_SIZE;
     let mut duplicate = outer[first..first + span].to_vec();
     f2a0_transform_from_dl(&mut duplicate, 0x6d);
-    for (index, record) in duplicate.chunks_exact_mut(A_RECORD_SIZE).enumerate() {
+    for (index, record) in duplicate
+        .chunks_exact_mut(PAYLOAD_BLOCK_DESCRIPTOR_SIZE)
+        .enumerate()
+    {
         f710_record_transform(
             record,
-            options.destination_rva + first as u32 + (index * A_RECORD_SIZE) as u32,
+            options.destination_rva + first as u32 + (index * PAYLOAD_BLOCK_DESCRIPTOR_SIZE) as u32,
         );
         inverse_f710(
             record,
-            options.destination_rva + second as u32 + (index * A_RECORD_SIZE) as u32,
+            options.destination_rva
+                + second as u32
+                + (index * PAYLOAD_BLOCK_DESCRIPTOR_SIZE) as u32,
         );
     }
     inverse_f2a0(&mut duplicate, 0x6d);

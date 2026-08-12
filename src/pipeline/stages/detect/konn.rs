@@ -360,7 +360,7 @@ pub(crate) fn scan_konn_descriptors(packed: &[u8], pe: &Pe) -> Result<Vec<KonnDe
 /// Requires one unambiguous structurally validated KONN descriptor.
 ///
 /// Decryption supplies the independent proof by uniquely replaying an
-/// AES context and custom decoder against the complete A-record chain.
+/// AES context and custom decoder against the complete payload-block chain.
 pub(crate) fn combine_family_evidence(descriptors: Vec<KonnDescriptor>) -> Result<FamilyEvidence> {
     ensure!(
         descriptors.len() == 1,

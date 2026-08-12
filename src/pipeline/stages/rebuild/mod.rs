@@ -47,7 +47,7 @@ const MAX_SCAN_CANDIDATES: usize = 4_096;
 const MAX_SCAN_NESTED_WORK: usize = 16_000_000;
 
 /// The immutable handoff from packer-specific recovery to PE serialization.
-/// Authenticated A-record destinations and POGO contributions take precedence;
+/// Authenticated payload-block destinations and POGO contributions take precedence;
 /// header values and structural scans are bounded fallback evidence.
 pub(crate) struct ReconstructionInput {
     pub(crate) mapped: Vec<u8>,
@@ -2325,7 +2325,7 @@ fn recover_base_relocation_from_record_producer_closures(
     }
     ensure!(
         candidates.len() <= 1,
-        "multiple independent A-record relocation producer closures were found"
+        "multiple independent payload-block relocation producer closures were found"
     );
     Ok(candidates.pop())
 }

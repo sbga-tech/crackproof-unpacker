@@ -5,15 +5,15 @@ use tracing::{debug, info};
 
 use crate::pe::{Machine, Pe};
 use crate::pipeline::cancellation::{CancellationToken, Cancelled};
-use crate::pipeline::outcome::{PayloadGrammar, SelectedPayloadStream};
+use crate::pipeline::outcome::{PayloadPlanProvenance, SelectedPayloadStream};
 use crate::pipeline::stages::payload::bootstrap::{
     PackedBootstrap, bootstrap_source_file_range, derive_outer_source,
 };
 
 use super::DecryptedImage;
 use super::records::ensure_source_excludes_security;
-use super::replay::recover_a_record_payload;
-use super::staged::{recognizes_staged_table_payload, recover_staged_table_payload};
+use super::replay::recover_evidence_search_payload;
+use super::staged::{recognizes_staged_controller, recover_staged_controller_payload};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PayloadStreamProvenance {
@@ -22,7 +22,11 @@ pub(super) struct PayloadStreamProvenance {
     pub(super) gap_after_outer_source: usize,
 }
 
-/// Source bytes and common outer-layer evidence shared by every payload grammar.
+pub(super) struct PayloadPlanProposal {
+    pub(super) provenance: PayloadPlanProvenance,
+    pub(super) recovered: DecryptedImage,
+}
+/// Source bytes and common outer-layer evidence shared by every payload-plan provider.
 pub(super) struct BoundPayloadSource<'a> {
     pub(super) packed: &'a [u8],
     pub(super) pe: &'a Pe,
@@ -35,44 +39,55 @@ pub(super) struct BoundPayloadSource<'a> {
     pub(super) outer: Vec<u8>,
 }
 
-trait PayloadGrammarFrontend {
-    fn grammar(&self) -> PayloadGrammar;
+trait PayloadPlanProvider {
+    fn provenance(&self) -> PayloadPlanProvenance;
 
-    fn recover(
+    /// Derives and completely authenticates this provider's payload plan.
+    /// Provider-specific control flow normalizes into the common payload-block
+    /// authenticator and materializer before the proposal can be returned.
+    fn propose(
         &self,
         source: &BoundPayloadSource<'_>,
         cancellation: Option<&CancellationToken>,
-    ) -> Result<DecryptedImage>;
+    ) -> Result<PayloadPlanProposal>;
 }
 
-struct ARecordGrammar;
+struct EvidenceSearchProvider;
 
-impl PayloadGrammarFrontend for ARecordGrammar {
-    fn grammar(&self) -> PayloadGrammar {
-        PayloadGrammar::ARecord
+impl PayloadPlanProvider for EvidenceSearchProvider {
+    fn provenance(&self) -> PayloadPlanProvenance {
+        PayloadPlanProvenance::EvidenceSearch
     }
 
-    fn recover(
+    fn propose(
         &self,
         source: &BoundPayloadSource<'_>,
         cancellation: Option<&CancellationToken>,
-    ) -> Result<DecryptedImage> {
-        recover_a_record_payload(source, cancellation)
+    ) -> Result<PayloadPlanProposal> {
+        recover_evidence_search_payload(source, cancellation).map(|recovered| PayloadPlanProposal {
+            provenance: self.provenance(),
+            recovered,
+        })
     }
 }
-struct StagedTableGrammar;
+struct StagedControllerProvider;
 
-impl PayloadGrammarFrontend for StagedTableGrammar {
-    fn grammar(&self) -> PayloadGrammar {
-        PayloadGrammar::StagedTable
+impl PayloadPlanProvider for StagedControllerProvider {
+    fn provenance(&self) -> PayloadPlanProvenance {
+        PayloadPlanProvenance::StagedController
     }
 
-    fn recover(
+    fn propose(
         &self,
         source: &BoundPayloadSource<'_>,
         cancellation: Option<&CancellationToken>,
-    ) -> Result<DecryptedImage> {
-        recover_staged_table_payload(source, cancellation)
+    ) -> Result<PayloadPlanProposal> {
+        recover_staged_controller_payload(source, cancellation).map(|recovered| {
+            PayloadPlanProposal {
+                provenance: self.provenance(),
+                recovered,
+            }
+        })
     }
 }
 
@@ -85,33 +100,33 @@ pub(super) fn derive_payload_stream_provenance(
     let locator_file_offset = bootstrap
         .descriptor_file_offset
         .checked_add(0x80)
-        .context("A-record stream-base field offset overflows")?;
+        .context("payload block stream-base field offset overflows")?;
     let locator_end = locator_file_offset
         .checked_add(size_of::<u32>())
-        .context("A-record stream-base field end overflows")?;
+        .context("payload block stream-base field end overflows")?;
     let locator_file_range = locator_file_offset..locator_end;
     ensure!(
         locator_end <= source_file_range.start,
-        "A-record stream-base field overlaps the outer source"
+        "payload block stream-base field overlaps the outer source"
     );
     ensure_source_excludes_security(&locator_file_range, source_security_range)?;
     let encoded_base = u32::from_le_bytes(
         payload_source
             .get(locator_file_range)
-            .context("payload source does not contain the A-record stream-base field")?
+            .context("payload source does not contain the payload block stream-base field")?
             .try_into()
             .expect("stream-base field has four bytes"),
     );
     let descriptor_offset = u32::try_from(bootstrap.descriptor_file_offset)
         .context("KONN descriptor file offset exceeds u32")?;
     let base_file_offset = usize::try_from((!encoded_base).wrapping_add(descriptor_offset))
-        .context("A-record stream base does not fit host address space")?;
+        .context("payload block stream base does not fit host address space")?;
     let gap_after_outer_source = base_file_offset
         .checked_sub(source_file_range.end)
-        .context("A-record stream base precedes the outer source end")?;
+        .context("payload block stream base precedes the outer source end")?;
     ensure!(
         base_file_offset <= payload_source.len(),
-        "A-record stream base exceeds the payload source"
+        "payload block stream base exceeds the payload source"
     );
     Ok(PayloadStreamProvenance {
         locator_file_offset,
@@ -153,64 +168,66 @@ fn bind_payload_source<'a>(
     })
 }
 
-pub(super) fn select_payload_grammar(
+pub(super) fn select_payload_plan_provider(
     source: &BoundPayloadSource<'_>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<DecryptedImage> {
-    let a_record = ARecordGrammar;
-    let staged_table = StagedTableGrammar;
-    let staged_table_prefix_valid =
-        source.pe.machine_kind() == Machine::I386 && recognizes_staged_table_payload(source);
-    // A valid staged prefix is a priority hint, not authentication. Complete staged replay
-    // runs first because it is the more specific grammar; an incidental prefix collision
-    // falls back to complete A-record authentication. If the prefix is invalid, staged
-    // recovery would fail at that same prerequisite and is not a viable candidate.
-    let frontends: Vec<&dyn PayloadGrammarFrontend> = if staged_table_prefix_valid {
-        vec![&staged_table, &a_record]
+    let evidence_search = EvidenceSearchProvider;
+    let staged_controller = StagedControllerProvider;
+    let staged_controller_prefix_valid =
+        source.pe.machine_kind() == Machine::I386 && recognizes_staged_controller(source);
+    // A valid staged prefix is a priority hint, not authentication. The explicit
+    // controller provider runs first because it retains stronger native provenance;
+    // any incomplete or incidental match falls back to complete evidence-search replay.
+    let providers: Vec<&dyn PayloadPlanProvider> = if staged_controller_prefix_valid {
+        vec![&staged_controller, &evidence_search]
     } else {
-        vec![&a_record]
+        vec![&evidence_search]
     };
-    let mut failures = Vec::with_capacity(frontends.len());
+    let mut failures = Vec::with_capacity(providers.len());
 
-    for (priority, frontend) in frontends.into_iter().enumerate() {
+    for (priority, provider) in providers.into_iter().enumerate() {
         if let Some(cancellation) = cancellation {
             cancellation.checkpoint()?;
         }
-        let grammar = frontend.grammar();
+        let provenance = provider.provenance();
         debug!(
-            ?grammar,
-            priority, staged_table_prefix_valid, "trying payload grammar"
+            ?provenance,
+            priority, staged_controller_prefix_valid, "trying payload-plan provider"
         );
-        match frontend.recover(source, cancellation) {
-            Ok(mut recovered) => {
-                recovered.decryption_details.payload_grammar = Some(grammar);
+        match provider.propose(source, cancellation) {
+            Ok(PayloadPlanProposal {
+                provenance,
+                mut recovered,
+            }) => {
+                recovered.decryption_details.plan_provenance = Some(provenance);
                 recovered.decryption_details.selected_stream = Some(SelectedPayloadStream {
                     locator_file_offset: source.stream.locator_file_offset,
                     base_file_offset: source.stream.base_file_offset,
                     gap_after_outer_source: source.stream.gap_after_outer_source,
                 });
                 info!(
-                    ?grammar,
+                    ?provenance,
                     fallback = priority != 0,
-                    "selected authenticated payload grammar"
+                    "selected authenticated payload-plan provider"
                 );
                 return Ok(recovered);
             }
             Err(error) if error.downcast_ref::<Cancelled>().is_some() => return Err(error),
-            Err(error) => failures.push((grammar, error)),
+            Err(error) => failures.push((provenance, error)),
         }
     }
 
     if failures.len() == 1 {
-        let (grammar, error) = failures.pop().expect("one recorded grammar failure");
-        return Err(error).with_context(|| format!("replaying {grammar:?} payload grammar"));
+        let (provenance, error) = failures.pop().expect("one recorded provider failure");
+        return Err(error).with_context(|| format!("authenticating {provenance:?} payload plan"));
     }
     let diagnostics = failures
         .into_iter()
-        .map(|(grammar, error)| format!("{grammar:?}: {error:#}"))
+        .map(|(provenance, error)| format!("{provenance:?}: {error:#}"))
         .collect::<Vec<_>>()
         .join("; ");
-    bail!("no payload grammar authenticated the packed source: {diagnostics}")
+    bail!("no payload-plan provider authenticated the packed source: {diagnostics}")
 }
 
 #[cfg(test)]
@@ -260,7 +277,7 @@ pub(crate) fn decrypt_packed_image_from_source(
         source_security_range,
         None,
     )?;
-    select_payload_grammar(&source, None)
+    select_payload_plan_provider(&source, None)
 }
 
 pub(crate) fn decrypt_packed_image_from_source_with_cancellation(
@@ -279,5 +296,5 @@ pub(crate) fn decrypt_packed_image_from_source_with_cancellation(
         source_security_range,
         Some(cancellation),
     )?;
-    select_payload_grammar(&source, Some(cancellation))
+    select_payload_plan_provider(&source, Some(cancellation))
 }

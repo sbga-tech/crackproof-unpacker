@@ -6,18 +6,25 @@ use tracing::{debug, info};
 
 use crate::pe::{Machine, Pe};
 use crate::pipeline::cancellation::CancellationToken;
-use crate::pipeline::outcome::{DecryptionDetails, SelectedStagedTable};
+use crate::pipeline::outcome::{DecryptionDetails, SelectedStagedController};
 use crate::pipeline::stages::payload::nested::{
     LfsrAlMapCandidate, crackproof_checksum, crc32_table, lfsr_al_map_candidates,
 };
 
-use super::DecryptedImage;
 use super::aes::{
     AES_CONTEXT_HEADER, AES_DECRYPT_SCHEDULE_SIZE, Aes256CbcDecryptor,
     make_openssl_decrypt_schedule, recover_raw_key,
 };
 use super::decoder::decode_custom_stream_with_history;
 use super::grammar::BoundPayloadSource;
+use super::replay::{
+    PayloadMaterializationPlan, PayloadPlanCandidate, PayloadPostTransform,
+    authenticate_payload_plan_candidates, materialize_payload_plan,
+};
+use super::{
+    DecoderCandidate, DecryptedImage, PayloadBlock, PayloadBlockTable,
+    merged_payload_block_destination_ranges, payload_block_destination_range,
+};
 
 const KONN_MAGIC: u32 = u32::from_le_bytes(*b"KONN");
 const HEADER_COPY_SIZE: usize = 0x1000;
@@ -35,13 +42,8 @@ struct StageDescriptor {
     destination_length: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileBlock {
-    source_offset: u32,
-    source_length: u32,
-    destination: u32,
-    destination_length: u32,
-}
+// Final compressed-info entries are normalized into the same payload-block IR
+// consumed by the evidence-search provider.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EighthLayout {
@@ -760,14 +762,14 @@ fn apply_zero_list(image: &mut [u8], stage_start: u32, layout: EighthLayout) -> 
     bail!("zero-fill list exceeds entry budget")
 }
 
-fn parse_file_blocks(
+fn parse_payload_blocks(
     image: &mut [u8],
     stage_start: u32,
     layout: EighthLayout,
     payload_length: usize,
     source_base: u32,
     security_range: Option<&Range<usize>>,
-) -> Result<Vec<FileBlock>> {
+) -> Result<Vec<PayloadBlock>> {
     let slot = usize::try_from(
         stage_start
             .checked_add(layout.compressed_info)
@@ -789,7 +791,7 @@ fn parse_file_blocks(
         if record.source_length == 0 {
             ensure!(
                 !blocks.is_empty(),
-                "compressed-info list contains no file blocks"
+                "compressed-info list contains no payload blocks"
             );
             return Ok(blocks);
         }
@@ -799,117 +801,45 @@ fn parse_file_blocks(
         );
         let file_start = source_base
             .checked_add(record.source)
-            .context("file-block source offset overflows")?;
+            .context("payload-block source offset overflows")?;
         let file_range = checked_range(
             payload_length,
             file_start,
             record.source_length,
-            "file-block source",
+            "payload-block source",
         )?;
         if let Some(security) = security_range {
             ensure!(
                 file_range.end <= security.start || file_range.start >= security.end,
-                "file-block source overlaps the PE Security Directory"
+                "payload-block source overlaps the PE Security Directory"
             );
         }
         checked_range(
             image.len(),
             record.destination,
             record.destination_length,
-            "file-block destination",
+            "payload-block destination",
         )?;
         replay_work = replay_work
             .checked_add(file_range.len())
             .and_then(|value| value.checked_add(record.destination_length as usize))
-            .context("file-block replay work overflows")?;
+            .context("payload-block replay work overflows")?;
         ensure!(
             replay_work <= MAX_FILE_REPLAY_WORK,
-            "file-block replay exceeds byte budget"
+            "payload-block replay exceeds byte budget"
         );
-        blocks.push(FileBlock {
-            source_offset: file_start,
-            source_length: record.source_length,
-            destination: record.destination,
-            destination_length: record.destination_length,
+        blocks.push(PayloadBlock {
+            source_offset: usize::try_from(file_start)
+                .context("payload-block source offset does not fit usize")?,
+            encoded_length: usize::try_from(record.source_length)
+                .context("payload-block encoded length does not fit usize")?,
+            destination_rva: usize::try_from(record.destination)
+                .context("payload-block destination RVA does not fit usize")?,
+            destination_length: usize::try_from(record.destination_length)
+                .context("payload-block destination length does not fit usize")?,
         });
     }
     bail!("compressed-info list exceeds entry budget")
-}
-
-fn replay_file_blocks(
-    image: &mut [u8],
-    payload_source: &[u8],
-    blocks: &[FileBlock],
-    aes: &Aes256CbcDecryptor,
-    decoder: &[u8],
-    map: &[u8; 256],
-    cancellation: Option<&CancellationToken>,
-) -> Result<()> {
-    let mut payload = Vec::new();
-    for (index, block) in blocks.iter().enumerate() {
-        if index & 0xff == 0
-            && let Some(cancellation) = cancellation
-        {
-            cancellation.checkpoint()?;
-        }
-        let source = checked_range(
-            payload_source.len(),
-            block.source_offset,
-            block.source_length,
-            "file-block source",
-        )?;
-        payload.clear();
-        payload.extend_from_slice(&payload_source[source]);
-        aes.decrypt_full_blocks_in_place(&mut payload);
-        for byte in &mut payload {
-            *byte = map[usize::from(*byte)];
-        }
-        let destination = checked_range(
-            image.len(),
-            block.destination,
-            block.destination_length,
-            "file-block destination",
-        )?;
-        if block.source_length == block.destination_length {
-            image[destination].copy_from_slice(&payload);
-        } else {
-            let history_start = destination.start.saturating_sub(4);
-            let history = image[history_start..destination.start].to_vec();
-            decode_custom_stream_with_history(decoder, &payload, &history, &mut image[destination])
-                .with_context(|| format!("decoding file block {index}"))?;
-        }
-    }
-    Ok(())
-}
-
-struct DestinationCoverage {
-    records: Vec<Range<u32>>,
-    merged: Vec<Range<u32>>,
-}
-
-fn merged_destination_ranges(blocks: &[FileBlock]) -> Result<DestinationCoverage> {
-    let mut records = blocks
-        .iter()
-        .map(|block| {
-            let end = block
-                .destination
-                .checked_add(block.destination_length)
-                .context("file-block destination end overflows")?;
-            Ok(block.destination..end)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    records.sort_unstable_by_key(|range| range.start);
-    let mut merged: Vec<Range<u32>> = Vec::new();
-    for range in &records {
-        if let Some(previous) = merged.last_mut()
-            && range.start <= previous.end
-        {
-            previous.end = previous.end.max(range.end);
-            continue;
-        }
-        merged.push(range.clone());
-    }
-    Ok(DestinationCoverage { records, merged })
 }
 
 fn packed_rva_range(pe: &Pe, packed_len: usize, rva: u32, length: u32) -> Result<Range<usize>> {
@@ -1063,7 +993,7 @@ fn finalize_header(
     }
     Ok(())
 }
-pub(super) fn recognizes_staged_table_payload(source: &BoundPayloadSource<'_>) -> bool {
+pub(super) fn recognizes_staged_controller(source: &BoundPayloadSource<'_>) -> bool {
     decode_info(source)
         .and_then(|info| {
             let image = materialize_bootstrap(source, &info)?;
@@ -1072,13 +1002,13 @@ pub(super) fn recognizes_staged_table_payload(source: &BoundPayloadSource<'_>) -
         .is_ok()
 }
 
-pub(super) fn recover_staged_table_payload(
+pub(super) fn recover_staged_controller_payload(
     source: &BoundPayloadSource<'_>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<DecryptedImage> {
     ensure!(
         source.pe.machine_kind() == Machine::I386,
-        "staged-table grammar only applies to PE32/I386 images"
+        "staged controller provider only applies to PE32/I386 images"
     );
     if let Some(cancellation) = cancellation {
         cancellation.checkpoint()?;
@@ -1237,7 +1167,7 @@ pub(super) fn recover_staged_table_payload(
     }
     let file_decoder_table = snapshot_decoder_table(&image, key_offsets[0])?;
     let stage_decoder_table = snapshot_decoder_table(&image, key_offsets[1])?;
-    let (file_raw_aes_key, file_aes) = recover_aes(&image, key_offsets[2])?;
+    let (file_raw_aes_key, _) = recover_aes(&image, key_offsets[2])?;
     let (stage_raw_aes_key, stage_aes) = recover_aes(&image, key_offsets[3])?;
 
     let second_checksum = checksum_descriptor(&image, table + 0xb0, &crc_table)?;
@@ -1429,7 +1359,7 @@ pub(super) fn recover_staged_table_payload(
         u32::try_from(source.bootstrap.descriptor_file_offset)
             .context("descriptor file offset exceeds u32")?,
     );
-    let blocks = parse_file_blocks(
+    let blocks = parse_payload_blocks(
         &mut image,
         eighth.source,
         layout,
@@ -1437,73 +1367,57 @@ pub(super) fn recover_staged_table_payload(
         source_base,
         source.source_security_range,
     )?;
-    let replay_base = image.clone();
-    let mut selected_file_map = None;
-    let mut rejection_evidence = Vec::new();
-    for (index, program) in file_programs.iter().enumerate() {
-        if let Some(cancellation) = cancellation {
-            cancellation.checkpoint()?;
-        }
-        let mut trial = replay_base.clone();
-        match replay_file_blocks(
-            &mut trial,
-            source.payload_source,
-            &blocks,
-            &file_aes,
-            &file_decoder_table,
-            program.map.as_ref(),
-            cancellation,
-        ) {
-            Ok(()) => {
-                ensure!(
-                    selected_file_map.is_none(),
-                    "multiple staged file byte maps replay every block"
-                );
-                selected_file_map = Some(index);
-            }
-            Err(error) => {
-                let reason = format!("{error:#}");
-                debug!(
-                    program_offset = program.offset,
-                    program_length = program.length,
-                    reason,
-                    "rejected staged file byte map"
-                );
-                if rejection_evidence.len() < 8 {
-                    rejection_evidence.push(format!(
-                        "+{:#x}/{}: {reason}",
-                        program.offset, program.length
-                    ));
-                }
-            }
-        }
-    }
-    let selected_file_map = selected_file_map.with_context(|| {
-        format!(
-            "no staged file byte map replays every block ({} candidates: {})",
-            file_programs.len(),
-            rejection_evidence.join("; ")
-        )
-    })?;
-    image = replay_base;
-    replay_file_blocks(
-        &mut image,
+    let block_table = PayloadBlockTable {
+        stream_base: 0,
+        blocks,
+    };
+    let candidates = file_programs
+        .iter()
+        .map(|program| {
+            PayloadPlanCandidate::new(PayloadMaterializationPlan {
+                block_table: block_table.clone(),
+                aes_key: file_raw_aes_key,
+                decoder: DecoderCandidate {
+                    source_file_offset: usize::try_from(key_offsets[0])
+                        .expect("file decoder RVA fits usize"),
+                    phase: 0,
+                    table: file_decoder_table.clone(),
+                },
+                post_transform: PayloadPostTransform::ByteMap(program.map.clone()),
+            })
+        })
+        .collect();
+    let authenticated = authenticate_payload_plan_candidates(
         source.payload_source,
-        &blocks,
-        &file_aes,
-        &file_decoder_table,
-        file_programs[selected_file_map].map.as_ref(),
+        &image,
+        &block_table,
+        candidates,
+        cancellation,
+    )?;
+    let selected_plan = authenticated.plan;
+    let selected_map = selected_plan.post_transform.mapping();
+    let selected_file_map = file_programs
+        .iter()
+        .position(|program| program.map.as_ref() == &selected_map)
+        .expect("authenticated staged byte map came from provider candidates");
+    materialize_payload_plan(
+        source.payload_source,
+        &mut image,
+        &selected_plan,
         cancellation,
     )?;
     finalize_header(&mut image, source, metadata_entry, &metadata_directories)?;
-
-    let DestinationCoverage {
-        records: destination_record_ranges,
-        merged: destination_ranges,
-    } = merged_destination_ranges(&blocks)?;
-    let copied_chunk_count = blocks
+    let mut destination_record_ranges = block_table
+        .blocks
         .iter()
-        .filter(|block| block.source_length == block.destination_length)
+        .map(payload_block_destination_range)
+        .collect::<Result<Vec<_>>>()?;
+    destination_record_ranges.sort_unstable_by_key(|range| range.start);
+    let destination_ranges = merged_payload_block_destination_ranges(&block_table.blocks)?;
+    let copied_block_count = block_table
+        .blocks
+        .iter()
+        .filter(|block| block.encoded_length == block.destination_length)
         .count();
     info!(
         table_rva = table,
@@ -1513,7 +1427,7 @@ pub(super) fn recover_staged_table_payload(
         file_program_offset = file_programs[selected_file_map].offset,
         file_program_length = file_programs[selected_file_map].length,
         byte_map_candidates = file_programs.len(),
-        chunks = blocks.len(),
+        blocks = block_table.blocks.len(),
         "selected static PE32 staged byte-map pipeline"
     );
     debug!(
@@ -1526,16 +1440,16 @@ pub(super) fn recover_staged_table_payload(
         destination_ranges,
         image,
         decryption_details: DecryptionDetails {
-            payload_grammar: None,
+            plan_provenance: None,
             selected_stream: None,
-            chunk_count: blocks.len(),
-            copied_chunk_count,
-            decoded_chunk_count: blocks.len() - copied_chunk_count,
+            block_count: block_table.blocks.len(),
+            copied_block_count,
+            decoded_block_count: block_table.blocks.len() - copied_block_count,
             aes_key_candidates: 1,
             decoder_candidates: 1,
             byte_transform_candidates: file_programs.len(),
-            selected_chain: None,
-            selected_staged_table: Some(SelectedStagedTable {
+            selected_chain: authenticated.selected_chain,
+            selected_staged_controller: Some(SelectedStagedController {
                 shell_table_rva: u32::try_from(table).context("shell table RVA exceeds u32")?,
                 seven_stage_rva: seven.source,
                 eighth_stage_rva: eighth.source,

@@ -314,7 +314,7 @@ impl<'a> Pipeline<'a> {
                     observer,
                     Stage::PayloadRecovery,
                     Operation::MaterializeImage,
-                    decryption.decryption_details.chunk_count,
+                    decryption.decryption_details.block_count,
                     ProgressUnit::Records,
                 )?;
                 Ok(decryption)
@@ -328,18 +328,18 @@ impl<'a> Pipeline<'a> {
         } = decryption;
         summary.decryption = Some(decryption_details);
         info!(
-            chunks = summary
+            blocks = summary
                 .decryption
                 .as_ref()
-                .map_or(0, |details| details.chunk_count),
-            copied_chunks = summary
+                .map_or(0, |details| details.block_count),
+            copied_blocks = summary
                 .decryption
                 .as_ref()
-                .map_or(0, |details| details.copied_chunk_count),
-            decoded_chunks = summary
+                .map_or(0, |details| details.copied_block_count),
+            decoded_blocks = summary
                 .decryption
                 .as_ref()
-                .map_or(0, |details| details.decoded_chunk_count),
+                .map_or(0, |details| details.decoded_block_count),
             destination_ranges = destination_ranges.len(),
             image_bytes = image.len(),
             "materialized recovered mapped image"
@@ -760,7 +760,7 @@ impl<'a> Pipeline<'a> {
         summary.elapsed_ms = self
             .started
             .map_or(0, |started| started.elapsed().as_millis());
-        if let Some(selection) = error.downcast_ref::<decrypt::DecryptionSelectionError>() {
+        if let Some(selection) = error.downcast_ref::<decrypt::PayloadPlanSelectionError>() {
             summary.decryption = Some(selection.decryption_details.clone());
         }
         let reason = classify_failure(stage, &error);

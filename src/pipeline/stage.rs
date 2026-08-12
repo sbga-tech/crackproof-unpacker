@@ -135,7 +135,7 @@ impl Operation {
             Self::ScanDescriptors => "Scanning KONN descriptors",
             Self::BindPayloadSource => "Binding payload source",
             Self::ReplayOuter => "Replaying outer layer",
-            Self::DiscoverRecords => "Discovering A records",
+            Self::DiscoverRecords => "Discovering payload blocks",
             Self::DiscoverAesContexts => "Discovering AES contexts",
             Self::DiscoverDecoders => "Discovering decoders",
             Self::RecoverByteMaps => "Recovering byte maps",

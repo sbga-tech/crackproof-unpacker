@@ -13,7 +13,7 @@ use crate::pipeline::stages::payload::bootstrap::PackedBootstrap;
 #[cfg(test)]
 mod tests;
 
-const A_RECORD_SIZE: usize = 16;
+const PAYLOAD_BLOCK_DESCRIPTOR_SIZE: usize = 16;
 const MAX_NESTED_STAGE_CONTEXTS: usize = 8;
 pub(crate) const MAX_AL_PROGRAM_BYTES: usize = 96;
 const MIN_AL_PROGRAM_BYTES: usize = 8;
@@ -650,10 +650,14 @@ pub(super) fn discover_nested_records(
     stage_range: Range<usize>,
 ) -> Result<Vec<NestedRecord>> {
     let mut records = Vec::new();
-    for descriptor_offset in (stage_range.start..stage_range.end.saturating_sub(A_RECORD_SIZE - 1))
+    for descriptor_offset in (stage_range.start
+        ..stage_range
+            .end
+            .saturating_sub(PAYLOAD_BLOCK_DESCRIPTOR_SIZE - 1))
         .step_by(size_of::<u32>())
     {
-        let Some(bytes) = staged_outer.get(descriptor_offset..descriptor_offset + A_RECORD_SIZE)
+        let Some(bytes) =
+            staged_outer.get(descriptor_offset..descriptor_offset + PAYLOAD_BLOCK_DESCRIPTOR_SIZE)
         else {
             continue;
         };
@@ -1494,7 +1498,7 @@ fn discover_nested_byte_maps_profile(
                 else {
                     continue;
                 };
-                if stage_range.len() < A_RECORD_SIZE
+                if stage_range.len() < PAYLOAD_BLOCK_DESCRIPTOR_SIZE
                     || !stage_range.len().is_multiple_of(size_of::<u32>())
                 {
                     continue;

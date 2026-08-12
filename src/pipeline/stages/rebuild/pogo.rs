@@ -203,7 +203,7 @@ fn parse_gctl(
         .context("Debug Directory is partial")?;
     ensure!(
         covered_by_destinations(destination_ranges, debug_range.clone()),
-        "Debug Directory is not backed by authenticated A-record destinations"
+        "Debug Directory is not backed by authenticated payload-block destinations"
     );
     ensure!(
         (debug.size as usize).is_multiple_of(IMAGE_DEBUG_DIRECTORY_SIZE),
@@ -235,7 +235,7 @@ fn parse_gctl(
             .context("POGO payload range overflows")?;
         ensure!(
             covered_by_destinations(destination_ranges, range.clone()),
-            "POGO payload is not backed by authenticated A-record destinations"
+            "POGO payload is not backed by authenticated payload-block destinations"
         );
         let payload = rva_slice(mapped, pe, rva, usize::try_from(size)?)
             .context("POGO payload exceeds mapped image")?;

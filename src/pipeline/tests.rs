@@ -104,7 +104,7 @@ fn invalid_pe_fails_at_the_typed_input_boundary() {
 }
 
 #[test]
-fn reconstructs_polymorphic_pe32_staged_table_fixture() {
+fn reconstructs_polymorphic_pe32_staged_controller_fixture() {
     let input =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packed/maimai_SDEY_1.99.exe");
     let request = PipelineRequest {
@@ -128,12 +128,12 @@ fn reconstructs_polymorphic_pe32_staged_table_fixture() {
 
     let decryption = summary.decryption.as_ref().unwrap();
     assert_eq!(
-        decryption.payload_grammar,
-        Some(crate::pipeline::outcome::PayloadGrammar::StagedTable)
+        decryption.plan_provenance,
+        Some(crate::pipeline::outcome::PayloadPlanProvenance::StagedController)
     );
-    assert_eq!(decryption.chunk_count, 2_264);
-    assert_eq!(decryption.copied_chunk_count, 93);
-    let staged = decryption.selected_staged_table.as_ref().unwrap();
+    assert_eq!(decryption.block_count, 2_264);
+    assert_eq!(decryption.copied_block_count, 93);
+    let staged = decryption.selected_staged_controller.as_ref().unwrap();
     assert_eq!(staged.shell_table_rva, 0x00c0_3790);
     assert_eq!(staged.seven_stage_rva, 0x00c0_4f70);
     assert_eq!(staged.eighth_stage_rva, 0x00c0_5ef8);
@@ -190,7 +190,7 @@ fn reconstructs_polymorphic_pe32_staged_table_fixture() {
 }
 
 #[test]
-fn staged_table_prefilter_cannot_hide_authenticated_a_records() {
+fn staged_controller_prefilter_cannot_hide_authenticated_payload_blocks() {
     let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packed/chusanApp_2.25.exe");
     let request = PipelineRequest {
         input,
@@ -213,17 +213,17 @@ fn staged_table_prefilter_cannot_hide_authenticated_a_records() {
 
     let decryption = summary.decryption.as_ref().unwrap();
     assert_eq!(
-        decryption.payload_grammar,
-        Some(crate::pipeline::outcome::PayloadGrammar::ARecord)
+        decryption.plan_provenance,
+        Some(crate::pipeline::outcome::PayloadPlanProvenance::EvidenceSearch)
     );
-    assert_eq!(decryption.chunk_count, 7_485);
-    assert_eq!(decryption.copied_chunk_count, 16);
-    assert_eq!(decryption.decoded_chunk_count, 7_469);
+    assert_eq!(decryption.block_count, 7_485);
+    assert_eq!(decryption.copied_block_count, 16);
+    assert_eq!(decryption.decoded_block_count, 7_469);
     assert_eq!(decryption.aes_key_candidates, 2);
     assert_eq!(decryption.decoder_candidates, 2);
     assert_eq!(decryption.byte_transform_candidates, 3);
     assert!(decryption.selected_chain.is_some());
-    assert!(decryption.selected_staged_table.is_none());
+    assert!(decryption.selected_staged_controller.is_none());
 
     let recovered = summary.recovered_program.as_ref().unwrap();
     assert_eq!(recovered.startup_rva, 0x00a2_ce71);

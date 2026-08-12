@@ -29,7 +29,7 @@ pub(crate) enum ImportSymbol {
     Ordinal(u16),
 }
 
-/// A descriptor and its authoritative source thunks.
+/// payload block descriptor and its authoritative source thunks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ImportModule {
     pub(crate) dll: String,

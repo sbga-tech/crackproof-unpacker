@@ -22,7 +22,7 @@ pub(crate) use grammar::{decrypt_packed_image, decrypt_packed_image_from_source}
 pub(crate) use grammar::{
     decrypt_packed_image_from_source_with_cancellation, decrypt_packed_image_with_cancellation,
 };
-pub(crate) use replay::DecryptionSelectionError;
+pub(crate) use replay::PayloadPlanSelectionError;
 
 #[cfg(test)]
 use aes::*;
