@@ -2093,7 +2093,10 @@ fn required_tls_relocation_slots(mapped: &[u8], pe: &Pe) -> Result<Vec<BaseReloc
     bail!("TLS callback array has no bounded terminator")
 }
 
-fn declared_relocations_match_tls_closure(
+/// Validates a candidate relocation directory against the mapped PE's complete
+/// dynamic-base TLS relocation closure. `mapped` must already contain the
+/// candidate bytes at `declared`; this function never mutates it.
+pub(crate) fn declared_relocations_match_tls_closure(
     mapped: &[u8],
     pe: &Pe,
     declared: DataDirectory,

@@ -2,13 +2,13 @@ use std::ops::Range;
 
 use anyhow::{Context, Result, ensure};
 
-use super::image::{read_bytes, read_u16, read_u32, read_u64};
 use super::model::{
     COFF_HEADER_SIZE, DOS_HEADER_SIZE, DataDirectory, IMAGE_BASE_ALIGNMENT, MAX_FILE_ALIGNMENT,
     MAX_MAPPABLE_IMAGE_SIZE, MAX_PE_SECTIONS, MIN_STANDARD_FILE_ALIGNMENT, Machine, PE_PAGE_SIZE,
     PE_SIGNATURE_SIZE, PE32_OPTIONAL_HEADER_MAGIC, PE32_PLUS_OPTIONAL_HEADER_MAGIC, Pe,
     PeInputLayout, PeKind, SECTION_HEADER_SIZE, Section,
 };
+use crate::util::bytes::{read_bytes, read_u16, read_u32, read_u64};
 
 impl Pe {
     pub fn parse(data: &[u8]) -> Result<Self> {

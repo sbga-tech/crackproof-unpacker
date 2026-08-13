@@ -1,13 +1,20 @@
 use std::ops::Range;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::bail;
+use anyhow::{Context, Result, ensure};
+
+use tracing::debug;
 
 use crate::pipeline::cancellation::CancellationToken;
+
 use crate::pipeline::stages::payload::bootstrap::PackedBootstrap;
 
 pub(super) const PAYLOAD_BLOCK_DESCRIPTOR_SIZE: usize = 16;
+
 pub(super) const PAYLOAD_BLOCK_PHASES: usize = u8::MAX as usize + 1;
+
 pub(super) const MAX_PAYLOAD_BLOCK_DISCOVERY_CANDIDATES: usize = 16_000_000;
+
 pub(super) const MAX_PAYLOAD_BLOCK_CHECKS: usize = 32_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -443,6 +450,12 @@ fn discover_payload_block_table_impl(
         cancellation,
     )?;
 
+    debug!(
+        table_offset = selected_state.start,
+        phase = selected_state.phase,
+        records = selected_state.length,
+        "selected evidence-search payload-block table"
+    );
     let selected_identity = PayloadBlockTableSelection {
         state: selected_state,
         blocks: &selected.blocks,

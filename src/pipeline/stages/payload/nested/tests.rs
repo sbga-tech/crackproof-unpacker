@@ -262,38 +262,49 @@ fn unique_reference_rooted_output_avoids_speculative_replay() {
 }
 
 #[test]
-fn nested_map_graph_completes_after_two_nonempty_generations() {
+fn empty_nested_map_output_preserves_existing_frontier() {
     let original = Box::new([0x11; 256]);
-    let first = Box::new([0x22; 256]);
-    let second = Box::new([0x33; 256]);
     let mut maps = vec![(1, original)];
-    let mut generations = 0;
+    let mut generations = Vec::new();
+    let record = NestedRecord {
+        descriptor_offset: 0,
+        source_rva: 0,
+        encoded_length: 1,
+        destination_rva: 0x1000,
+        destination_length: 0x100,
+    };
 
-    assert!(!commit_nested_output_maps(
-        &mut maps,
-        Vec::new(),
-        &mut generations
-    ));
-    assert_eq!(generations, 0);
+    commit_nested_output_maps(&mut maps, &record, Vec::new(), &mut generations).unwrap();
+
+    assert!(generations.is_empty());
     assert_eq!(maps[0].1.as_ref(), &[0x11; 256]);
+}
 
-    assert!(!commit_nested_output_maps(
-        &mut maps,
-        vec![(2, first)],
-        &mut generations
-    ));
-    assert_eq!(generations, 1);
-    assert_eq!(maps[0].0, 2);
+#[test]
+fn nested_map_output_records_absolute_producer_provenance() {
+    let original = Box::new([0x11; 256]);
+    let generated = Box::new([0x22; 256]);
+    let mut maps = vec![(1, original)];
+    let mut generations = Vec::new();
+    let record = NestedRecord {
+        descriptor_offset: 0,
+        source_rva: 0,
+        encoded_length: 1,
+        destination_rva: 0x1000,
+        destination_length: 0x100,
+    };
+    let candidate = LfsrAlMapCandidate {
+        offset: 3,
+        length: 11,
+        map: generated,
+    };
+
+    commit_nested_output_maps(&mut maps, &record, vec![candidate], &mut generations).unwrap();
+
+    assert_eq!(maps[0].0, 11);
     assert_eq!(maps[0].1.as_ref(), &[0x22; 256]);
-
-    assert!(commit_nested_output_maps(
-        &mut maps,
-        vec![(3, second)],
-        &mut generations
-    ));
-    assert_eq!(generations, 2);
-    assert_eq!(maps[0].0, 3);
-    assert_eq!(maps[0].1.as_ref(), &[0x33; 256]);
+    assert_eq!(generations[0].producer_rva, 0x1000);
+    assert_eq!(generations[0].maps[0].offset, 0x1003);
 }
 
 #[test]

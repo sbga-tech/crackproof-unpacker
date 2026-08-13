@@ -1,10 +1,12 @@
+use sha2::Digest;
 use std::ops::Range;
 
 use super::decoder::CustomDecoderSource;
-use super::grammar::{
-    BoundPayloadSource, derive_payload_stream_provenance, select_payload_plan_provider,
-};
 use super::replay::NestedTransformedSource;
+use super::router::{ProviderPolicy, recover_payload_with_policy};
+use super::source::{
+    BoundPayloadSource, PayloadStreamProvenance, derive_payload_stream_provenance,
+};
 use super::*;
 use crate::pe::{DataDirectory, Machine, Pe, Section};
 use crate::pipeline::stages::payload::bootstrap::{
@@ -13,8 +15,8 @@ use crate::pipeline::stages::payload::bootstrap::{
 };
 use crate::pipeline::stages::payload::nested::{
     MAX_AL_PROGRAM_BYTES, amd64_runtime_header_checksums, crackproof_checksum, crc32_table,
-    lfsr_al_map_candidates, lfsr_al_maps, lfsr_decode_program, nested_transform_dwords_into,
-    parse_al_byte_map,
+    lfsr_al_map_at_start, lfsr_al_map_candidates, lfsr_al_maps, lfsr_decode_program,
+    nested_transform_dwords_into, parse_al_byte_map,
 };
 use crate::pipeline::stages::startup::{
     SparsePageKey, decode_sparse_text_pages_in_place, unique_sparse_page_keys,
@@ -49,67 +51,388 @@ fn bound_fixture_source<'a>(packed: &'a [u8], pe: &'a Pe) -> BoundPayloadSource<
         outer,
     }
 }
-
-#[test]
-fn shallow_staged_shape_does_not_preempt_evidence_search_authentication() {
-    let packed = include_bytes!("../../../../../packed/chusanApp_2.25.exe");
-    let pe = Pe::parse(packed).unwrap();
-    let source = bound_fixture_source(packed, &pe);
-    assert!(super::staged::recognizes_staged_controller(&source));
-
-    let recovered = select_payload_plan_provider(&source, None).unwrap();
-    assert_eq!(
-        recovered.decryption_details.plan_provenance,
-        Some(crate::pipeline::outcome::PayloadPlanProvenance::EvidenceSearch)
-    );
-    assert_eq!(recovered.decryption_details.block_count, 7_485);
-    assert!(
-        recovered
-            .decryption_details
-            .selected_staged_controller
-            .is_none()
-    );
+fn controller_registration(
+    kind: crate::pipeline::outcome::ControllerKind,
+) -> super::controller::ControllerRegistration {
+    super::controller::REGISTRY
+        .into_iter()
+        .find(|registration| registration.kind == kind)
+        .expect("controller kind must have one registration")
 }
 
 #[test]
-fn complete_staged_controller_replay_remains_authoritative() {
+fn controller_probe_propagates_preexisting_cancellation_before_nonapplicability() {
     let packed = include_bytes!("../../../../../packed/maimai_SDEY_1.99.exe");
     let pe = Pe::parse(packed).unwrap();
     let source = bound_fixture_source(packed, &pe);
-    assert!(super::staged::recognizes_staged_controller(&source));
+    let cancellation = crate::pipeline::cancellation::CancellationToken::default();
+    cancellation.cancel();
 
-    let recovered = select_payload_plan_provider(&source, None).unwrap();
-    assert_eq!(
-        recovered.decryption_details.plan_provenance,
-        Some(crate::pipeline::outcome::PayloadPlanProvenance::StagedController)
+    let probe = super::controller::probe(
+        controller_registration(crate::pipeline::outcome::ControllerKind::CodecRelocation),
+        &source,
+        Some(&cancellation),
     );
-    assert_eq!(recovered.decryption_details.block_count, 2_264);
+    let error = match &probe {
+        super::controller::ControllerProbeOutcome::Cancelled(error) => error,
+        _ => panic!("cancelled probe must not be classified as nonapplicable"),
+    };
+
     assert!(
-        recovered
-            .decryption_details
-            .selected_staged_controller
+        error
+            .downcast_ref::<crate::pipeline::cancellation::Cancelled>()
             .is_some()
     );
 }
 
 #[test]
-fn complete_staged_controller_replay_wins_payload_block_overlap() {
-    let packed = include_bytes!("../../../../../packed/chusanApp_2.50.exe");
+fn automatic_routing_wraps_preexisting_cancellation_with_route_diagnostics() {
+    let packed = include_bytes!("../../../../../packed/sddt160/chiffre.dll");
     let pe = Pe::parse(packed).unwrap();
     let source = bound_fixture_source(packed, &pe);
-    assert!(super::staged::recognizes_staged_controller(&source));
+    let cancellation = crate::pipeline::cancellation::CancellationToken::default();
+    cancellation.cancel();
 
-    let recovered = select_payload_plan_provider(&source, None).unwrap();
+    let error =
+        recover_payload_with_policy(&source, Some(&cancellation), ProviderPolicy::Automatic)
+            .unwrap_err();
+    let route = error
+        .downcast_ref::<super::replay::PayloadRouteError>()
+        .expect("automatic cancellation exposes typed routing diagnostics");
+
+    assert_eq!(route.kind, super::replay::PayloadRouteErrorKind::Cancelled);
+    assert!(route.decryption_details.provider_attempts.is_empty());
+    assert!(error.chain().any(|source| {
+        source
+            .downcast_ref::<crate::pipeline::cancellation::Cancelled>()
+            .is_some()
+    }));
+}
+#[test]
+fn automatic_routing_prefers_authenticated_controller_over_evidence_search() {
+    let packed = include_bytes!("../../../../../packed/chusanApp_2.25.exe");
+    let pe = Pe::parse(packed).unwrap();
+    let source = bound_fixture_source(packed, &pe);
+    let recovered = recover_payload_with_policy(&source, None, ProviderPolicy::Automatic).unwrap();
+    let evidence_only =
+        recover_payload_with_policy(&source, None, ProviderPolicy::EvidenceOnly).unwrap();
+
     assert_eq!(
         recovered.decryption_details.plan_provenance,
-        Some(crate::pipeline::outcome::PayloadPlanProvenance::StagedController)
+        Some(crate::pipeline::outcome::PayloadPlanProvenance::Controller)
+    );
+    assert_eq!(recovered.image, evidence_only.image);
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&recovered.image)),
+        "bee1a2949c6f807aa77f50e471ff606b5b560ee116900b685a8873068bac5e47"
+    );
+    assert_eq!(recovered.decryption_details.block_count, 7_485);
+    assert!(recovered.decryption_details.selected_controller.is_some());
+    assert!(
+        recovered
+            .decryption_details
+            .provider_attempts
+            .iter()
+            .all(|attempt| attempt.provenance
+                == crate::pipeline::outcome::PayloadPlanProvenance::Controller)
     );
     assert!(
         recovered
             .decryption_details
-            .selected_staged_controller
-            .is_some()
+            .provider_attempts
+            .iter()
+            .any(|attempt| attempt.outcome
+                == crate::pipeline::outcome::PayloadProviderAttemptOutcome::Authenticated)
     );
+}
+
+#[test]
+fn shell_directory_manifest_controller_authenticates_complete_plan() {
+    let packed = include_bytes!("../../../../../packed/maimai_SDEY_1.99.exe");
+    let pe = Pe::parse(packed).unwrap();
+    let source = bound_fixture_source(packed, &pe);
+    assert!(matches!(
+        super::controller::probe(
+            controller_registration(
+                crate::pipeline::outcome::ControllerKind::ShellDirectoryManifest,
+            ),
+            &source,
+            None,
+        ),
+        super::controller::ControllerProbeOutcome::Applicable(_)
+    ));
+    let recovered = recover_payload_with_policy(&source, None, ProviderPolicy::Automatic).unwrap();
+    assert_eq!(
+        recovered.decryption_details.plan_provenance,
+        Some(crate::pipeline::outcome::PayloadPlanProvenance::Controller)
+    );
+    assert_eq!(recovered.decryption_details.block_count, 2_264);
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&recovered.image)),
+        "55a8eee026db8208d3957b2872df00510fe2cbc75b096518add41a5691943916"
+    );
+    assert!(recovered.decryption_details.selected_controller.is_some());
+    assert!(matches!(
+        recovered.decryption_details.selected_controller,
+        Some(crate::pipeline::outcome::SelectedController::ShellDirectoryManifest(_))
+    ));
+}
+
+#[test]
+fn codec_relocation_controller_matches_evidence_search() {
+    let packed = include_bytes!("../../../../../packed/sddt160/chiffre.dll");
+    let pe = Pe::parse(packed).unwrap();
+    let source = bound_fixture_source(packed, &pe);
+    assert!(matches!(
+        super::controller::probe(
+            controller_registration(crate::pipeline::outcome::ControllerKind::CodecRelocation),
+            &source,
+            None,
+        ),
+        super::controller::ControllerProbeOutcome::Applicable(_)
+    ));
+    let recovered = recover_payload_with_policy(&source, None, ProviderPolicy::Automatic).unwrap();
+    let evidence_only =
+        recover_payload_with_policy(&source, None, ProviderPolicy::EvidenceOnly).unwrap();
+
+    assert_eq!(
+        recovered.destination_ranges,
+        evidence_only.destination_ranges
+    );
+    for range in &recovered.destination_ranges {
+        let start = usize::try_from(range.start).unwrap();
+        let end = usize::try_from(range.end).unwrap();
+        assert_eq!(
+            &recovered.image[start..end],
+            &evidence_only.image[start..end],
+            "authenticated payload destination {range:#x?} differs"
+        );
+    }
+    assert_eq!(
+        recovered.decryption_details.plan_provenance,
+        Some(crate::pipeline::outcome::PayloadPlanProvenance::Controller)
+    );
+    assert_eq!(recovered.decryption_details.block_count, 29);
+    assert!(matches!(
+        recovered.decryption_details.selected_controller,
+        Some(crate::pipeline::outcome::SelectedController::CodecRelocation(_))
+    ));
+    let attempts = &recovered.decryption_details.provider_attempts;
+    assert!(
+        attempts
+            .iter()
+            .map(|attempt| attempt.controller)
+            .eq(super::controller::REGISTRY
+                .into_iter()
+                .map(|registration| Some(registration.kind))),
+        "controller attempts must cover the ordered registry"
+    );
+    let manifest_attempt = attempts
+        .iter()
+        .find(|attempt| {
+            attempt.controller
+                == Some(crate::pipeline::outcome::ControllerKind::ShellDirectoryManifest)
+        })
+        .expect("manifest controller attempt must be recorded");
+    assert_eq!(
+        manifest_attempt.outcome,
+        crate::pipeline::outcome::PayloadProviderAttemptOutcome::NotApplicable
+    );
+    let descriptor_attempt = attempts
+        .iter()
+        .find(|attempt| {
+            attempt.controller == Some(crate::pipeline::outcome::ControllerKind::CodecRelocation)
+        })
+        .expect("descriptor controller attempt must be recorded");
+    assert_eq!(
+        descriptor_attempt.outcome,
+        crate::pipeline::outcome::PayloadProviderAttemptOutcome::Authenticated
+    );
+    let Some(crate::pipeline::outcome::SelectedController::CodecRelocation(controller)) =
+        recovered.decryption_details.selected_controller.as_ref()
+    else {
+        panic!("expected PE32+/AMD64 DLL descriptor-payload controller evidence");
+    };
+    assert_ne!(controller.anchor_rva, 0);
+    assert_ne!(controller.primary_rva, 0);
+    assert_ne!(controller.codec_rva, 0);
+    assert_ne!(controller.map_layer_rva, 0);
+    assert_ne!(controller.final_controller_rva, 0);
+    assert_ne!(controller.payload_list_rva, 0);
+    assert_eq!(controller.layer_byte_map.len(), 256);
+    assert_eq!(controller.file_byte_map.len(), 256);
+    assert!(controller.metadata_record_count > 0);
+}
+
+#[test]
+fn eight_aa_controller_matches_evidence_search_image() {
+    let packed = include_bytes!("../../../../../packed/mu3_sddt_1.45.exe");
+    let pe = Pe::parse(packed).unwrap();
+    let source = bound_fixture_source(packed, &pe);
+    let recovered = recover_payload_with_policy(&source, None, ProviderPolicy::Automatic).unwrap();
+    let evidence_only =
+        recover_payload_with_policy(&source, None, ProviderPolicy::EvidenceOnly).unwrap();
+
+    assert_eq!(
+        recovered.destination_ranges,
+        evidence_only.destination_ranges
+    );
+    assert_eq!(
+        sha2::Sha256::digest(&recovered.image),
+        sha2::Sha256::digest(&evidence_only.image),
+        "authenticated image-base-metadata-binding full mapped image differs from evidence replay"
+    );
+}
+
+#[test]
+fn codec_control_metadata_controller_matches_evidence_search_image() {
+    let packed = include_bytes!("../../../../../packed/CardMaker/PrintDLL.dll");
+    let pe = Pe::parse(packed).unwrap();
+    let source = bound_fixture_source(packed, &pe);
+    let recovered = recover_payload_with_policy(&source, None, ProviderPolicy::Automatic).unwrap();
+    let evidence_only =
+        recover_payload_with_policy(&source, None, ProviderPolicy::EvidenceOnly).unwrap();
+
+    assert_eq!(
+        sha2::Sha256::digest(&recovered.image),
+        sha2::Sha256::digest(&evidence_only.image),
+        "authenticated codec-control-metadata full mapped image differs from evidence replay"
+    );
+    assert_eq!(
+        recovered.destination_record_ranges,
+        evidence_only.destination_record_ranges
+    );
+    for range in &recovered.destination_ranges {
+        let start = usize::try_from(range.start).unwrap();
+        let end = usize::try_from(range.end).unwrap();
+        assert_eq!(
+            &recovered.image[start..end],
+            &evidence_only.image[start..end],
+            "authenticated codec-control-metadata payload destination {range:#x?} differs"
+        );
+    }
+}
+
+#[test]
+fn codec_control_metadata_controller_roots_unihttp2_terminal_without_evidence_search() {
+    use crate::pipeline::outcome::{
+        RootedNativeControllerGraphNode, RootedNativeControllerNodeKind, SelectedController,
+    };
+
+    let packed = include_bytes!("../../../../../packed/SDGY10100/UniHttp2.dll");
+    let pe = Pe::parse(packed).unwrap();
+    let source = bound_fixture_source(packed, &pe);
+    let recovered = recover_payload_with_policy(&source, None, ProviderPolicy::Automatic).unwrap();
+    let controller = match recovered.decryption_details.selected_controller.as_ref() {
+        Some(SelectedController::CodecControlMetadata(controller)) => controller,
+        selected => panic!("expected rooted codec-control-metadata controller, found {selected:?}"),
+    };
+    let expected_nodes = [
+        RootedNativeControllerGraphNode {
+            kind: RootedNativeControllerNodeKind::PrimaryDescriptor,
+            rva: 0x16430,
+        },
+        RootedNativeControllerGraphNode {
+            kind: RootedNativeControllerNodeKind::Stage1,
+            rva: 0x1c4d8,
+        },
+        RootedNativeControllerGraphNode {
+            kind: RootedNativeControllerNodeKind::Stage2Descriptor,
+            rva: 0x1d310,
+        },
+        RootedNativeControllerGraphNode {
+            kind: RootedNativeControllerNodeKind::Stage2,
+            rva: 0x1ee00,
+        },
+        RootedNativeControllerGraphNode {
+            kind: RootedNativeControllerNodeKind::Codec,
+            rva: 0x211b0,
+        },
+        RootedNativeControllerGraphNode {
+            kind: RootedNativeControllerNodeKind::Stage3Descriptor,
+            rva: 0x1d368,
+        },
+        RootedNativeControllerGraphNode {
+            kind: RootedNativeControllerNodeKind::Stage3,
+            rva: 0x16b30,
+        },
+        RootedNativeControllerGraphNode {
+            kind: RootedNativeControllerNodeKind::Stage3bDescriptor,
+            rva: 0x1d378,
+        },
+        RootedNativeControllerGraphNode {
+            kind: RootedNativeControllerNodeKind::Stage3b,
+            rva: 0x1d5c0,
+        },
+        RootedNativeControllerGraphNode {
+            kind: RootedNativeControllerNodeKind::Stage4Descriptor,
+            rva: 0x1d398,
+        },
+        RootedNativeControllerGraphNode {
+            kind: RootedNativeControllerNodeKind::MapLayer,
+            rva: 0x17990,
+        },
+        RootedNativeControllerGraphNode {
+            kind: RootedNativeControllerNodeKind::Stage5Descriptor,
+            rva: 0x1d3e8,
+        },
+        RootedNativeControllerGraphNode {
+            kind: RootedNativeControllerNodeKind::Terminal,
+            rva: 0x186f8,
+        },
+    ];
+
+    assert_eq!(
+        (
+            controller.root_rva,
+            controller.graph_nodes.as_slice(),
+            controller.payload_list_rva,
+            controller.file_decoder_rva,
+            controller.layer_decoder_rva,
+            controller.file_aes_context_rva,
+            controller.layer_aes_context_rva,
+            controller.layer_program_rva,
+            controller.layer_program_length,
+            controller.file_program_rva,
+            controller.file_program_length,
+        ),
+        (
+            0x163b8,
+            expected_nodes.as_slice(),
+            0x141c0,
+            0x3b200,
+            Some(0x3beb8),
+            0x3bdc4,
+            Some(0x3caca),
+            Some(0x18620),
+            Some(15),
+            0x1b6d8,
+            11,
+        )
+    );
+}
+
+#[test]
+fn shell_directory_manifest_controller_wins_payload_block_overlap() {
+    let packed = include_bytes!("../../../../../packed/chusanApp_2.50.exe");
+    let pe = Pe::parse(packed).unwrap();
+    let source = bound_fixture_source(packed, &pe);
+    assert!(matches!(
+        super::controller::probe(
+            controller_registration(
+                crate::pipeline::outcome::ControllerKind::ShellDirectoryManifest,
+            ),
+            &source,
+            None,
+        ),
+        super::controller::ControllerProbeOutcome::Applicable(_)
+    ));
+    let recovered = recover_payload_with_policy(&source, None, ProviderPolicy::Automatic).unwrap();
+    assert_eq!(
+        recovered.decryption_details.plan_provenance,
+        Some(crate::pipeline::outcome::PayloadPlanProvenance::Controller)
+    );
+    assert!(recovered.decryption_details.selected_controller.is_some());
 }
 
 #[test]
@@ -334,6 +657,23 @@ fn discovers_short_semantic_al_program() {
             .iter()
             .any(|(length, map)| { *length == PROGRAM.len() && map == &expected })
     );
+}
+#[test]
+fn exact_lfsr_program_parser_rejects_non_rooted_prefixes() {
+    const PROGRAM: [u8; 11] = [
+        0xfe, 0xc0, 0xfe, 0xc0, 0xc0, 0xc0, 0x07, 0xc0, 0xc0, 0x03, 0xc3,
+    ];
+    let encoded = lfsr_encode_program(&PROGRAM);
+    let expected = parse_al_byte_map(&PROGRAM).unwrap().1;
+
+    let exact = lfsr_al_map_at_start(&encoded).expect("rooted AL program");
+    assert_eq!(exact.offset, 0);
+    assert_eq!(exact.length, PROGRAM.len());
+    assert_eq!(exact.map, expected);
+
+    let mut prefixed = vec![0x5a];
+    prefixed.extend_from_slice(&encoded);
+    assert!(lfsr_al_map_at_start(&prefixed).is_none());
 }
 
 #[test]
@@ -985,7 +1325,7 @@ fn payload_stream_provenance_uses_the_descriptor_locator_gap() {
 
     assert_eq!(
         provenance,
-        super::grammar::PayloadStreamProvenance {
+        PayloadStreamProvenance {
             locator_file_offset: fixture.bootstrap.descriptor_file_offset + 0x80,
             base_file_offset: fixture.stream_base,
             gap_after_outer_source: options_b().stream_gap,
@@ -1052,7 +1392,7 @@ fn payload_stream_provenance_rejects_a_locator_in_the_security_directory() {
 }
 
 #[test]
-fn primitives_round_trip_and_custom_decoder_consumes_exact_stream() {
+fn shared_round_trip_and_custom_decoder_consumes_exact_stream() {
     let mut f2 = [0x10, 0x22, 0x33, 0x44];
     let original = f2;
     inverse_f2a0(&mut f2, 0x91);
@@ -1114,7 +1454,7 @@ fn custom_decoder_prefix_filter_never_rejects_a_successful_stream() {
         false,
     ));
 
-    for rejected in [0x203, 0x301] {
+    for rejected in [0x203, 0x305] {
         assert!(!custom_decoder_prefix_is_viable(
             &token_table(rejected),
             &[0],
@@ -1488,7 +1828,7 @@ fn decrypts_structurally_discovered_direct_and_custom_records() {
 }
 
 #[test]
-fn decryption_preserves_native_ordered_destination_overlaps() {
+fn authenticates_one_source_derived_plan_with_ordered_destination_overlaps() {
     let records = vec![
         PayloadBlock {
             source_offset: 0,
@@ -1527,9 +1867,54 @@ fn decryption_preserves_native_ordered_destination_overlaps() {
         },
         post_transform: PayloadPostTransform::F8,
     };
-    let mut mapped = [0; 3];
-    materialize_payload_plan(&packed, &mut mapped, &plan, None).expect("ordered direct writes");
-    assert_eq!(mapped, *b"ACD");
+    let block_table = plan.block_table.clone();
+    let authenticated = authenticate_payload_plan(
+        &packed,
+        &[0; 3],
+        &block_table,
+        PayloadPlanCandidate::new(plan),
+        None,
+    )
+    .expect("ordered direct writes authenticate");
+    assert_eq!(authenticated.image(), *b"ACD");
+}
+
+#[test]
+fn single_plan_authentication_rejects_a_nonreplaying_plan() {
+    let block_table = PayloadBlockTable {
+        stream_base: 0,
+        blocks: vec![PayloadBlock {
+            source_offset: 0,
+            encoded_length: 1,
+            destination_rva: 0,
+            destination_length: 2,
+        }],
+    };
+    let rejected_plan = PayloadMaterializationPlan {
+        block_table: block_table.clone(),
+        aes_key: [0; AES_256_KEY_SIZE],
+        decoder: DecoderCandidate {
+            source_file_offset: 0,
+            phase: 0,
+            table: Vec::new(),
+        },
+        post_transform: PayloadPostTransform::F8,
+    };
+
+    let Err(error) = authenticate_payload_plan(
+        &[inverse_f8(0)],
+        &[0; 2],
+        &block_table,
+        PayloadPlanCandidate::new(rejected_plan),
+        None,
+    ) else {
+        panic!("a rooted controller plan must not be replaced after replay rejection");
+    };
+
+    assert!(matches!(
+        error.downcast_ref::<PayloadPlanAuthenticationError>(),
+        Some(PayloadPlanAuthenticationError::NoCandidate { .. })
+    ));
 }
 
 #[test]
@@ -1542,13 +1927,15 @@ fn decryption_rejects_a_direct_only_chain_before_mutation() {
     };
     assert!(
         select_payload_plan(
-            &[],
-            0..0,
-            0,
-            &[],
-            &[direct],
+            PayloadPlanSelectionInput {
+                packed: &[],
+                source_file_range: 0..0,
+                stream_base: 0,
+                mapped: &[],
+                records: &[direct],
+                post_transforms: &[PayloadPostTransform::F8],
+            },
             Vec::new(),
-            &[PayloadPostTransform::F8],
         )
         .is_err()
     );
@@ -1613,11 +2000,14 @@ fn decryption_replay_budget_is_independent_per_candidate_chain() {
     let accepting_table = root_literal_table(0);
     let mapped = vec![0; direct_length];
     let (plan, decryption_details) = select_payload_plan(
-        &packed,
-        0..stream_base,
-        stream_base,
-        &mapped,
-        &records,
+        PayloadPlanSelectionInput {
+            packed: &packed,
+            source_file_range: 0..stream_base,
+            stream_base,
+            mapped: &mapped,
+            records: &records,
+            post_transforms: &[PayloadPostTransform::F8],
+        },
         vec![
             DecoderCandidate {
                 source_file_offset: 0,
@@ -1630,13 +2020,13 @@ fn decryption_replay_budget_is_independent_per_candidate_chain() {
                 table: accepting_table.clone(),
             },
         ],
-        &[PayloadPostTransform::F8],
     )
     .expect("a rejected chain cannot consume the succeeding chain's replay budget");
 
-    assert_eq!(plan.aes_key, key);
-    assert_eq!(plan.decoder.table, accepting_table);
-    assert_eq!(plan.post_transform, PayloadPostTransform::F8);
+    assert_eq!(plan.plan().aes_key, key);
+    assert_eq!(plan.plan().decoder.table, accepting_table);
+    assert_eq!(plan.plan().post_transform, PayloadPostTransform::F8);
+    assert_eq!(plan.image().len(), mapped.len());
     assert_eq!(decryption_details.block_count, 2);
     assert_eq!(decryption_details.copied_block_count, 1);
     assert_eq!(decryption_details.decoded_block_count, 1);
@@ -1689,11 +2079,14 @@ fn parallel_candidate_replay_matches_single_thread_selection() {
             .unwrap()
             .install(|| {
                 select_payload_plan(
-                    &packed,
-                    0..stream_base,
-                    stream_base,
-                    &mapped,
-                    &records,
+                    PayloadPlanSelectionInput {
+                        packed: &packed,
+                        source_file_range: 0..stream_base,
+                        stream_base,
+                        mapped: &mapped,
+                        records: &records,
+                        post_transforms: &[PayloadPostTransform::F8],
+                    },
                     vec![
                         DecoderCandidate {
                             source_file_offset: 1,
@@ -1706,7 +2099,6 @@ fn parallel_candidate_replay_matches_single_thread_selection() {
                             table: accepting_table.clone(),
                         },
                     ],
-                    &[PayloadPostTransform::F8],
                 )
             })
             .unwrap()
@@ -1714,14 +2106,24 @@ fn parallel_candidate_replay_matches_single_thread_selection() {
 
     let (single_plan, single_details) = select(1);
     let (parallel_plan, parallel_details) = select(4);
-    assert_eq!(parallel_plan.aes_key, single_plan.aes_key);
+    assert_eq!(parallel_plan.plan().aes_key, single_plan.plan().aes_key);
     assert_eq!(
-        parallel_plan.decoder.source_file_offset,
-        single_plan.decoder.source_file_offset
+        parallel_plan.plan().decoder.source_file_offset,
+        single_plan.plan().decoder.source_file_offset
     );
-    assert_eq!(parallel_plan.decoder.phase, single_plan.decoder.phase);
-    assert_eq!(parallel_plan.decoder.table, single_plan.decoder.table);
-    assert_eq!(parallel_plan.post_transform, single_plan.post_transform);
+    assert_eq!(
+        parallel_plan.plan().decoder.phase,
+        single_plan.plan().decoder.phase
+    );
+    assert_eq!(
+        parallel_plan.plan().decoder.table,
+        single_plan.plan().decoder.table
+    );
+    assert_eq!(
+        parallel_plan.plan().post_transform,
+        single_plan.plan().post_transform
+    );
+    assert_eq!(parallel_plan.image(), single_plan.image());
     assert_eq!(parallel_details, single_details);
 }
 
@@ -1757,13 +2159,15 @@ fn decryption_selection_failure_reports_bounded_custom_rejections() {
         .collect::<Vec<_>>();
 
     let error = select_payload_plan(
-        &packed,
-        0..stream_base,
-        stream_base,
-        &[0; 3],
-        &records,
+        PayloadPlanSelectionInput {
+            packed: &packed,
+            source_file_range: 0..stream_base,
+            stream_base,
+            mapped: &[0; 3],
+            records: &records,
+            post_transforms: &[PayloadPostTransform::F8],
+        },
         decoder_candidates,
-        &[PayloadPostTransform::F8],
     )
     .err()
     .expect("all candidate chains reject the custom record");
@@ -1798,16 +2202,17 @@ fn decryption_rejects_excess_candidate_pairs_before_replay() {
             table: root_literal_table(0),
         })
         .collect();
-
     let mapped = [0; 2];
     let error = select_payload_plan(
-        &packed,
-        0..AES_CONTEXT_SIZE,
-        AES_CONTEXT_SIZE,
-        &mapped,
-        &[record],
+        PayloadPlanSelectionInput {
+            packed: &packed,
+            source_file_range: 0..AES_CONTEXT_SIZE,
+            stream_base: AES_CONTEXT_SIZE,
+            mapped: &mapped,
+            records: &[record],
+            post_transforms: &[PayloadPostTransform::F8],
+        },
         decoder_candidates,
-        &[PayloadPostTransform::F8],
     )
     .err()
     .expect("over-cap candidate pairs must fail before replay");

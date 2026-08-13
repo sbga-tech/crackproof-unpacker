@@ -1,7 +1,5 @@
-#[cfg(test)]
 use anyhow::Result;
 
-#[cfg(test)]
 use crate::pe::Pe;
 
 mod konn;
@@ -24,13 +22,38 @@ pub(crate) struct KonnDescriptor {
 pub(crate) struct FamilyEvidence {
     pub(crate) descriptor: KonnDescriptor,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KonnDescriptorSelectionError {
+    pub(crate) found: usize,
+}
+
+impl std::fmt::Display for KonnDescriptorSelectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "expected exactly one valid KONN descriptor, found {}",
+            self.found
+        )
+    }
+}
+
+impl std::error::Error for KonnDescriptorSelectionError {}
+
+pub(crate) fn detect_with_cancellation(
+    packed: &[u8],
+    pe: &Pe,
+    cancellation: &crate::pipeline::cancellation::CancellationToken,
+    progress: impl FnMut(u64, u64) -> Result<()>,
+) -> Result<FamilyEvidence> {
+    konn::detect_family_with_cancellation(packed, pe, cancellation, progress)
+}
 
 #[cfg(test)]
 pub(crate) fn detect_family(packed: &[u8], pe: &Pe) -> Result<FamilyEvidence> {
     konn::detect_family(packed, pe)
 }
 
-pub(crate) use konn::{KONN_DESCRIPTOR_SIZE, detect_family_with_cancellation};
+pub(crate) use konn::KONN_DESCRIPTOR_SIZE;
 
 #[cfg(test)]
 pub(crate) use konn::{

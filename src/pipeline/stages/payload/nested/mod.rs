@@ -1,29 +1,46 @@
 use std::collections::HashSet;
+
 use std::error::Error;
+
 use std::fmt;
+
 use std::mem::size_of;
+
 use std::ops::Range;
 
 use anyhow::{Context, Result, ensure};
+
 use tracing::{debug, info};
 
 use crate::pe::{Machine, Pe};
+
 use crate::pipeline::stages::payload::bootstrap::PackedBootstrap;
+
+use crate::util::bytes::read_u32_opt;
 
 #[cfg(test)]
 mod tests;
 
 const PAYLOAD_BLOCK_DESCRIPTOR_SIZE: usize = 16;
+
 const MAX_NESTED_STAGE_CONTEXTS: usize = 8;
 pub(crate) const MAX_AL_PROGRAM_BYTES: usize = 96;
 const MIN_AL_PROGRAM_BYTES: usize = 8;
+
 const MAX_AL_MAP_CANDIDATES: usize = 64;
+
 const MAX_NESTED_RECORD_CANDIDATES: usize = 64;
+
 const MAX_NESTED_SPAN_CANDIDATES: usize = 128;
+
 const MAX_NESTED_SCALAR_CANDIDATES: usize = 8_192;
+
 const MAX_NESTED_KEY_CANDIDATES: usize = 1_048_576;
+
 pub(crate) const MAX_NESTED_REPLAY_OUTPUTS: usize = 8;
+
 const MAX_PRIMARY_NESTED_KEY_WORK: usize = 16 * 1024 * 1024;
+
 const MAX_PRIMARY_NESTED_BYTE_WORK: u64 = 32 * 1024 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -85,15 +102,25 @@ impl NestedKeyWorkBudget {
         Ok(())
     }
 }
+
 const MAX_NESTED_CONTEXT_WORDS: usize = 1_536;
+
 const NESTED_STAGE_SUM_FOUR: u32 = 0x0002_4be4;
+
 const NESTED_STAGE_SUM_THREE: u32 = 0x0001_129c;
+
 const CRC32_TABLE_BYTES: usize = 256 * size_of::<u32>();
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LfsrAlMapCandidate {
     pub(crate) offset: usize,
     pub(crate) length: usize,
     pub(crate) map: Box<[u8; 256]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NestedByteMapGeneration {
+    pub(crate) producer_rva: u32,
+    pub(crate) maps: Vec<LfsrAlMapCandidate>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,8 +205,7 @@ struct NestedSpan {
 }
 
 pub(super) fn read_u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
-    let value = bytes.get(offset..offset.checked_add(size_of::<u32>())?)?;
-    Some(u32::from_le_bytes(value.try_into().ok()?))
+    read_u32_opt(bytes, offset)
 }
 
 pub(crate) fn crc32_table() -> [u32; 256] {
@@ -379,6 +405,19 @@ pub(crate) fn has_lfsr_al_program_at_start(encoded: &[u8]) -> bool {
     }
     let program = lfsr_decode_program(&encoded[..available]);
     al_program_length(&program[..available]).is_some_and(|length| length >= MIN_AL_PROGRAM_BYTES)
+}
+pub(crate) fn lfsr_al_map_at_start(encoded: &[u8]) -> Option<LfsrAlMapCandidate> {
+    let available = encoded.len().min(MAX_AL_PROGRAM_BYTES);
+    if available == 0 {
+        return None;
+    }
+    let program = lfsr_decode_program(&encoded[..available]);
+    let length = al_program_length(&program[..available])?;
+    (length >= MIN_AL_PROGRAM_BYTES).then(|| LfsrAlMapCandidate {
+        offset: 0,
+        length,
+        map: build_al_byte_map(&program[..length]),
+    })
 }
 
 pub(crate) fn lfsr_al_map_candidates(decoded: &[u8]) -> Vec<LfsrAlMapCandidate> {
@@ -1021,16 +1060,31 @@ pub(crate) fn nested_transform_dwords_into(
 
 fn commit_nested_output_maps(
     maps: &mut Vec<(usize, Box<[u8; 256]>)>,
-    output_maps: Vec<(usize, Box<[u8; 256]>)>,
-    map_generations: &mut usize,
-) -> bool {
+    record: &NestedRecord,
+    mut output_maps: Vec<LfsrAlMapCandidate>,
+    generations: &mut Vec<NestedByteMapGeneration>,
+) -> Result<()> {
     if output_maps.is_empty() {
-        return false;
+        return Ok(());
+    }
+    let producer = usize::try_from(record.destination_rva)
+        .context("nested map producer RVA does not fit usize")?;
+    for candidate in &mut output_maps {
+        candidate.offset = producer
+            .checked_add(candidate.offset)
+            .context("nested map program RVA overflows")?;
     }
     maps.clear();
-    maps.extend(output_maps);
-    *map_generations += 1;
-    *map_generations >= 2
+    maps.extend(
+        output_maps
+            .iter()
+            .map(|candidate| (candidate.length, candidate.map.clone())),
+    );
+    generations.push(NestedByteMapGeneration {
+        producer_rva: record.destination_rva,
+        maps: output_maps,
+    });
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1044,6 +1098,7 @@ fn collect_nested_maps_from_graph_profile(
     root_spans: &[NestedSpan],
     table: &[u32; 256],
     maps: &mut Vec<(usize, Box<[u8; 256]>)>,
+    generations: &mut Vec<NestedByteMapGeneration>,
     replayer: &mut impl NestedRecordReplayer,
     extended_profile: bool,
     include_length_complements: bool,
@@ -1062,7 +1117,6 @@ fn collect_nested_maps_from_graph_profile(
     }
     let mut output_ranges = Vec::<Range<usize>>::new();
     let mut processed = HashSet::new();
-    let mut map_generations = 0usize;
 
     for _ in 0..records.len() {
         let checksum_bases = nested_checksum_bases(
@@ -1205,25 +1259,38 @@ fn collect_nested_maps_from_graph_profile(
                     output_ranges.push(tail);
                 }
                 processed.insert(record.descriptor_offset);
-                let output_maps = lfsr_al_maps(&output);
+                let output_maps = lfsr_al_map_candidates(&output);
                 info!(
                     descriptor_offset = record.descriptor_offset,
                     selected_key,
                     output_bytes = output.len(),
                     output_maps = output_maps.len(),
-                    generation = map_generations + usize::from(!output_maps.is_empty()),
+                    generation = generations.len() + usize::from(!output_maps.is_empty()),
                     "selected unique nested replay"
                 );
-                for (map_index, (map_offset, map)) in output_maps.iter().enumerate() {
+                for (map_index, map) in output_maps.iter().enumerate() {
                     debug!(
                         descriptor_offset = record.descriptor_offset,
                         map_index,
-                        map_offset,
-                        byte_map_hex = %hex::encode(map.as_ref()),
+                        map_offset = map.offset,
+                        byte_map_hex = %hex::encode(map.map.as_ref()),
                         "recovered nested byte map"
                     );
                 }
-                if commit_nested_output_maps(maps, output_maps, &mut map_generations) {
+                let repeated_frontier = generations.last().is_some_and(|previous| {
+                    previous.maps.len() == output_maps.len()
+                        && previous
+                            .maps
+                            .iter()
+                            .all(|prior| output_maps.iter().any(|next| next.map == prior.map))
+                });
+                // One map is a deterministic seed for another graph step. More than one
+                // is the terminal candidate frontier: propagating every alternative would
+                // turn authentication candidates into speculative controller state. Stop
+                // here and let the full payload-table replay authenticate every map.
+                let terminal_candidate_frontier = output_maps.len() > 1;
+                commit_nested_output_maps(maps, record, output_maps, generations)?;
+                if repeated_frontier || terminal_candidate_frontier {
                     return Ok(true);
                 }
                 progress = true;
@@ -1237,7 +1304,7 @@ fn collect_nested_maps_from_graph_profile(
             break;
         }
     }
-    Ok(false)
+    Ok(!generations.is_empty())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1251,12 +1318,14 @@ fn collect_nested_maps_from_graph(
     root_spans: &[NestedSpan],
     table: &[u32; 256],
     maps: &mut Vec<(usize, Box<[u8; 256]>)>,
+    generations: &mut Vec<NestedByteMapGeneration>,
     replayer: &mut impl NestedRecordReplayer,
     include_length_complements: bool,
     exhaustive_rotations: bool,
     work_budget: &mut NestedKeyWorkBudget,
 ) -> Result<bool> {
     let initial_maps = maps.clone();
+    let initial_generations = generations.clone();
     if collect_nested_maps_from_graph_profile(
         outer,
         bootstrap,
@@ -1267,6 +1336,7 @@ fn collect_nested_maps_from_graph(
         root_spans,
         table,
         maps,
+        generations,
         replayer,
         false,
         include_length_complements,
@@ -1276,6 +1346,7 @@ fn collect_nested_maps_from_graph(
         return Ok(true);
     }
     maps.clone_from(&initial_maps);
+    generations.clone_from(&initial_generations);
     collect_nested_maps_from_graph_profile(
         outer,
         bootstrap,
@@ -1286,6 +1357,7 @@ fn collect_nested_maps_from_graph(
         root_spans,
         table,
         maps,
+        generations,
         replayer,
         true,
         include_length_complements,
@@ -1304,7 +1376,9 @@ fn discover_nested_byte_maps_profile(
     include_length_complements: bool,
     exhaustive_rotations: bool,
     work_budget: &mut NestedKeyWorkBudget,
+    completed_generations: &mut Vec<NestedByteMapGeneration>,
 ) -> Result<Vec<Box<[u8; 256]>>> {
+    completed_generations.clear();
     let table = crc32_table();
     let table_bytes = crc32_table_bytes(&table);
     let mut contexts = outer
@@ -1412,6 +1486,7 @@ fn discover_nested_byte_maps_profile(
                 else {
                     continue;
                 };
+                let mut candidate_generations = Vec::new();
                 if collect_nested_maps_from_graph(
                     outer,
                     bootstrap,
@@ -1422,11 +1497,13 @@ fn discover_nested_byte_maps_profile(
                     &root_spans,
                     &table,
                     &mut maps,
+                    &mut candidate_generations,
                     replayer,
                     include_length_complements,
                     exhaustive_rotations,
                     work_budget,
                 )? {
+                    completed_generations.clone_from(&candidate_generations);
                     return Ok(maps.into_iter().map(|(_, map)| map).collect());
                 }
             }
@@ -1529,8 +1606,11 @@ fn discover_nested_byte_maps_profile(
                         continue;
                     }
                     let mut candidate_maps = Vec::new();
+                    let mut candidate_generations = Vec::new();
                     let mut graph_complete = false;
                     for &header_checksum in &header_checksums {
+                        candidate_maps.clear();
+                        candidate_generations.clear();
                         graph_complete = collect_nested_maps_from_graph(
                             outer,
                             bootstrap,
@@ -1541,6 +1621,7 @@ fn discover_nested_byte_maps_profile(
                             &root_spans,
                             &table,
                             &mut candidate_maps,
+                            &mut candidate_generations,
                             replayer,
                             include_length_complements,
                             exhaustive_rotations,
@@ -1549,6 +1630,9 @@ fn discover_nested_byte_maps_profile(
                         if graph_complete {
                             break;
                         }
+                    }
+                    if graph_complete {
+                        completed_generations.clone_from(&candidate_generations);
                     }
                     for candidate in candidate_maps {
                         if !maps.iter().any(|(_, map)| map == &candidate.1) {
@@ -1569,17 +1653,23 @@ fn discover_nested_byte_maps_profile(
     Ok(maps.into_iter().map(|(_, map)| map).collect())
 }
 
+// Candidates produce boxed maps, and replay consumes those allocations unchanged.
+
 #[allow(clippy::vec_box)]
-pub(crate) fn discover_nested_byte_maps(
+struct NestedByteMapDiscovery {
+    maps: Vec<Box<[u8; 256]>>,
+}
+
+#[allow(clippy::vec_box, clippy::too_many_arguments)]
+fn discover_nested_byte_map_result(
     mapped: &[u8],
     pe: &Pe,
     bootstrap: PackedBootstrap,
     outer: &[u8],
     mut replayer: impl NestedRecordReplayer,
-) -> Result<Vec<Box<[u8; 256]>>> {
-    // Try the metadata-rooted checksum/ROR19 format profile first, then add
-    // length-complement evidence without multiplying it by speculative rotations.
-    // Only after both evidence tiers fail do we enable the complete rotation search.
+) -> Result<NestedByteMapDiscovery> {
+    let complete = |maps: &[Box<[u8; 256]>]| !maps.is_empty();
+    let mut generations = Vec::new();
     let mut primary_budget =
         NestedKeyWorkBudget::limited(MAX_PRIMARY_NESTED_KEY_WORK, MAX_PRIMARY_NESTED_BYTE_WORK);
     match discover_nested_byte_maps_profile(
@@ -1591,14 +1681,15 @@ pub(crate) fn discover_nested_byte_maps(
         false,
         false,
         &mut primary_budget,
+        &mut generations,
     ) {
-        Ok(maps) if !maps.is_empty() => {
+        Ok(maps) if complete(&maps) => {
             debug!(
                 key_work = primary_budget.charged,
                 byte_work = primary_budget.charged_bytes,
                 "checksum-only nested replay recovered byte maps"
             );
-            return Ok(maps);
+            return Ok(NestedByteMapDiscovery { maps });
         }
         Ok(_) => debug!(
             key_work = primary_budget.charged,
@@ -1625,14 +1716,15 @@ pub(crate) fn discover_nested_byte_maps(
         true,
         false,
         &mut length_complement_budget,
+        &mut generations,
     ) {
-        Ok(maps) if !maps.is_empty() => {
+        Ok(maps) if complete(&maps) => {
             debug!(
                 key_work = length_complement_budget.charged,
                 byte_work = length_complement_budget.charged_bytes,
                 "length-complement ROR19 replay recovered byte maps"
             );
-            return Ok(maps);
+            return Ok(NestedByteMapDiscovery { maps });
         }
         Ok(_) => debug!(
             key_work = length_complement_budget.charged,
@@ -1642,7 +1734,7 @@ pub(crate) fn discover_nested_byte_maps(
         Err(error) => return Err(error),
     }
 
-    discover_nested_byte_maps_profile(
+    let maps = discover_nested_byte_maps_profile(
         mapped,
         pe,
         bootstrap,
@@ -1651,5 +1743,18 @@ pub(crate) fn discover_nested_byte_maps(
         true,
         true,
         &mut NestedKeyWorkBudget::unlimited(),
-    )
+        &mut generations,
+    )?;
+    Ok(NestedByteMapDiscovery { maps })
+}
+
+#[allow(clippy::vec_box)]
+pub(crate) fn discover_nested_byte_maps(
+    mapped: &[u8],
+    pe: &Pe,
+    bootstrap: PackedBootstrap,
+    outer: &[u8],
+    replayer: impl NestedRecordReplayer,
+) -> Result<Vec<Box<[u8; 256]>>> {
+    Ok(discover_nested_byte_map_result(mapped, pe, bootstrap, outer, replayer)?.maps)
 }

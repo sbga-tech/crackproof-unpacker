@@ -95,21 +95,22 @@ pub(super) fn recover(
         .context("POGO layout has no Debug Directory")?;
     let load_config = recover_load_config(&recovered_mapped, &recovered_pe, &gctl)?;
 
-    let export_directory = export
-        .map(|range| {
-            let directory = DataDirectory {
-                virtual_address: range.start,
-                size: range.end - range.start,
-            };
-            let parsed = parse_export_candidate(&recovered_mapped, &recovered_pe, range.start)?
-                .context("POGO .edata contribution is not a valid export graph")?;
-            ensure!(
-                parsed.size <= directory.size,
-                "POGO export graph exceeds .edata contribution"
-            );
-            Ok(directory)
-        })
-        .transpose()?;
+    let export_directory = if let Some(range) = export {
+        let directory = DataDirectory {
+            virtual_address: range.start,
+            size: range.end - range.start,
+        };
+        let Some(parsed) = parse_export_candidate(&recovered_mapped, &recovered_pe, range.start)?
+        else {
+            return Ok(None);
+        };
+        if parsed.size > directory.size {
+            return Ok(None);
+        }
+        Some(directory)
+    } else {
+        None
+    };
     let resource_directory = resources
         .map(|range| {
             let mut resource_nodes = 0usize;

@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+
 use std::ops::Range;
 
 use crate::pipeline::cancellation::CancellationToken;
 use ::aes::Aes256;
 use ::aes::cipher::{Block, BlockDecrypt, KeyInit};
+
 use anyhow::{Context, Result, ensure};
 
 pub(super) const AES_256_KEY_SIZE: usize = 32;
@@ -11,9 +13,13 @@ pub(super) const AES_256_EXPANDED_WORDS: usize = 60;
 pub(super) const AES_256_ROUNDS: usize = 14;
 pub(super) const AES_CONTEXT_HEADER: [u8; 4] = [0x00, 0x01, 0x0e, 0x00];
 pub(super) const AES_DECRYPT_SCHEDULE_SIZE: usize = 240;
+
 pub(super) const AES_CONTEXT_SIZE: usize = AES_CONTEXT_HEADER.len() + AES_DECRYPT_SCHEDULE_SIZE;
+
 pub(super) const MAX_AES_CONTEXT_SCAN_BYTES: usize = 32 << 20;
+
 const MAX_AES_CONTEXT_MATCHES: usize = 64;
+
 const MAX_AES_CONTEXT_VALIDATION_CANDIDATES: usize = 65_536;
 
 /// A transformed, self-validating AES-256 context found in packed input.

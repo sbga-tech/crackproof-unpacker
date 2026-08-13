@@ -3,6 +3,7 @@ use std::ops::Range;
 use anyhow::{Context, Result, ensure};
 
 use crate::pe::{Pe, PointerWidth};
+use crate::util::bytes::{read_u16_opt as read_u16, read_u32_opt as read_u32};
 
 const DESCRIPTOR_SIZE: usize = 20;
 const DESCRIPTOR_ALIGNMENT: u32 = 4;
@@ -257,16 +258,6 @@ pub(super) struct DecodedString {
 pub(super) struct ParsedThunks {
     pub(super) symbols: Vec<ImportSymbol>,
     pub(super) metadata_ranges: Vec<Range<u32>>,
-}
-
-pub(super) fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
-    let bytes = data.get(offset..offset.checked_add(2)?)?;
-    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
-}
-
-pub(super) fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
-    let bytes = data.get(offset..offset.checked_add(4)?)?;
-    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 impl<'a> MappedImage<'a> {

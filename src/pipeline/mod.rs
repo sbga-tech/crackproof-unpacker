@@ -202,7 +202,7 @@ impl<'a> Pipeline<'a> {
             Stage::ProtectorDetection,
             Operation::ScanDescriptors,
             |observer| {
-                let family = detect::detect_family_with_cancellation(
+                let family = detect::detect_with_cancellation(
                     &packed,
                     &packed_pe,
                     cancellation,
@@ -218,7 +218,7 @@ impl<'a> Pipeline<'a> {
                             .context("emitting descriptor scan progress")
                     },
                 )
-                .context("detecting one unambiguous CrackProof family")?;
+                .context("detecting a unique CrackProof payload descriptor")?;
                 let discovered_sidecar_path = read::sidecar_path(&request.input);
                 let sidecar = if discovered_sidecar_path
                     .try_exists()
@@ -759,7 +759,9 @@ impl<'a> Pipeline<'a> {
         summary.elapsed_ms = self
             .started
             .map_or(0, |started| started.elapsed().as_millis());
-        if let Some(selection) = error.downcast_ref::<decrypt::PayloadPlanSelectionError>() {
+        if let Some(route) = error.downcast_ref::<decrypt::PayloadRouteError>() {
+            summary.decryption = Some(route.decryption_details.clone());
+        } else if let Some(selection) = error.downcast_ref::<decrypt::PayloadPlanSelectionError>() {
             summary.decryption = Some(selection.decryption_details.clone());
         }
         let reason = classify_failure(stage, &error);
@@ -776,6 +778,13 @@ fn classify_failure(stage: Stage, error: &anyhow::Error) -> FailureReason {
     if error.downcast_ref::<Cancelled>().is_some() {
         return FailureReason::Cancelled;
     }
+    if let Some(selection) = error.downcast_ref::<detect::KonnDescriptorSelectionError>() {
+        return if selection.found == 0 {
+            FailureReason::Unsupported
+        } else {
+            FailureReason::Ambiguous
+        };
+    }
     if stage == Stage::InputValidation {
         return FailureReason::InvalidInput;
     }
@@ -783,6 +792,14 @@ fn classify_failure(stage: Stage, error: &anyhow::Error) -> FailureReason {
         || error.downcast_ref::<std::io::Error>().is_some()
     {
         return FailureReason::Io;
+    }
+    if let Some(route) = error.downcast_ref::<decrypt::PayloadRouteError>() {
+        return match route.kind {
+            decrypt::PayloadRouteErrorKind::Unsupported => FailureReason::Unsupported,
+            decrypt::PayloadRouteErrorKind::Ambiguous => FailureReason::Ambiguous,
+            decrypt::PayloadRouteErrorKind::Internal => FailureReason::Internal,
+            decrypt::PayloadRouteErrorKind::Cancelled => FailureReason::Cancelled,
+        };
     }
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("ambiguous") || message.contains("multiple ") {

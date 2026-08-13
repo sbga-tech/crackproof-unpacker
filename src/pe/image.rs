@@ -2,57 +2,10 @@ use std::ops::Range;
 
 use anyhow::{Context, Result, ensure};
 
+use crate::util::bytes::{checked_range, read_bytes, read_u32, read_u64, write_u32, write_u64};
+
 use super::model::{DataDirectory, IMAGE_DIRECTORY_ENTRY_SECURITY, Pe, PointerWidth, Section};
 use super::parse::checked_mappable_image_len;
-
-pub fn checked_range(total_len: usize, offset: usize, len: usize) -> Result<Range<usize>> {
-    let end = offset.checked_add(len).context("range end overflow")?;
-    ensure!(
-        end <= total_len,
-        "range {offset:#x}..{end:#x} exceeds buffer length {total_len:#x}"
-    );
-    Ok(offset..end)
-}
-
-pub fn read_bytes(data: &[u8], offset: usize, len: usize) -> Result<&[u8]> {
-    let range = checked_range(data.len(), offset, len)?;
-    Ok(&data[range])
-}
-
-pub fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
-    let bytes: [u8; 2] = read_bytes(data, offset, 2)?
-        .try_into()
-        .expect("bounded two-byte read");
-    Ok(u16::from_le_bytes(bytes))
-}
-
-pub fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
-    let bytes: [u8; 4] = read_bytes(data, offset, 4)?
-        .try_into()
-        .expect("bounded four-byte read");
-    Ok(u32::from_le_bytes(bytes))
-}
-
-pub fn read_u64(data: &[u8], offset: usize) -> Result<u64> {
-    let bytes: [u8; 8] = read_bytes(data, offset, 8)?
-        .try_into()
-        .expect("bounded eight-byte read");
-    Ok(u64::from_le_bytes(bytes))
-}
-
-pub fn write_bytes(data: &mut [u8], offset: usize, value: &[u8]) -> Result<()> {
-    let range = checked_range(data.len(), offset, value.len())?;
-    data[range].copy_from_slice(value);
-    Ok(())
-}
-
-pub fn write_u32(data: &mut [u8], offset: usize, value: u32) -> Result<()> {
-    write_bytes(data, offset, &value.to_le_bytes())
-}
-
-pub fn write_u64(data: &mut [u8], offset: usize, value: u64) -> Result<()> {
-    write_bytes(data, offset, &value.to_le_bytes())
-}
 
 impl DataDirectory {
     /// Interprets the directory's first field as a file offset.

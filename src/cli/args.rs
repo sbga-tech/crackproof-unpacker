@@ -67,4 +67,15 @@ mod tests {
         let plain = ["tool".into(), "--bad".into()];
         assert!(!Args::machine_mode_requested(&plain));
     }
+
+    #[test]
+    fn obsolete_forensic_evidence_search_flag_is_rejected() {
+        let error = Args::try_parse_from([
+            "crackproof-unpacker",
+            "--forensic-evidence-search",
+            "packed.exe",
+        ])
+        .expect_err("evidence search is automatic and has no CLI switch");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
 }

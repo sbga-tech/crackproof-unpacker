@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 
-use super::image::checked_range;
+use crate::util::bytes::checked_range;
 
 pub fn align_up(value: u32, alignment: u32) -> Result<u32> {
     ensure!(

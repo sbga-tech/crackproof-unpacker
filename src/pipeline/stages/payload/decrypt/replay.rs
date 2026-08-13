@@ -2,57 +2,134 @@ use std::mem::size_of;
 use std::ops::Range;
 
 use crate::pipeline::cancellation::CancellationToken;
+
+use crate::pipeline::outcome::{ByteTransform, SelectedAesContext, SelectedDecoder};
 use crate::pipeline::outcome::{
-    ByteTransform, DecryptionDetails, SelectedAesContext, SelectedDecoder, SelectedDecryptionChain,
+    DecryptionDetails, PayloadProviderAttempt, SelectedDecryptionChain, SelectedPayloadStream,
 };
 use anyhow::{Context, Result, ensure};
+
 use rayon::prelude::*;
+
 use tracing::debug;
 
-use crate::pe::Machine;
 use crate::pipeline::stages::payload::bootstrap::PackedBootstrap;
 #[cfg(test)]
 use crate::pipeline::stages::payload::bootstrap::{
     bootstrap_source_file_range, derive_outer_source,
 };
+
 use crate::pipeline::stages::payload::nested::{
     MAX_NESTED_REPLAY_OUTPUTS, NestedRecord, NestedRecordReplayer, NestedReplay,
-    discover_nested_byte_maps, has_lfsr_al_program_at_start, nested_outer_range,
-    nested_transform_dwords_into,
+    has_lfsr_al_program_at_start, nested_outer_range, nested_transform_dwords_into,
 };
 
 use super::aes::{AES_256_KEY_SIZE, Aes256CbcDecryptor};
-use super::decoder::{
-    CustomDecodeError, CustomDecoderSource, decode_custom_stream_with_history_source_mode,
-};
-use super::grammar::BoundPayloadSource;
+use super::decoder::CustomDecodeError;
+
+use super::decoder::{CustomDecoderSource, decode_custom_stream_with_history_source_mode};
 #[cfg(test)]
-use super::grammar::derive_payload_stream_provenance;
+use super::source::derive_payload_stream_provenance;
+
 use super::{
-    AesContextMatch, DecoderCandidate, DecryptedImage, PayloadBlock, PayloadBlockTable,
-    custom_decoder_prefix_is_viable, decode_custom_stream_with_history,
-    discover_decoder_candidates, discover_decoder_candidates_with_cancellation,
-    discover_payload_block_table, discover_payload_block_table_with_cancellation,
-    scan_aes_contexts_in_range, scan_aes_contexts_in_range_with_cancellation,
+    AesContextMatch, custom_decoder_prefix_is_viable, scan_aes_contexts_in_range,
+    scan_aes_contexts_in_range_with_cancellation,
 };
-use super::{merged_payload_block_destination_ranges, payload_block_destination_range};
+use super::{
+    DecoderCandidate, PayloadBlock, PayloadBlockTable, decode_custom_stream_with_history,
+    merged_payload_block_destination_ranges,
+};
+#[cfg(test)]
+use super::{discover_decoder_candidates, discover_payload_block_table};
 
 pub(super) const MAX_DECRYPTION_REPLAY_WORK: usize = 512 << 20;
+
 pub(super) const MAX_DECRYPTION_REPLAY_PAIRS: usize = 64;
+
 pub(super) const MAX_DECRYPTION_AGGREGATE_REPLAY_WORK: usize = 16 << 30;
+
 const MAX_PARALLEL_REPLAY_SCRATCH_BYTES: usize = 256 << 20;
 
-/// A bounded diagnostic produced when no replay chain can authenticate every
-/// custom-coded payload block.
+/// Terminal payload routing failure with the complete bounded attempt trace.
+#[derive(Debug)]
+pub(crate) struct PayloadRouteError {
+    pub(crate) decryption_details: DecryptionDetails,
+    pub(crate) kind: PayloadRouteErrorKind,
+    source: anyhow::Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PayloadRouteErrorKind {
+    Unsupported,
+    Ambiguous,
+    Internal,
+    Cancelled,
+}
+
+impl PayloadRouteError {
+    pub(super) fn new(
+        kind: PayloadRouteErrorKind,
+        source: anyhow::Error,
+        selected_stream: SelectedPayloadStream,
+        provider_attempts: Vec<PayloadProviderAttempt>,
+    ) -> Self {
+        let decryption_details = source
+            .downcast_ref::<PayloadPlanSelectionError>()
+            .map(|selection| selection.decryption_details.clone())
+            .unwrap_or_default();
+        Self {
+            decryption_details: DecryptionDetails {
+                selected_stream: Some(selected_stream),
+                provider_attempts,
+                ..decryption_details
+            },
+            kind,
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for PayloadRouteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for PayloadRouteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// A bounded diagnostic produced when no descriptor-graph plan authenticates.
 #[derive(Debug)]
 pub(crate) struct PayloadPlanSelectionError {
     pub(crate) decryption_details: DecryptionDetails,
+    message: String,
 }
+impl PayloadPlanSelectionError {
+    fn no_authenticated_chain(decryption_details: DecryptionDetails) -> Self {
+        Self {
+            decryption_details,
+            message: "no AES-context and decoder-precursor chain replays every payload block"
+                .to_owned(),
+        }
+    }
 
+    #[cfg(test)]
+    pub(super) fn for_test(
+        decryption_details: DecryptionDetails,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            decryption_details,
+            message: message.into(),
+        }
+    }
+}
 impl std::fmt::Display for PayloadPlanSelectionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .write_str("no AES-context and decoder-precursor chain replays every payload block")
+        formatter.write_str(&self.message)
     }
 }
 
@@ -61,6 +138,7 @@ impl std::error::Error for PayloadPlanSelectionError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum PayloadPostTransform {
     F8,
+
     None,
     ByteMap(Box<[u8; 256]>),
 }
@@ -69,6 +147,7 @@ impl PayloadPostTransform {
     fn apply(&self, payload: &mut [u8]) {
         match self {
             Self::F8 => f8_transform(payload),
+
             Self::None => {}
             Self::ByteMap(map) => {
                 for byte in payload {
@@ -89,19 +168,28 @@ impl PayloadPostTransform {
     pub(super) fn mapping(&self) -> [u8; 256] {
         match self {
             Self::F8 => std::array::from_fn(|value| f8_byte(value as u8)),
+
             Self::None => std::array::from_fn(|value| value as u8),
             Self::ByteMap(map) => **map,
         }
     }
 }
 
-/// Provider-normalized inputs for the common payload-block authenticator and materializer.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) struct PayloadMaterializationPlan {
     pub(super) block_table: PayloadBlockTable,
     pub(super) aes_key: [u8; AES_256_KEY_SIZE],
     pub(super) decoder: DecoderCandidate,
     pub(super) post_transform: PayloadPostTransform,
+}
+
+impl PayloadMaterializationPlan {
+    pub(super) fn semantically_eq(&self, other: &Self) -> bool {
+        self.block_table == other.block_table
+            && self.aes_key == other.aes_key
+            && self.decoder.table == other.decoder.table
+            && self.post_transform.mapping() == other.post_transform.mapping()
+    }
 }
 
 #[derive(Clone)]
@@ -117,24 +205,56 @@ impl PayloadPlanCandidate {
             selected_chain: None,
         }
     }
+}
 
-    pub(super) fn with_selected_chain(
-        plan: PayloadMaterializationPlan,
-        selected_chain: SelectedDecryptionChain,
-    ) -> Self {
-        Self {
-            plan,
-            selected_chain: Some(selected_chain),
+#[derive(Debug)]
+pub(super) enum PayloadPlanAuthenticationError {
+    NoCandidate { diagnostics: Vec<String> },
+}
+
+impl std::fmt::Display for PayloadPlanAuthenticationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoCandidate { diagnostics } => write!(
+                formatter,
+                "no payload plan replays every block ({})",
+                diagnostics.join("; ")
+            ),
         }
     }
 }
 
+impl std::error::Error for PayloadPlanAuthenticationError {}
+
 pub(super) struct AuthenticatedPayloadPlan {
-    pub(super) plan: PayloadMaterializationPlan,
-    pub(super) selected_chain: Option<SelectedDecryptionChain>,
+    plan: PayloadMaterializationPlan,
+    selected_chain: Option<SelectedDecryptionChain>,
+    /// Scratch image produced by the successful complete-table replay.
+    image: Vec<u8>,
 }
 
-struct PreparedAesContext {
+impl AuthenticatedPayloadPlan {
+    pub(super) fn plan(&self) -> &PayloadMaterializationPlan {
+        &self.plan
+    }
+
+    #[cfg(test)]
+    pub(super) fn image(&self) -> &[u8] {
+        &self.image
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        PayloadMaterializationPlan,
+        Option<SelectedDecryptionChain>,
+        Vec<u8>,
+    ) {
+        (self.plan, self.selected_chain, self.image)
+    }
+}
+
+pub(super) struct PreparedAesContext {
     evidence: AesContextMatch,
     decryptor: Aes256CbcDecryptor,
 }
@@ -176,6 +296,36 @@ pub(super) fn ensure_decryption_work_bound(records: &[PayloadBlock]) -> Result<(
     let mut budget = ReplayBudget::default();
     for record in records {
         budget.reserve(record)?;
+    }
+    Ok(())
+}
+
+/// Rejects terminal zero fills that would mutate bytes produced by the
+/// authenticated payload replay.
+pub(super) fn ensure_terminal_zero_ranges_are_disjoint_from_payload_destinations(
+    zero_ranges: &[Range<usize>],
+    block_table: &PayloadBlockTable,
+) -> Result<()> {
+    let destination_ranges = merged_payload_block_destination_ranges(&block_table.blocks)?;
+    for zero_range in zero_ranges {
+        let zero_start =
+            u32::try_from(zero_range.start).context("terminal zero-fill start exceeds u32")?;
+        let zero_end =
+            u32::try_from(zero_range.end).context("terminal zero-fill end exceeds u32")?;
+        ensure!(
+            zero_start <= zero_end,
+            "terminal zero-fill range is inverted"
+        );
+        let next_destination =
+            destination_ranges.partition_point(|destination| destination.end <= zero_start);
+        if let Some(destination) = destination_ranges.get(next_destination) {
+            ensure!(
+                zero_end <= destination.start,
+                "terminal zero-fill range {zero_start:#x}..{zero_end:#x} overlaps authenticated payload destination {:#x}..{:#x}",
+                destination.start,
+                destination.end,
+            );
+        }
     }
     Ok(())
 }
@@ -383,9 +533,13 @@ fn nested_replay_byte_maps<'a>(
 }
 
 const NESTED_REPLAY_PREFIX_BYTES: usize = 4;
+
 const MIN_PARALLEL_NESTED_KEYS: usize = 4_096;
+
 const MIN_NESTED_KEYS_PER_WORKER: usize = 1_024;
+
 const MAX_PARALLEL_NESTED_BYTES: usize = 256 << 20;
+
 const MAX_LOCAL_NESTED_OUTPUTS: usize = MAX_NESTED_REPLAY_OUTPUTS * 2 + 1;
 
 struct NestedReplayCandidate {
@@ -854,30 +1008,74 @@ mod nested_replay_parallel_tests {
     }
 }
 
-struct DecryptionNestedReplayer<'a> {
-    payload_source: &'a [u8],
-    source_file_range: Range<usize>,
-    decoders: &'a [DecoderCandidate],
-    contexts: Vec<PreparedAesContext>,
-    extended_profile: bool,
-    exhaustive_rotations: bool,
-    cancellation: Option<&'a CancellationToken>,
+#[cfg(test)]
+mod terminal_zero_range_tests {
+    use super::*;
+
+    fn block_table() -> PayloadBlockTable {
+        PayloadBlockTable {
+            stream_base: 0,
+            blocks: vec![PayloadBlock {
+                source_offset: 0,
+                encoded_length: 16,
+                destination_rva: 0x100,
+                destination_length: 0x20,
+            }],
+        }
+    }
+
+    #[test]
+    fn terminal_zero_range_rejects_authenticated_destination_overlap() {
+        let zero_range = 0x110..0x130;
+        assert!(
+            ensure_terminal_zero_ranges_are_disjoint_from_payload_destinations(
+                std::slice::from_ref(&zero_range),
+                &block_table(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_zero_range_accepts_adjacent_authenticated_destination() {
+        let zero_range = 0x120..0x140;
+        assert!(
+            ensure_terminal_zero_ranges_are_disjoint_from_payload_destinations(
+                std::slice::from_ref(&zero_range),
+                &block_table(),
+            )
+            .is_ok()
+        );
+    }
+}
+
+pub(super) struct DecryptionNestedReplayer<'a> {
+    pub(super) payload_source: &'a [u8],
+    pub(super) source_file_range: Range<usize>,
+    pub(super) decoders: &'a [DecoderCandidate],
+    pub(super) contexts: Vec<PreparedAesContext>,
+    pub(super) fixed_contexts: bool,
+    pub(super) extended_profile: bool,
+    pub(super) exhaustive_rotations: bool,
+    pub(super) cancellation: Option<&'a CancellationToken>,
 }
 
 impl NestedRecordReplayer for DecryptionNestedReplayer<'_> {
     fn begin_graph(&mut self, extended_profile: bool, exhaustive_rotations: bool) -> Result<()> {
         self.extended_profile = extended_profile;
         self.exhaustive_rotations = exhaustive_rotations;
-        let contexts = if let Some(cancellation) = self.cancellation {
-            scan_aes_contexts_in_range_with_cancellation(
-                self.payload_source,
-                self.source_file_range.clone(),
-                cancellation,
-            )?
-        } else {
-            scan_aes_contexts_in_range(self.payload_source, self.source_file_range.clone())?
-        };
-        self.contexts = contexts.into_iter().map(PreparedAesContext::new).collect();
+        if !self.fixed_contexts {
+            let contexts = if let Some(cancellation) = self.cancellation {
+                scan_aes_contexts_in_range_with_cancellation(
+                    self.payload_source,
+                    self.source_file_range.clone(),
+                    cancellation,
+                )?
+            } else {
+                scan_aes_contexts_in_range(self.payload_source, self.source_file_range.clone())?
+            };
+            self.contexts = contexts.into_iter().map(PreparedAesContext::new).collect();
+        }
         for (context_index, context) in self.contexts.iter().enumerate() {
             debug!(
                 context_index,
@@ -949,45 +1147,6 @@ pub(super) fn transform_payload_block_into(
         .context("reserving payload block transform payload")?;
     payload.extend_from_slice(source);
     decryptor.decrypt_full_blocks_in_place(payload);
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn materialize_payload_blocks(
-    packed: &[u8],
-    stream_base: usize,
-    mapped: &mut [u8],
-    blocks: &[PayloadBlock],
-    decryptor: &Aes256CbcDecryptor,
-    decoder_table: &[u8],
-    post_transform: &PayloadPostTransform,
-    cancellation: Option<&CancellationToken>,
-) -> Result<()> {
-    let mut payload = Vec::new();
-    for block in blocks {
-        if let Some(cancellation) = cancellation {
-            cancellation.checkpoint()?;
-        }
-        transform_payload_block_into(&mut payload, packed, stream_base, block, decryptor)?;
-        post_transform.apply(&mut payload);
-        let destination_end = block
-            .destination_rva
-            .checked_add(block.destination_length)
-            .context("validated payload-block destination end overflows")?;
-        ensure!(
-            destination_end <= mapped.len(),
-            "validated payload-block destination range disappeared"
-        );
-        let (before, destination_and_after) = mapped.split_at_mut(block.destination_rva);
-        let destination = &mut destination_and_after[..block.destination_length];
-        if block.encoded_length == block.destination_length {
-            destination.copy_from_slice(&payload);
-        } else {
-            let history = &before[before.len().saturating_sub(4)..];
-            decode_custom_stream_with_history(decoder_table, &payload, history, destination)
-                .context("authenticated custom decoder no longer materializes")?;
-        }
-    }
     Ok(())
 }
 
@@ -1165,131 +1324,103 @@ fn candidate_replay_worker_count(candidate_count: usize, scratch_bytes: usize) -
         .max(1)
 }
 
-pub(super) fn authenticate_payload_plan_candidates(
+fn replay_payload_plan_candidate(
     packed: &[u8],
     mapped: &[u8],
     block_table: &PayloadBlockTable,
-    candidates: Vec<PayloadPlanCandidate>,
+    candidate: PayloadPlanCandidate,
+    cancellation: Option<&CancellationToken>,
+) -> Result<std::result::Result<AuthenticatedPayloadPlan, CustomDecoderRejection>> {
+    let PayloadPlanCandidate {
+        plan,
+        selected_chain,
+    } = candidate;
+    ensure!(
+        plan.block_table == *block_table,
+        "payload-plan candidate block table diverges from provider table"
+    );
+    let decryptor = Aes256CbcDecryptor::new(&plan.aes_key);
+    let mut replay = mapped.to_vec();
+    let mut payload = Vec::new();
+    let mut budget = ReplayBudget::default();
+    match chain_replays(
+        packed,
+        plan.block_table.stream_base,
+        &mut replay,
+        &plan.block_table.blocks,
+        &decryptor,
+        &plan.decoder.table,
+        &mut budget,
+        &plan.post_transform,
+        &mut payload,
+        cancellation,
+    )? {
+        None => Ok(Ok(AuthenticatedPayloadPlan {
+            plan,
+            selected_chain,
+            image: replay,
+        })),
+        Some(rejection) => Ok(Err(rejection)),
+    }
+}
+
+pub(super) fn authenticate_payload_plan(
+    packed: &[u8],
+    mapped: &[u8],
+    block_table: &PayloadBlockTable,
+    candidate: PayloadPlanCandidate,
     cancellation: Option<&CancellationToken>,
 ) -> Result<AuthenticatedPayloadPlan> {
-    ensure!(
-        !candidates.is_empty(),
-        "payload-plan provider produced no candidates"
-    );
     ensure_decryption_work_bound(&block_table.blocks)?;
-    ensure_aggregate_replay_work_bound(&block_table.blocks, candidates.len())?;
-
-    let mut selected = None;
-    let mut rejections = Vec::new();
-    for (index, candidate) in candidates.into_iter().enumerate() {
-        ensure!(
-            candidate.plan.block_table == *block_table,
-            "payload-plan candidate block table diverges from provider table"
-        );
-        let decryptor = Aes256CbcDecryptor::new(&candidate.plan.aes_key);
-        let mut replay = mapped.to_vec();
-        let mut payload = Vec::new();
-        let mut budget = ReplayBudget::default();
-        match chain_replays(
-            packed,
-            candidate.plan.block_table.stream_base,
-            &mut replay,
-            &candidate.plan.block_table.blocks,
-            &decryptor,
-            &candidate.plan.decoder.table,
-            &mut budget,
-            &candidate.plan.post_transform,
-            &mut payload,
-            cancellation,
-        )? {
-            None => {
-                ensure!(
-                    selected.is_none(),
-                    "multiple payload plans replay every block"
-                );
-                selected = Some(AuthenticatedPayloadPlan {
-                    plan: candidate.plan,
-                    selected_chain: candidate.selected_chain,
-                });
-            }
-            Some(rejection) => {
-                debug!(
-                    candidate_index = index,
-                    block_index = rejection.record_index,
-                    reason = %rejection.error,
-                    "payload-plan candidate rejected"
-                );
-                if rejections.len() < 8 {
-                    rejections.push(format!(
-                        "candidate {index}, block {}: {}",
-                        rejection.record_index, rejection.error
-                    ));
-                }
-            }
+    match replay_payload_plan_candidate(packed, mapped, block_table, candidate, cancellation)? {
+        Ok(authenticated) => Ok(authenticated),
+        Err(rejection) => Err(PayloadPlanAuthenticationError::NoCandidate {
+            diagnostics: vec![format!(
+                "block {}: {}",
+                rejection.record_index, rejection.error
+            )],
         }
+        .into()),
     }
-    selected.with_context(|| {
-        format!(
-            "no payload plan replays every block ({})",
-            rejections.join("; ")
-        )
-    })
 }
+
+pub(super) struct PayloadPlanSelectionInput<'a> {
+    pub(super) packed: &'a [u8],
+    pub(super) source_file_range: Range<usize>,
+    pub(super) stream_base: usize,
+    pub(super) mapped: &'a [u8],
+    pub(super) records: &'a [PayloadBlock],
+    pub(super) post_transforms: &'a [PayloadPostTransform],
+}
+
 pub(super) fn select_payload_plan(
-    packed: &[u8],
-    source_file_range: Range<usize>,
-    stream_base: usize,
-    mapped: &[u8],
-    records: &[PayloadBlock],
+    input: PayloadPlanSelectionInput<'_>,
     decoder_candidates: Vec<DecoderCandidate>,
-    post_transforms: &[PayloadPostTransform],
-) -> Result<(PayloadMaterializationPlan, DecryptionDetails)> {
-    select_payload_plan_impl(
-        packed,
-        source_file_range,
-        stream_base,
-        mapped,
-        records,
-        decoder_candidates,
-        post_transforms,
-        None,
-    )
+) -> Result<(AuthenticatedPayloadPlan, DecryptionDetails)> {
+    select_payload_plan_impl(input, decoder_candidates, None)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn select_payload_plan_with_cancellation(
-    packed: &[u8],
-    source_file_range: Range<usize>,
-    stream_base: usize,
-    mapped: &[u8],
-    records: &[PayloadBlock],
+pub(super) fn select_payload_plan_with_cancellation(
+    input: PayloadPlanSelectionInput<'_>,
     decoder_candidates: Vec<DecoderCandidate>,
-    post_transforms: &[PayloadPostTransform],
     cancellation: &CancellationToken,
-) -> Result<(PayloadMaterializationPlan, DecryptionDetails)> {
-    select_payload_plan_impl(
+) -> Result<(AuthenticatedPayloadPlan, DecryptionDetails)> {
+    select_payload_plan_impl(input, decoder_candidates, Some(cancellation))
+}
+
+fn select_payload_plan_impl(
+    input: PayloadPlanSelectionInput<'_>,
+    decoder_candidates: Vec<DecoderCandidate>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(AuthenticatedPayloadPlan, DecryptionDetails)> {
+    let PayloadPlanSelectionInput {
         packed,
         source_file_range,
         stream_base,
         mapped,
         records,
-        decoder_candidates,
         post_transforms,
-        Some(cancellation),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn select_payload_plan_impl(
-    packed: &[u8],
-    source_file_range: Range<usize>,
-    stream_base: usize,
-    mapped: &[u8],
-    records: &[PayloadBlock],
-    decoder_candidates: Vec<DecoderCandidate>,
-    post_transforms: &[PayloadPostTransform],
-    cancellation: Option<&CancellationToken>,
-) -> Result<(PayloadMaterializationPlan, DecryptionDetails)> {
+    } = input;
     ensure!(
         records
             .iter()
@@ -1365,7 +1496,7 @@ fn select_payload_plan_impl(
         "prefix-viable replay candidate count exceeds its bounded product"
     );
     if candidates.is_empty() {
-        return Err(PayloadPlanSelectionError { decryption_details }.into());
+        return Err(PayloadPlanSelectionError::no_authenticated_chain(decryption_details).into());
     }
 
     let scratch_bytes = mapped
@@ -1442,11 +1573,16 @@ fn select_payload_plan_impl(
                     break;
                 }
             }
+            (results, scratch)
+        })
+        .collect::<Vec<_>>();
+    let mut scratches = Vec::with_capacity(candidate_results.len());
+    let mut candidate_results = candidate_results
+        .drain(..)
+        .flat_map(|(results, scratch)| {
+            scratches.push(scratch);
             results
         })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .flatten()
         .collect::<Vec<_>>();
     if let Some(cancellation) = cancellation {
         cancellation.checkpoint()?;
@@ -1503,13 +1639,32 @@ fn select_payload_plan_impl(
         "multiple AES-context, post-transform, and decoder-precursor chains replay every payload block"
     );
     let Some(selected) = selected else {
-        return Err(PayloadPlanSelectionError { decryption_details }.into());
+        return Err(PayloadPlanSelectionError::no_authenticated_chain(decryption_details).into());
     };
     let context = &contexts[selected.context_index];
     let decoder = &decoder_candidates[selected.decoder_index];
     let post_transform = &post_transforms[selected.transform_index];
+    let mut image = mapped.to_vec();
+    let mut payload = Vec::new();
+    let mut replay_budget = ReplayBudget::default();
+    ensure!(
+        chain_replays(
+            packed,
+            stream_base,
+            &mut image,
+            records,
+            &context.decryptor,
+            &decoder.table,
+            &mut replay_budget,
+            post_transform,
+            &mut payload,
+            cancellation,
+        )?
+        .is_none(),
+        "selected decryption chain no longer authenticates during materialization"
+    );
     let byte_map = post_transform.mapping();
-    decryption_details.selected_chain = Some(SelectedDecryptionChain {
+    let selected_chain = SelectedDecryptionChain {
         aes: SelectedAesContext {
             file_offset: context.evidence.file_offset,
             seed: context.evidence.seed,
@@ -1522,218 +1677,25 @@ fn select_payload_plan_impl(
         },
         byte_transform: post_transform.profile(),
         byte_map: byte_map.to_vec(),
-    });
-    let selected_chain = decryption_details
-        .selected_chain
-        .clone()
-        .expect("selected evidence-search chain has telemetry");
+    };
+    decryption_details.selected_chain = Some(selected_chain.clone());
     let block_table = PayloadBlockTable {
         stream_base,
         blocks: records.to_vec(),
     };
-    let authenticated = authenticate_payload_plan_candidates(
-        packed,
-        mapped,
-        &block_table,
-        vec![PayloadPlanCandidate::with_selected_chain(
-            PayloadMaterializationPlan {
-                block_table: block_table.clone(),
+    Ok((
+        AuthenticatedPayloadPlan {
+            plan: PayloadMaterializationPlan {
+                block_table,
                 aes_key: context.evidence.raw_key,
                 decoder: decoder.clone(),
                 post_transform: post_transform.clone(),
             },
-            selected_chain,
-        )],
-        cancellation,
-    )?;
-    decryption_details.selected_chain = authenticated.selected_chain;
-    Ok((authenticated.plan, decryption_details))
-}
-pub(super) fn materialize_payload_plan(
-    packed: &[u8],
-    mapped: &mut [u8],
-    plan: &PayloadMaterializationPlan,
-    cancellation: Option<&CancellationToken>,
-) -> Result<()> {
-    let decryptor = Aes256CbcDecryptor::new(&plan.aes_key);
-    materialize_payload_blocks(
-        packed,
-        plan.block_table.stream_base,
-        mapped,
-        &plan.block_table.blocks,
-        &decryptor,
-        &plan.decoder.table,
-        &plan.post_transform,
-        cancellation,
-    )
-}
-
-pub(super) fn recover_evidence_search_payload(
-    source: &BoundPayloadSource<'_>,
-    cancellation: Option<&CancellationToken>,
-) -> Result<DecryptedImage> {
-    if let Some(cancellation) = cancellation {
-        cancellation.checkpoint()?;
-    }
-    let packed = source.packed;
-    let pe = source.pe;
-    let payload_source = source.payload_source;
-    let bootstrap = source.bootstrap;
-    let source_security_range = source.source_security_range;
-    let source_file_range = source.source_file_range.clone();
-    let source_start = source.source_start;
-    let source_length = source_file_range.len();
-    let stream_base = source.stream.base_file_offset;
-    let outer = source.outer.as_slice();
-
-    let mut mapped = pe.map_image(packed).context("mapping packed PE image")?;
-    let outer_start = usize::try_from(bootstrap.destination_rva)
-        .context("bootstrap destination RVA does not fit host address space")?;
-    let outer_end = outer_start
-        .checked_add(outer.len())
-        .context("bootstrap destination range overflows")?;
-    mapped
-        .get_mut(outer_start..outer_end)
-        .context("bootstrap destination range exceeds mapped image")?
-        .copy_from_slice(outer);
-    let records = if let Some(cancellation) = cancellation {
-        discover_payload_block_table_with_cancellation(
-            outer,
-            bootstrap,
-            stream_base,
-            payload_source.len(),
-            mapped.len(),
-            source_security_range,
-            cancellation,
-        )?
-    } else {
-        discover_payload_block_table(
-            outer,
-            bootstrap,
-            stream_base,
-            payload_source.len(),
-            mapped.len(),
-            source_security_range,
-        )?
-    };
-    let first_block = records
-        .blocks
-        .first()
-        .expect("selected payload-block table is nonempty");
-    debug!(
-        stream_base,
-        first_source_offset = first_block.source_offset,
-        first_encoded_length = first_block.encoded_length,
-        max_source_end = records
-            .blocks
-            .iter()
-            .map(|block| block.source_offset + block.encoded_length)
-            .max()
-            .expect("selected payload-block table is nonempty"),
-        "diagnostic payload-block source geometry"
-    );
-    let mut destination_record_ranges = records
-        .blocks
-        .iter()
-        .map(payload_block_destination_range)
-        .collect::<Result<Vec<_>>>()?;
-    destination_record_ranges.sort_unstable_by_key(|range| range.start);
-    let destination_ranges = merged_payload_block_destination_ranges(&records.blocks)?;
-    let decoder_candidates = if let Some(cancellation) = cancellation {
-        discover_decoder_candidates_with_cancellation(
-            source_start,
-            payload_source,
-            source_length,
-            cancellation,
-        )?
-    } else {
-        discover_decoder_candidates(source_start, payload_source, source_length)?
-    };
-    let nested_replayer = DecryptionNestedReplayer {
-        payload_source,
-        source_file_range: source_file_range.clone(),
-        decoders: &decoder_candidates,
-        contexts: Vec::new(),
-        extended_profile: false,
-        exhaustive_rotations: false,
-        cancellation,
-    };
-    if let Some(cancellation) = cancellation {
-        cancellation.checkpoint()?;
-    }
-    let mut post_transforms =
-        discover_nested_byte_maps(&mapped, pe, bootstrap, outer, nested_replayer)?
-            .into_iter()
-            .map(PayloadPostTransform::ByteMap)
-            .collect::<Vec<_>>();
-    if let Some(cancellation) = cancellation {
-        cancellation.checkpoint()?;
-    }
-    post_transforms.push(PayloadPostTransform::F8);
-    if pe.machine_kind() == Machine::Amd64 {
-        post_transforms.push(PayloadPostTransform::None);
-    }
-    let mut unique_mappings = Vec::<[u8; 256]>::new();
-    post_transforms.retain(|transform| {
-        let mapping = transform.mapping();
-        if unique_mappings.contains(&mapping) {
-            false
-        } else {
-            unique_mappings.push(mapping);
-            true
-        }
-    });
-    let transform_count = post_transforms.len();
-    let decoder_count = decoder_candidates.len();
-    let (plan, decryption_details) = if let Some(cancellation) = cancellation {
-        select_payload_plan_with_cancellation(
-            payload_source,
-            source_file_range,
-            stream_base,
-            &mapped,
-            &records.blocks,
-            decoder_candidates,
-            &post_transforms,
-            cancellation,
-        )
-    } else {
-        select_payload_plan(
-            payload_source,
-            source_file_range,
-            stream_base,
-            &mapped,
-            &records.blocks,
-            decoder_candidates,
-            &post_transforms,
-        )
-    }
-    .with_context(|| {
-        format!(
-            "selecting from {transform_count} payload transforms and {decoder_count} decoder precursors"
-        )
-    })?;
-    materialize_payload_plan(payload_source, &mut mapped, &plan, cancellation)?;
-    for metadata_offset in [32usize, 64] {
-        let start = outer_start + metadata_offset;
-        let end = start + 144;
-        let mut metadata = mapped[start..end].to_vec();
-        super::records::f710_record_transform(&mut metadata, start as u32);
-        let words = metadata[..32]
-            .chunks_exact(4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("metadata dword")))
-            .collect::<Vec<_>>();
-        debug!(
-            metadata_offset,
-            ?words,
-            "diagnostic decoded CrackProof metadata"
-        );
-    }
-    Ok(DecryptedImage {
-        destination_record_ranges,
-        image: mapped,
-        destination_ranges,
+            selected_chain: Some(selected_chain),
+            image,
+        },
         decryption_details,
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -1759,14 +1721,17 @@ pub(super) fn decrypt_bootstrap_into(
     )?;
     merged_payload_block_destination_ranges(&records.blocks)?;
     let decoder_candidates = discover_decoder_candidates(source_start, packed, source_length)?;
-    let (plan, _) = select_payload_plan(
-        packed,
-        source_file_range,
-        stream_base,
-        mapped,
-        &records.blocks,
+    let (authenticated, _) = select_payload_plan(
+        PayloadPlanSelectionInput {
+            packed,
+            source_file_range,
+            stream_base,
+            mapped,
+            records: &records.blocks,
+            post_transforms: &[PayloadPostTransform::F8],
+        },
         decoder_candidates,
-        &[PayloadPostTransform::F8],
     )?;
-    materialize_payload_plan(packed, mapped, &plan, None)
+    mapped.copy_from_slice(&authenticated.image);
+    Ok(())
 }

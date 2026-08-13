@@ -7,7 +7,9 @@ use crate::pe::Pe;
 use crate::pipeline::cancellation::CancellationToken;
 use crate::pipeline::progress::ProgressMilestones;
 
-use crate::pipeline::stages::detect::{FamilyEvidence, KonnDescriptor};
+use crate::pipeline::stages::detect::{
+    FamilyEvidence, KonnDescriptor, KonnDescriptorSelectionError,
+};
 
 pub(crate) const KONN_MAGIC: u32 = u32::from_le_bytes(*b"KONN");
 pub(crate) const KONN_WORD_COUNT: usize = 8;
@@ -362,11 +364,12 @@ pub(crate) fn scan_konn_descriptors(packed: &[u8], pe: &Pe) -> Result<Vec<KonnDe
 /// Decryption supplies the independent proof by uniquely replaying an
 /// AES context and custom decoder against the complete payload-block chain.
 pub(crate) fn combine_family_evidence(descriptors: Vec<KonnDescriptor>) -> Result<FamilyEvidence> {
-    ensure!(
-        descriptors.len() == 1,
-        "expected exactly one valid KONN descriptor, found {}",
-        descriptors.len()
-    );
+    if descriptors.len() != 1 {
+        return Err(KonnDescriptorSelectionError {
+            found: descriptors.len(),
+        }
+        .into());
+    }
     Ok(FamilyEvidence {
         descriptor: descriptors.into_iter().next().expect("one descriptor"),
     })

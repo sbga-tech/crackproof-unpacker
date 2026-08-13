@@ -1,16 +1,25 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Result;
+
+use anyhow::{Context, bail, ensure};
 
 use super::records::{f2a0_byte, f2a0_transform_from_dl};
 
 pub(super) const CUSTOM_DECODER_NODE_SIZE: usize = 3;
+
 use crate::pipeline::cancellation::CancellationToken;
 pub(super) const CUSTOM_DECODER_ROOT_NODES: usize = 256;
 pub(super) const CUSTOM_DECODER_MAX_CODE_BITS: usize = 24;
+
 const MAX_DECODER_PRECURSOR_CANDIDATES: usize = 1 << 28;
+
 const MAX_DECODER_TABLE_NODES: usize = 65_536;
+
 const MAX_STRUCTURAL_DECODER_CANDIDATES: usize = 64;
+
 const DECODER_CHEAP_ROOT_PREFILTER: usize = 16;
+
 const MAX_DECODER_FULL_VALIDATION_ATTEMPTS: usize = 65_536;
+
 const MAX_DECODER_VALIDATION_NODE_WORK: usize = 8 << 20;
 
 #[derive(Clone, Debug)]
@@ -160,9 +169,6 @@ pub enum CustomDecodeError {
     SourceExhausted {
         bit_offset: usize,
     },
-    PendingOverflow {
-        pending: usize,
-    },
     PendingPrefix {
         pending: usize,
     },
@@ -206,10 +212,6 @@ impl std::fmt::Display for CustomDecodeError {
             Self::SourceExhausted { bit_offset } => {
                 write!(formatter, "decoder source is exhausted at bit {bit_offset}")
             }
-            Self::PendingOverflow { pending } => write!(
-                formatter,
-                "decoder pending integer {pending:#x} cannot accept another byte"
-            ),
             Self::PendingPrefix { pending } => write!(
                 formatter,
                 "decoder completed with unconsumed pending prefix {pending:#x}"
@@ -398,9 +400,16 @@ pub(crate) fn custom_decoder_prefix_is_viable(
         0 => true,
         0x100 => argument != 0 || allow_zero_width_controls,
         0x200 => {
-            matches!(argument, 1 | 2 | 4) && argument <= destination_len && argument <= history_len
+            matches!(argument, 0 | 1 | 2 | 4)
+                && (argument != 0 || allow_zero_width_controls)
+                && argument <= destination_len
+                && argument <= history_len
         }
-        0x300 => argument == 0 && allow_zero_width_controls,
+        0x300 => {
+            (argument != 0 || allow_zero_width_controls)
+                && argument <= destination_len
+                && argument <= history_len
+        }
         _ => unreachable!("token class is masked to two bits"),
     }
 }
@@ -465,7 +474,7 @@ pub(super) fn decode_custom_stream_with_history_source_mode(
                     return Err(CustomDecodeError::InvalidRepeatWidth { width: argument });
                 }
                 if pending >= 0x100 {
-                    return Err(CustomDecodeError::PendingOverflow { pending });
+                    return Err(CustomDecodeError::PendingPrefix { pending });
                 }
                 pending = if pending == 0 {
                     argument
@@ -532,14 +541,22 @@ pub(super) fn decode_custom_stream_with_history_source_mode(
                 let distance = gap
                     .checked_add(length)
                     .ok_or(CustomDecodeError::ArithmeticOverflow)?;
-                if distance > written {
+                let history_needed = distance.saturating_sub(written);
+                if history_needed > history.len() {
                     return Err(CustomDecodeError::HistoryUnderflow {
                         required: distance,
-                        written,
+                        written: written
+                            .checked_add(history.len())
+                            .ok_or(CustomDecodeError::ArithmeticOverflow)?,
                     });
                 }
-                let start = written - distance;
-                destination.copy_within(start..start + length, written);
+                for index in 0..length {
+                    destination[written + index] = if index < history_needed {
+                        history[history.len() - history_needed + index]
+                    } else {
+                        destination[written + index - distance]
+                    };
+                }
                 written += length;
             }
             _ => unreachable!("token class is masked to two bits"),
@@ -549,7 +566,6 @@ pub(super) fn decode_custom_stream_with_history_source_mode(
     if pending != 0 {
         return Err(CustomDecodeError::PendingPrefix { pending });
     }
-
     let consumed_bytes = source_bits / 8 + usize::from(!source_bits.is_multiple_of(8));
     if consumed_bytes != source.len() {
         return Err(CustomDecodeError::SourceLengthMismatch {

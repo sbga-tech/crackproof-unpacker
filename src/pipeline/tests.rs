@@ -7,10 +7,10 @@ use crate::pipeline::stages::detect::{
     MAX_KONN_SCAN_BODY_BYTES, combine_family_evidence, decode_konn_words, detect_family,
     encode_konn_words, ensure_konn_scan_body_bound, reserve_konn_candidate, scan_konn_descriptors,
 };
-
 #[derive(Default)]
 struct RecordingObserver {
     events: Vec<&'static str>,
+    stages: Vec<Stage>,
     terminal_events: usize,
     failure_had_input_artifact: bool,
 }
@@ -19,7 +19,10 @@ impl Observer for RecordingObserver {
     fn observe(&mut self, event: StateEvent<'_>) -> std::io::Result<()> {
         let kind = match event {
             StateEvent::RunStarted => "run_started",
-            StateEvent::StageStarted { .. } => "stage_started",
+            StateEvent::StageStarted { stage } => {
+                self.stages.push(stage);
+                "stage_started"
+            }
             StateEvent::OperationStarted { .. } => "operation_started",
             StateEvent::Progress { .. } => "progress",
             StateEvent::OperationCompleted { .. } => "operation_completed",
@@ -36,6 +39,26 @@ impl Observer for RecordingObserver {
         };
         self.events.push(kind);
         Ok(())
+    }
+}
+
+struct CancelOnDetectionProgress<'a> {
+    recording: RecordingObserver,
+    cancellation: &'a CancellationToken,
+}
+
+impl Observer for CancelOnDetectionProgress<'_> {
+    fn observe(&mut self, event: StateEvent<'_>) -> std::io::Result<()> {
+        if matches!(
+            &event,
+            StateEvent::Progress {
+                stage: Stage::ProtectorDetection,
+                ..
+            }
+        ) {
+            self.cancellation.cancel();
+        }
+        self.recording.observe(event)
     }
 }
 
@@ -104,7 +127,82 @@ fn invalid_pe_fails_at_the_typed_input_boundary() {
 }
 
 #[test]
-fn reconstructs_polymorphic_pe32_staged_controller_fixture() {
+fn typed_route_cancellation_is_reported_as_cancelled() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("cancelled.exe");
+    std::fs::write(&input, include_bytes!("../../packed/sddt160/chiffre.dll")).unwrap();
+    let request = PipelineRequest {
+        input,
+        output: None,
+        dry_run: true,
+        hash_artifacts: true,
+    };
+    let mut observer = RecordingObserver::default();
+    let cancellation = CancellationToken::default();
+    cancellation.cancel();
+
+    let failure = Pipeline::new(&mut observer, &cancellation)
+        .run(&request)
+        .unwrap_err();
+
+    assert_eq!(failure.failure.reason, FailureReason::Cancelled);
+}
+
+#[test]
+fn pipeline_falls_back_to_evidence_search_after_all_controllers_reject() {
+    let input =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packed/SDGT30100/IndRun.dll");
+    let request = PipelineRequest {
+        input,
+        output: None,
+        dry_run: true,
+        hash_artifacts: true,
+    };
+    let mut observer = RecordingObserver::default();
+    let cancellation = CancellationToken::default();
+
+    let output = Pipeline::new(&mut observer, &cancellation)
+        .run(&request)
+        .unwrap();
+    let decryption = output.summary.decryption.as_ref().unwrap();
+
+    assert_eq!(
+        decryption.plan_provenance,
+        Some(crate::pipeline::outcome::PayloadPlanProvenance::EvidenceSearch)
+    );
+    assert!(decryption.selected_controller.is_none());
+    assert_eq!(decryption.provider_attempts.len(), 10);
+    assert!(decryption.provider_attempts[..9].iter().all(|attempt| {
+        attempt.provenance == crate::pipeline::outcome::PayloadPlanProvenance::Controller
+            && attempt.outcome
+                != crate::pipeline::outcome::PayloadProviderAttemptOutcome::Authenticated
+    }));
+    let evidence_attempt = decryption.provider_attempts.last().unwrap();
+    assert_eq!(
+        (
+            evidence_attempt.provenance,
+            evidence_attempt.controller,
+            evidence_attempt.stage,
+            evidence_attempt.outcome,
+        ),
+        (
+            crate::pipeline::outcome::PayloadPlanProvenance::EvidenceSearch,
+            None,
+            crate::pipeline::outcome::PayloadProviderStage::EvidenceSearch,
+            crate::pipeline::outcome::PayloadProviderAttemptOutcome::Authenticated,
+        )
+    );
+    let artifact = output.summary.output_artifact.as_ref().unwrap();
+    assert_eq!(artifact.size, 2_192_384);
+    assert_eq!(
+        artifact.sha256.as_deref(),
+        Some("3094f03d1a8a084d53d7f3aa490e540567b6ef396eb34ac9cc5be0a930ed72c2")
+    );
+    assert!(!artifact.written);
+}
+
+#[test]
+fn reconstructs_polymorphic_shell_directory_manifest_controller_fixture() {
     let input =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packed/maimai_SDEY_1.99.exe");
     let request = PipelineRequest {
@@ -129,26 +227,99 @@ fn reconstructs_polymorphic_pe32_staged_controller_fixture() {
     let decryption = summary.decryption.as_ref().unwrap();
     assert_eq!(
         decryption.plan_provenance,
-        Some(crate::pipeline::outcome::PayloadPlanProvenance::StagedController)
+        Some(crate::pipeline::outcome::PayloadPlanProvenance::Controller)
+    );
+    assert_eq!(
+        decryption.selected_stream,
+        Some(crate::pipeline::outcome::SelectedPayloadStream {
+            locator_file_offset: 4_224,
+            base_file_offset: 233_104,
+            gap_after_outer_source: 5_632,
+        })
+    );
+    let expected_controllers = [
+        crate::pipeline::outcome::ControllerKind::ShellDirectoryManifest,
+        crate::pipeline::outcome::ControllerKind::CodecRelocation,
+        crate::pipeline::outcome::ControllerKind::CodecControlPayload,
+        crate::pipeline::outcome::ControllerKind::StateAssetSelection,
+        crate::pipeline::outcome::ControllerKind::CodecOperationDispatch,
+        crate::pipeline::outcome::ControllerKind::ImageBaseMetadataBinding,
+        crate::pipeline::outcome::ControllerKind::CodecControlMetadata,
+        crate::pipeline::outcome::ControllerKind::PayloadChecksumManifest,
+        crate::pipeline::outcome::ControllerKind::TerminalProfileDispatch,
+    ];
+    assert!(
+        decryption
+            .provider_attempts
+            .iter()
+            .map(|attempt| attempt.controller)
+            .eq(expected_controllers.into_iter().map(Some)),
+        "provider attempts must cover the ordered controller registry"
+    );
+    let manifest_attempt = &decryption.provider_attempts[0];
+    assert_eq!(
+        manifest_attempt.provenance,
+        crate::pipeline::outcome::PayloadPlanProvenance::Controller
+    );
+    assert_eq!(
+        manifest_attempt.controller,
+        Some(crate::pipeline::outcome::ControllerKind::ShellDirectoryManifest)
+    );
+    assert_eq!(
+        manifest_attempt.outcome,
+        crate::pipeline::outcome::PayloadProviderAttemptOutcome::Authenticated
+    );
+    let descriptor_attempt = decryption
+        .provider_attempts
+        .iter()
+        .find(|attempt| {
+            attempt.controller == Some(crate::pipeline::outcome::ControllerKind::CodecRelocation)
+        })
+        .expect("descriptor controller attempt must be recorded");
+    assert_eq!(
+        descriptor_attempt.outcome,
+        crate::pipeline::outcome::PayloadProviderAttemptOutcome::NotApplicable
+    );
+    assert!(descriptor_attempt.diagnostic.is_none());
+    let decryption_json = serde_json::to_value(decryption).unwrap();
+    assert_eq!(decryption_json["plan_provenance"], "controller");
+    assert_eq!(
+        decryption_json["provider_attempts"][0]["controller"],
+        "shell_directory_manifest"
+    );
+    assert_eq!(
+        decryption_json["provider_attempts"][0]["outcome"],
+        "authenticated"
+    );
+    assert!(decryption_json.get("selected_staged_controller").is_none());
+    assert!(decryption.selected_chain.is_none());
+    assert!(
+        decryption_json["selected_controller"]["shell_directory_manifest"]
+            .get("manifest_import_table_rva")
+            .is_none()
     );
     assert_eq!(decryption.block_count, 2_264);
     assert_eq!(decryption.copied_block_count, 93);
-    let staged = decryption.selected_staged_controller.as_ref().unwrap();
+    let crate::pipeline::outcome::SelectedController::ShellDirectoryManifest(staged) =
+        decryption.selected_controller.as_ref().unwrap()
+    else {
+        panic!("expected PE32 payload-manifest controller evidence");
+    };
     assert_eq!(staged.shell_table_rva, 0x00c0_3790);
-    assert_eq!(staged.seven_stage_rva, 0x00c0_4f70);
-    assert_eq!(staged.eighth_stage_rva, 0x00c0_5ef8);
+    assert_eq!(staged.byte_map_layer_rva, 0x00c0_4f70);
+    assert_eq!(staged.payload_manifest_rva, 0x00c0_5ef8);
     assert_eq!(staged.file_decoder_rva, 0x00c3_8c00);
-    assert_eq!(staged.stage_decoder_rva, 0x00c3_9bbe);
+    assert_eq!(staged.layer_decoder_rva, 0x00c3_9bbe);
     assert_eq!(staged.file_aes_context_rva, 0x00c3_9aca);
-    assert_eq!(staged.stage_aes_context_rva, 0x00c3_a7be);
-    assert_eq!(staged.custom_program_offset, 0x0f00);
+    assert_eq!(staged.layer_aes_context_rva, 0x00c3_a7be);
+    assert_eq!(staged.custom_program_rva, 0x00c0_5e70);
     assert_eq!(staged.custom_program_length, 71);
     assert_eq!(staged.custom_byte_map.len(), 256);
     assert_eq!(
-        staged.stage_raw_key_hex,
+        staged.layer_raw_key_hex,
         "214aa5f2ed74c698a91f1b8f7506bcb53121d15bfdcb754eb9f29674459d2b1b"
     );
-    assert_eq!(staged.file_program_offset, 0x4de0);
+    assert_eq!(staged.file_program_rva, 0x00c0_acd8);
     assert_eq!(staged.file_program_length, 67);
     assert_eq!(
         staged.file_raw_key_hex,
@@ -190,7 +361,98 @@ fn reconstructs_polymorphic_pe32_staged_controller_fixture() {
 }
 
 #[test]
-fn staged_controller_prefilter_cannot_hide_authenticated_payload_blocks() {
+fn pe32plus_controller_preserves_managed_import_and_clr_state() {
+    let input =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packed/sddt160/Assembly-CSharp.dll");
+    let request = PipelineRequest {
+        input,
+        output: None,
+        dry_run: true,
+        hash_artifacts: true,
+    };
+    let mut observer = RecordingObserver::default();
+    let cancellation = CancellationToken::default();
+
+    let output = Pipeline::new(&mut observer, &cancellation)
+        .run(&request)
+        .unwrap();
+    let summary = &output.summary;
+    let decryption = summary.decryption.as_ref().unwrap();
+    assert_eq!(
+        decryption.plan_provenance,
+        Some(crate::pipeline::outcome::PayloadPlanProvenance::Controller)
+    );
+    let Some(crate::pipeline::outcome::SelectedController::CodecRelocation(controller)) =
+        decryption.selected_controller.as_ref()
+    else {
+        panic!("expected PE32+ DLL descriptor-payload controller evidence");
+    };
+    assert_eq!(controller.zero_record_count, 3);
+
+    let recovered = summary.recovered_program.as_ref().unwrap();
+    assert_eq!(
+        recovered.startup_kind,
+        crate::pipeline::outcome::StartupKind::ManagedDll
+    );
+    let imports = summary.imports.as_ref().unwrap();
+    assert_eq!(
+        imports.source,
+        crate::pipeline::outcome::ImportSource::PeImportTable
+    );
+    assert_eq!((imports.module_count, imports.function_count), (1, 6));
+    let artifact = summary.output_artifact.as_ref().unwrap();
+    assert_eq!(artifact.size, 5_945_856);
+    assert_eq!(
+        artifact.sha256.as_deref(),
+        Some("c840595c60c7c6eec09346df474c928aa2c594fa705033551ee9d775b64579a4")
+    );
+    assert!(!artifact.written);
+}
+
+#[test]
+fn terminal_profile_dispatch_preserves_managed_executable_imports() {
+    let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packed/am/sgxsegaboot.exe");
+    let request = PipelineRequest {
+        input,
+        output: None,
+        dry_run: true,
+        hash_artifacts: true,
+    };
+    let mut observer = RecordingObserver::default();
+    let cancellation = CancellationToken::default();
+
+    let output = Pipeline::new(&mut observer, &cancellation)
+        .run(&request)
+        .unwrap();
+    let summary = &output.summary;
+    assert!(matches!(
+        summary
+            .decryption
+            .as_ref()
+            .and_then(|details| details.selected_controller.as_ref()),
+        Some(crate::pipeline::outcome::SelectedController::TerminalProfileDispatch(_))
+    ));
+    assert_eq!(
+        summary.recovered_program.as_ref().unwrap().startup_kind,
+        crate::pipeline::outcome::StartupKind::ManagedExe
+    );
+    let imports = summary.imports.as_ref().unwrap();
+    assert_eq!(
+        imports.source,
+        crate::pipeline::outcome::ImportSource::PeImportTable
+    );
+    assert_eq!((imports.module_count, imports.function_count), (3, 8));
+    let artifact = summary.output_artifact.as_ref().unwrap();
+    assert_eq!(artifact.size, 981_504);
+    assert_eq!(
+        artifact.sha256.as_deref(),
+        Some("f3d5930438b2f41797b251a296bb8fd7bc7b8de7d66e595776d0dcd244184c40")
+    );
+    assert!(!artifact.written);
+}
+
+#[test]
+fn codec_operation_dispatch_controller_recovers_chusan_with_typed_telemetry() {
     let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packed/chusanApp_2.25.exe");
     let request = PipelineRequest {
         input,
@@ -214,16 +476,43 @@ fn staged_controller_prefilter_cannot_hide_authenticated_payload_blocks() {
     let decryption = summary.decryption.as_ref().unwrap();
     assert_eq!(
         decryption.plan_provenance,
-        Some(crate::pipeline::outcome::PayloadPlanProvenance::EvidenceSearch)
+        Some(crate::pipeline::outcome::PayloadPlanProvenance::Controller)
     );
+    assert!(decryption.selected_stream.is_some());
+    assert!(decryption.provider_attempts.iter().all(|attempt| {
+        attempt.provenance == crate::pipeline::outcome::PayloadPlanProvenance::Controller
+    }));
+    assert!(decryption.provider_attempts.iter().any(|attempt| {
+        attempt.controller == Some(crate::pipeline::outcome::ControllerKind::CodecOperationDispatch)
+            && attempt.outcome
+                == crate::pipeline::outcome::PayloadProviderAttemptOutcome::Authenticated
+    }));
     assert_eq!(decryption.block_count, 7_485);
     assert_eq!(decryption.copied_block_count, 16);
     assert_eq!(decryption.decoded_block_count, 7_469);
-    assert_eq!(decryption.aes_key_candidates, 2);
-    assert_eq!(decryption.decoder_candidates, 2);
-    assert_eq!(decryption.byte_transform_candidates, 3);
-    assert!(decryption.selected_chain.is_some());
-    assert!(decryption.selected_staged_controller.is_none());
+    assert_eq!(decryption.aes_key_candidates, 1);
+    assert_eq!(decryption.decoder_candidates, 1);
+    assert_eq!(decryption.byte_transform_candidates, 1);
+    assert!(decryption.selected_chain.is_none());
+    let Some(crate::pipeline::outcome::SelectedController::CodecOperationDispatch(controller)) =
+        decryption.selected_controller.as_ref()
+    else {
+        panic!("expected native 54b7e623 rooted-controller evidence");
+    };
+    assert_eq!(controller.graph_nodes.len(), 11);
+    assert_eq!(controller.file_byte_map.len(), 256);
+    assert_eq!(
+        controller.layer_byte_map.as_deref().map(|map| map.len()),
+        Some(256)
+    );
+    assert_eq!(controller.file_raw_key_hex.len(), 64);
+    assert_eq!(
+        controller.layer_raw_key_hex.as_deref().map(str::len),
+        Some(64)
+    );
+    let decryption_json = serde_json::to_value(decryption).unwrap();
+    assert_eq!(decryption_json["plan_provenance"], "controller");
+    assert!(decryption_json["selected_controller"]["codec_operation_dispatch"].is_object());
 
     let recovered = summary.recovered_program.as_ref().unwrap();
     assert_eq!(recovered.startup_rva, 0x00a2_ce71);
@@ -282,14 +571,25 @@ fn dump_decrypted_image_for_analysis() {
     let packed = std::fs::read(&input).unwrap();
     let pe = Pe::parse(&packed).unwrap();
     let family = detect::detect_family(&packed, &pe).unwrap();
-    let mut bootstrap = bootstrap::PackedBootstrap::from(&family.descriptor);
+    let bootstrap = bootstrap::PackedBootstrap::from(&family.descriptor);
     let sidecar = std::fs::read(format!("{input}._")).ok();
-    let decrypted = if let Some(sidecar) = sidecar.as_deref() {
-        bootstrap.descriptor_file_offset = 0;
-        decrypt::decrypt_packed_image_from_source(&packed, &pe, sidecar, bootstrap, None).unwrap()
+    let payload_source = sidecar.as_deref().unwrap_or(&packed);
+    let security_range = pe.security_directory_file_range(packed.len()).unwrap();
+    let source = decrypt::bind_payload_source(
+        &packed,
+        &pe,
+        payload_source,
+        bootstrap,
+        security_range.as_ref(),
+        None,
+    )
+    .unwrap();
+    let policy = if std::env::var_os("CRACKPROOF_ANALYSIS_EVIDENCE_ONLY").is_some() {
+        decrypt::ProviderPolicy::EvidenceOnly
     } else {
-        decrypt::decrypt_packed_image(&packed, &pe, bootstrap).unwrap()
+        decrypt::ProviderPolicy::Automatic
     };
+    let decrypted = decrypt::recover_payload_with_policy(&source, None, policy).unwrap();
     std::fs::write(output, decrypted.image).unwrap();
 }
 
@@ -701,4 +1001,57 @@ fn descriptor_scan_caps_body_offsets_before_magic_prefilter() {
         error.to_string().contains("packed-body bytes"),
         "unexpected body-scan error: {error:#}"
     );
+}
+
+#[test]
+fn descriptor_detection_selects_one_structurally_valid_konn_record() {
+    let pe = synthetic_pe(0x3000);
+    let mut packed = vec![0; pe.file_len];
+    place_words(&mut packed, 0x20, encrypted_descriptor(0x3000));
+
+    let family = detect_family(&packed, &pe).expect("detect ordinary flat KONN fixture");
+    assert_eq!(family.descriptor.file_offset, 0x20);
+}
+
+#[test]
+fn input_identity_cannot_short_circuit_generic_detection() {
+    for relative in [
+        "SBWV_1.02.00/InitialD6_GLW_RE_SBWV.exe",
+        "SBWV_1.02.00/ServerBoxD6_RE_SBWV.exe",
+        "SBZZ20200/InitialD8_GLW_RE_SBZZ.exe",
+        "SBZZ20200/ServerBoxD8_RE_SBZZ.exe",
+        "SDGY10100/CX7000.Runtime.dll",
+    ] {
+        let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("packed")
+            .join(relative);
+        let request = PipelineRequest {
+            input,
+            output: None,
+            dry_run: true,
+            hash_artifacts: false,
+        };
+        let cancellation = CancellationToken::default();
+        let mut observer = CancelOnDetectionProgress {
+            recording: RecordingObserver::default(),
+            cancellation: &cancellation,
+        };
+
+        let failure = Pipeline::new(&mut observer, &cancellation)
+            .run(&request)
+            .expect_err("generic descriptor detection must observe cancellation");
+
+        assert_eq!(failure.failure.reason, FailureReason::Cancelled);
+        assert_eq!(failure.failure.stage, Some(Stage::ProtectorDetection));
+        assert!(failure.failure.partial_summary.protector.is_none());
+        assert!(failure.failure.partial_summary.decryption.is_none());
+        assert!(
+            observer
+                .recording
+                .stages
+                .contains(&Stage::ProtectorDetection),
+            "generic detector was not entered for {relative}"
+        );
+        assert!(!observer.recording.stages.contains(&Stage::PayloadRecovery));
+    }
 }
