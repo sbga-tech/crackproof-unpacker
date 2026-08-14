@@ -29,7 +29,7 @@ pub(crate) fn read_bounded(path: &Path, cancellation: &CancellationToken) -> Res
     bytes
         .try_reserve_exact(length)
         .with_context(|| format!("reserving {length} input bytes"))?;
-    let mut chunk = [0u8; READ_CHUNK_SIZE];
+    let mut chunk = vec![0u8; READ_CHUNK_SIZE];
     loop {
         cancellation.checkpoint()?;
         let read = file

@@ -23,6 +23,7 @@ serde_json = "1.0"
 
 [dev-dependencies]
 libmwemu = "0.25.3"
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Diagnostics_Debug"] }
 
 [profile.release]
 lto = "thin"
