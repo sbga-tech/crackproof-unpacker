@@ -107,7 +107,7 @@ impl<'a> Pipeline<'a> {
             Operation::ReadInput,
             |observer| {
                 info!(path = %request.input.display(), "reading packed input");
-                let packed = read::read_bounded(&request.input, cancellation)
+                let packed = read::read_bounded(&request.input)
                     .context("reading primary packed artifact")?;
                 emit_completed_progress(
                     observer,
@@ -230,7 +230,7 @@ impl<'a> Pipeline<'a> {
                     })?
                 {
                     info!(path = %discovered_sidecar_path.display(), "reading packed sidecar");
-                    let sidecar = read::read_bounded(&discovered_sidecar_path, cancellation)
+                    let sidecar = read::read_bounded(&discovered_sidecar_path)
                         .context("reading packer-selected sidecar artifact")?;
                     info!(path = %discovered_sidecar_path.display(), bytes = sidecar.len(), "read packed sidecar");
                     Some(sidecar)
@@ -643,14 +643,13 @@ impl<'a> Pipeline<'a> {
                     Some(path)
                 };
                 let output_hash = if let Some(path) = &output_path {
-                    info!(path = %path.display(), bytes = image.len(), "committing reconstructed output atomically");
-                    let hash = write::commit(
+                    info!(path = %path.display(), bytes = image.len(), "writing reconstructed output");
+                    let hash = write::write_output(
                         path,
                         &image,
-                        cancellation,
                         request.hash_artifacts,
                     )?;
-                    info!(path = %path.display(), bytes = image.len(), "committed reconstructed output");
+                    info!(path = %path.display(), bytes = image.len(), "wrote reconstructed output");
                     hash
                 } else if request.hash_artifacts {
                     Some(write::digest(&image))

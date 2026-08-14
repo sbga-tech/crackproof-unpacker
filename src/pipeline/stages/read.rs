@@ -6,15 +6,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 
-use crate::pipeline::cancellation::CancellationToken;
 use crate::pipeline::outcome::ArtifactSummary;
 
 pub(crate) const MAX_INPUT_SIZE: u64 = 512 << 20;
-const READ_CHUNK_SIZE: usize = 1 << 20;
 
-pub(crate) fn read_bounded(path: &Path, cancellation: &CancellationToken) -> Result<Vec<u8>> {
-    cancellation.checkpoint()?;
-    let mut file = File::open(path).with_context(|| format!("opening input {}", path.display()))?;
+pub(crate) fn read_bounded(path: &Path) -> Result<Vec<u8>> {
+    let file = File::open(path).with_context(|| format!("opening input {}", path.display()))?;
     let length = file
         .metadata()
         .with_context(|| format!("reading metadata for {}", path.display()))?
@@ -29,25 +26,12 @@ pub(crate) fn read_bounded(path: &Path, cancellation: &CancellationToken) -> Res
     bytes
         .try_reserve_exact(length)
         .with_context(|| format!("reserving {length} input bytes"))?;
-    let mut chunk = [0u8; READ_CHUNK_SIZE];
-    loop {
-        cancellation.checkpoint()?;
-        let read = file
-            .read(&mut chunk)
-            .with_context(|| format!("reading input {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        ensure!(
-            bytes.len().saturating_add(read) <= length,
-            "input {} grew while it was being read",
-            path.display()
-        );
-        bytes.extend_from_slice(&chunk[..read]);
-    }
+    file.take(MAX_INPUT_SIZE + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading input {}", path.display()))?;
     ensure!(
-        bytes.len() == length,
-        "input {} changed length while it was being read",
+        bytes.len() as u64 <= MAX_INPUT_SIZE,
+        "input {} exceeded the {MAX_INPUT_SIZE}-byte limit while being read",
         path.display()
     );
     Ok(bytes)

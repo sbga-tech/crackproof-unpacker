@@ -1,14 +1,8 @@
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
-
-use crate::pipeline::cancellation::CancellationToken;
-
-const WRITE_CHUNK_SIZE: usize = 1 << 20;
 
 fn parent_or_current(path: &Path) -> &Path {
     path.parent()
@@ -52,52 +46,9 @@ pub(crate) fn digest(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
-pub(crate) fn commit(
-    path: &Path,
-    data: &[u8],
-    cancellation: &CancellationToken,
-    hash: bool,
-) -> Result<Option<String>> {
-    cancellation.checkpoint()?;
-    let parent = parent_or_current(path);
-    let temporary = NamedTempFile::new_in(parent)
-        .with_context(|| format!("creating temporary output in {}", parent.display()))?;
-    let mut hasher = hash.then(Sha256::new);
-    {
-        let mut writer = BufWriter::with_capacity(WRITE_CHUNK_SIZE, temporary.as_file());
-        for chunk in data.chunks(WRITE_CHUNK_SIZE) {
-            cancellation.checkpoint()?;
-            writer
-                .write_all(chunk)
-                .with_context(|| format!("writing temporary output for {}", path.display()))?;
-            if let Some(hasher) = &mut hasher {
-                hasher.update(chunk);
-            }
-        }
-        writer
-            .flush()
-            .with_context(|| format!("flushing temporary output for {}", path.display()))?;
-    }
-    temporary
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("syncing temporary output for {}", path.display()))?;
-    cancellation.checkpoint()?;
-    temporary.persist(path).map_err(|error| {
-        anyhow::Error::new(error.error).context(format!("committing output {}", path.display()))
-    })?;
-
-    // The atomic rename is the commit point. A later directory-sync failure
-    // cannot be rolled back safely, so report it as a durability warning rather
-    // than falsely claiming that the previous output was preserved.
-    if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
-        tracing::warn!(
-            path = %parent.display(),
-            error = %error,
-            "output committed, but the containing directory could not be synced"
-        );
-    }
-    Ok(hasher.map(|hasher| hex::encode(hasher.finalize())))
+pub(crate) fn write_output(path: &Path, data: &[u8], hash: bool) -> Result<Option<String>> {
+    fs::write(path, data).with_context(|| format!("writing output {}", path.display()))?;
+    Ok(hash.then(|| digest(data)))
 }
 
 #[cfg(test)]
@@ -127,31 +78,17 @@ mod tests {
     }
 
     #[test]
-    fn commit_atomically_replaces_and_hashes_output() {
+    fn write_output_replaces_and_hashes_existing_file() {
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("output.exe");
         fs::write(&output, b"old").unwrap();
         let data = b"complete reconstructed image";
 
-        let digest = commit(&output, data, &CancellationToken::default(), true)
-            .expect("atomic commit succeeds")
+        let digest = write_output(&output, data, true)
+            .expect("output write succeeds")
             .expect("hashing requested");
 
         assert_eq!(fs::read(output).unwrap(), data);
         assert_eq!(digest, hex::encode(Sha256::digest(data)));
-    }
-
-    #[test]
-    fn cancellation_preserves_existing_output() {
-        let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("output.exe");
-        fs::write(&output, b"old").unwrap();
-        let cancellation = CancellationToken::default();
-        cancellation.cancel();
-
-        commit(&output, b"new", &cancellation, false)
-            .expect_err("cancelled output must not commit");
-
-        assert_eq!(fs::read(output).unwrap(), b"old");
     }
 }
