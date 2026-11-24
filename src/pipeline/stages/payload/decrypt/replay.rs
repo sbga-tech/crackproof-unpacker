@@ -108,11 +108,16 @@ pub(crate) struct PayloadPlanSelectionError {
     message: String,
 }
 impl PayloadPlanSelectionError {
-    fn no_authenticated_chain(decryption_details: DecryptionDetails) -> Self {
+    fn no_authenticated_chain(
+        decryption_details: DecryptionDetails,
+        tested: usize,
+        replayed: usize,
+    ) -> Self {
         Self {
             decryption_details,
-            message: "no AES-context and decoder-precursor chain replays every payload block"
-                .to_owned(),
+            message: format!(
+                "no AES-context and decoder-precursor chain replays every payload block: {replayed} of {tested} candidates passed prefix checks and reached full replay"
+            ),
         }
     }
 
@@ -1498,7 +1503,12 @@ fn select_payload_plan_impl(
         "prefix-viable replay candidate count exceeds its bounded product"
     );
     if candidates.is_empty() {
-        return Err(PayloadPlanSelectionError::no_authenticated_chain(decryption_details).into());
+        return Err(PayloadPlanSelectionError::no_authenticated_chain(
+            decryption_details,
+            replay_pairs,
+            0,
+        )
+        .into());
     }
 
     let scratch_bytes = mapped
@@ -1593,6 +1603,7 @@ fn select_payload_plan_impl(
 
     let mut selected = None;
     let mut selected_is_ambiguous = false;
+    let replayed = candidate_results.len();
     for candidate_result in candidate_results {
         let candidate = candidate_result.candidate;
         let context = &contexts[candidate.context_index];
@@ -1641,7 +1652,12 @@ fn select_payload_plan_impl(
         "multiple AES-context, post-transform, and decoder-precursor chains replay every payload block"
     );
     let Some(selected) = selected else {
-        return Err(PayloadPlanSelectionError::no_authenticated_chain(decryption_details).into());
+        return Err(PayloadPlanSelectionError::no_authenticated_chain(
+            decryption_details,
+            replay_pairs,
+            replayed,
+        )
+        .into());
     };
     let context = &contexts[selected.context_index];
     let decoder = &decoder_candidates[selected.decoder_index];

@@ -58,7 +58,7 @@ target/release/crackproof-unpacker --events protected.exe recovered.exe > events
 Options:
 
 - `--dry-run`: rebuild and verify in memory; cannot be combined with `OUTPUT`.
-- `--events`: emit detailed JSONL events on stdout.
+- `--events`: emit detailed JSONL events on stdout. Payload replay failures report how many candidates passed the prefix checks. The trace can contain raw key material; do not share it unredacted.
 - `--silent`: emit nothing on success and one fatal JSON object on failure.
 - `-h`, `--help`: show command help.
 - `-V`, `--version`: show the version.

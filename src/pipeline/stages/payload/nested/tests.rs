@@ -361,3 +361,23 @@ fn primary_nested_work_budget_fails_closed() {
     let error = budget.charge(1, 4).unwrap_err();
     assert!(error.downcast_ref::<PrimaryNestedWorkExhausted>().is_some());
 }
+
+#[test]
+fn accepted_descriptor_excludes_overlapping_candidates() {
+    let accepted = HashSet::from([0xc1d8]);
+
+    assert!(overlaps_accepted_descriptor(&accepted, 0xc1d8));
+    assert!(overlaps_accepted_descriptor(&accepted, 0xc1e0));
+    assert!(overlaps_accepted_descriptor(
+        &accepted,
+        0xc1d8 + PAYLOAD_BLOCK_DESCRIPTOR_SIZE - 1
+    ));
+    assert!(!overlaps_accepted_descriptor(
+        &accepted,
+        0xc1d8 + PAYLOAD_BLOCK_DESCRIPTOR_SIZE
+    ));
+    assert!(!overlaps_accepted_descriptor(
+        &accepted,
+        0xc1d8 - PAYLOAD_BLOCK_DESCRIPTOR_SIZE
+    ));
+}

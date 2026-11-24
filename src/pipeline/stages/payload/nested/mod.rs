@@ -1087,6 +1087,12 @@ fn commit_nested_output_maps(
     Ok(())
 }
 
+fn overlaps_accepted_descriptor(accepted: &HashSet<usize>, descriptor_offset: usize) -> bool {
+    accepted
+        .iter()
+        .any(|&offset| offset.abs_diff(descriptor_offset) < PAYLOAD_BLOCK_DESCRIPTOR_SIZE)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_nested_maps_from_graph_profile(
     outer: &[u8],
@@ -1178,7 +1184,7 @@ fn collect_nested_maps_from_graph_profile(
                 "constructed bounded nested replay candidates"
             );
             for record in &records {
-                if processed.contains(&record.descriptor_offset) {
+                if overlaps_accepted_descriptor(&processed, record.descriptor_offset) {
                     continue;
                 }
                 work_budget.charge(keys.len(), record.encoded_length)?;
