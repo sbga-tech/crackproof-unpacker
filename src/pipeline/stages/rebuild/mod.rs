@@ -1975,6 +1975,14 @@ fn recover_base_relocation_directory(
         return Ok(Some(produced));
     }
     if declared_relocations != 0 && declared_relocations_match_tls_closure(mapped, pe, declared)? {
+        if let Some(directory) = pogo::relocation_after_resources(
+            mapped,
+            pe,
+            destination_ranges,
+            destination_record_ranges,
+        )? {
+            return Ok(Some(directory));
+        }
         return Ok(Some(declared));
     }
 
