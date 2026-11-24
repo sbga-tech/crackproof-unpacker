@@ -10,7 +10,8 @@ The unpacker has passed 75 samples from games dated from 2018 through 2026.
 
 - PE32/I386 and PE32+/AMD64 protected images.
 - Native executables with authenticated I386 CRT, I386 standalone, AMD64 import-handoff, or AMD64 unwind-based startup paths.
-- Native AMD64 DLLs and managed DLL/EXE images; managed output uses a verified semantic CLR entry container.
+- Native AMD64 DLLs and I386 DLLs with a verified process-attach wrapper, security-cookie initializer, and CRT exception helper.
+- Managed DLL/EXE images use a verified semantic CLR entry container.
 
 ### Packer variants
 

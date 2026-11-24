@@ -24,6 +24,9 @@ serde_json = "1.0"
 libmwemu = "0.25.3"
 tempfile = "3.20"
 
+[target.'cfg(windows)'.dev-dependencies]
+mwemu-windows-sys = { package = "windows-sys", version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

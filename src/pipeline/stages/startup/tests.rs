@@ -1247,7 +1247,7 @@ fn native_i386_dll_entry_profile_fails_closed() {
     let error = discover_output_entry(&image, &pe).unwrap_err().to_string();
 
     assert!(
-        error.contains("I386 native DLL entry discovery is unsupported"),
+        error.contains("I386 DLL entry lacks its process-attach and stdcall dispatch contract"),
         "{error}"
     );
 }
@@ -1491,6 +1491,57 @@ fn place_standalone_i386_entry(
         0x33,
         0xc5,
     ]);
+}
+
+#[test]
+fn native_i386_dll_requires_matching_dispatch_and_cookie_evidence() {
+    let (mut image, mut pe, layout) = standalone_i386_fixture();
+    pe.coff_characteristics |= crate::pe::IMAGE_FILE_DLL;
+    let dispatch = layout.entry + SEMANTIC_VENEER_LEN as u32;
+    let entry = 0x1600;
+    pe.entry_rva = entry;
+    let start = offset(entry);
+    image[start..start + 35].copy_from_slice(&[
+        0x55, 0x8b, 0xec, 0x83, 0x7d, 0x0c, 1, 0x75, 5, 0xe8, 0, 0, 0, 0, 0xff, 0x75, 0x10, 0xff,
+        0x75, 0x0c, 0xff, 0x75, 8, 0xe8, 0, 0, 0, 0, 0x83, 0xc4, 0x0c, 0x5d, 0xc2, 0x0c, 0,
+    ]);
+    write_rel32(&mut image, entry + 9, 0xe8, layout.cookie_initializer);
+    write_rel32(&mut image, entry + 23, 0xe8, dispatch);
+    assert_eq!(
+        discover_output_entry(&image, &pe).unwrap(),
+        OutputEntry::NativeDll { entry_rva: entry }
+    );
+    image[start + 33] = 8;
+    assert!(discover_output_entry(&image, &pe).is_err());
+    image[start + 33] = 12;
+    write_u32_at(
+        &mut image,
+        layout.seh_helper + 0x21,
+        TEST_IMAGE_BASE as u32 + layout.cookie_complement,
+    );
+    assert!(discover_output_entry(&image, &pe).is_err());
+}
+
+#[test]
+fn ambiguous_amd64_profiles_must_match_each_recorded_push_register() {
+    let sites = [(0, 2, 13), (2, 3, 13), (5, 2, 5)];
+    let mut prologues = [0x41, 0x55, 0x41, 0xff, 0xf5, 0x40, 0x55];
+    assert!(native::amd64::matches_unwind_pushes(&prologues, &sites));
+    prologues[2] = 0x40;
+    assert!(!native::amd64::matches_unwind_pushes(&prologues, &sites));
+    prologues[2] = 0x41;
+    prologues[6] = 0x53;
+    assert!(!native::amd64::matches_unwind_pushes(&prologues, &sites));
+}
+
+#[test]
+fn cookie_time_call_binds_stack_argument_and_import_cell() {
+    let mut bytes = [0u8; I386_COOKIE_EVIDENCE_LEN];
+    bytes[..10].copy_from_slice(&[0x8d, 0x45, 0xf4, 0x50, 0xff, 0x15, 0x20, 0x10, 0x40, 0]);
+    assert!(native::i386::cookie_calls_time_import(&bytes, 0, 0x401020));
+    assert!(!native::i386::cookie_calls_time_import(&bytes, 0, 0x401024));
+    bytes[3] = 0x51;
+    assert!(!native::i386::cookie_calls_time_import(&bytes, 0, 0x401020));
 }
 
 #[test]

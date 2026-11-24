@@ -1224,13 +1224,14 @@ fn chain_replays(
     Ok(None)
 }
 
-fn chain_prefixes_are_viable(
+pub(super) fn chain_prefixes_are_viable(
     packed: &[u8],
     stream_base: usize,
     records: &[PayloadBlock],
     decryptor: &Aes256CbcDecryptor,
     decoder_table: &[u8],
-    post_transform: &PayloadPostTransform,
+    transform: impl Fn(&mut [u8]),
+    allow_zero_width_controls: bool,
 ) -> Result<bool> {
     let mut prefix = [0u8; 16];
     for record in records {
@@ -1250,7 +1251,7 @@ fn chain_prefixes_are_viable(
                 .context("validated payload block prefix range disappeared")?,
         );
         decryptor.decrypt_full_blocks_in_place(&mut prefix[..prefix_len]);
-        post_transform.apply(&mut prefix[..prefix_len]);
+        transform(&mut prefix[..prefix_len]);
         let history_len = record.destination_rva.min(4);
         if !custom_decoder_prefix_is_viable(
             decoder_table,
@@ -1258,7 +1259,7 @@ fn chain_prefixes_are_viable(
             record.encoded_length,
             history_len,
             record.destination_length,
-            false,
+            allow_zero_width_controls,
         ) {
             return Ok(false);
         }
@@ -1478,7 +1479,8 @@ fn select_payload_plan_impl(
                     records,
                     &context.decryptor,
                     &decoder.table,
-                    post_transform,
+                    |bytes| post_transform.apply(bytes),
+                    false,
                 )? {
                     continue;
                 }

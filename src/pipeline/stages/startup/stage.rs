@@ -13,6 +13,31 @@ use super::{
     unique_sparse_page_keys,
 };
 
+fn corroborate_sparse<T: Copy>(
+    mapped: &mut [u8],
+    pe: &Pe,
+    candidates: &mut Vec<(SparsePageKey, T)>,
+    corroborates: impl Fn(&[u8], T) -> bool,
+) -> Result<()> {
+    let mut supported = None;
+    for &(key, entry) in candidates.iter() {
+        decode_sparse_text_pages_in_place(mapped, pe, key)?;
+        let matches = corroborates(mapped, entry);
+        decode_sparse_text_pages_in_place(mapped, pe, key)?;
+        if matches {
+            if supported.is_some() {
+                return Ok(());
+            }
+            supported = Some((key, entry));
+        }
+    }
+    if let Some(candidate) = supported {
+        candidates.clear();
+        candidates.push(candidate);
+    }
+    Ok(())
+}
+
 /// The recovered program selected from semantic entry evidence.
 ///
 /// `code_transform` records whether executable code was used unchanged or restored through an
@@ -105,6 +130,13 @@ fn select_amd64_msvc_profile(mapped: &mut [u8], pe: &Pe) -> Result<Option<Select
                 "sparse AMD64 MSVC startup profile rejected"
             ),
         }
+    }
+
+    if successes.len() > 1 {
+        let sites = super::native::amd64::unwind_push_sites(mapped, pe)?;
+        corroborate_sparse(mapped, pe, &mut successes, |bytes, _| {
+            super::native::amd64::matches_unwind_pushes(bytes, &sites)
+        })?;
     }
 
     let [(page_key, entry)] = successes.as_slice() else {
@@ -212,6 +244,25 @@ pub(crate) fn select_output_entry(mapped: &mut [u8], pe: &Pe) -> Result<Selected
                 failures.push(format!("{page_key:?}: {error:#}"));
             }
         }
+    }
+
+    if successes.len() > 1
+        && pe.machine_kind() == Machine::I386
+        && successes.iter().all(|(_, entry)| {
+            matches!(
+                entry.semantic().map(|e| e.evidence),
+                Some(SemanticEvidence::I386MsvcStandalone { .. })
+            )
+        })
+        && let Some(slot) = super::native::i386::cookie_time_import(mapped, pe)?
+    {
+        corroborate_sparse(mapped, pe, &mut successes, |bytes, entry| {
+            let init = entry
+                .semantic()
+                .expect("standalone I386 entry")
+                .veneer_call_target_rva;
+            super::native::i386::cookie_calls_time_import(bytes, init, slot)
+        })?;
     }
 
     let [(page_key, entry)] = successes.as_slice() else {

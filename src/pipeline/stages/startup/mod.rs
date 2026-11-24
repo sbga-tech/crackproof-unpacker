@@ -454,9 +454,8 @@ pub(crate) fn discover_output_entry(mapped: &[u8], pe: &Pe) -> Result<OutputEntr
                     native::amd64::discover_amd64_dll_entry(mapped, pe)
                         .map(|entry_rva| OutputEntry::NativeDll { entry_rva })
                 }
-                Machine::I386 => bail!(
-                    "I386 native DLL entry discovery is unsupported; refusing to preserve a packed bootstrap"
-                ),
+                Machine::I386 => native::i386::verify_dll_entry(mapped, pe)
+                    .map(|entry_rva| OutputEntry::NativeDll { entry_rva }),
             };
         }
         return discover_semantic_entry(mapped, pe).map(OutputEntry::Native);
