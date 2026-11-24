@@ -25,6 +25,8 @@ The unpacker fails closed when descriptors, decryption chains, startup semantics
 Reconstructed files are normalized for correctness and may not be byte-identical to a runtime image or another unpacker's output.
 If linker metadata describes a compact section layout that would omit nonzero mapped bytes, the unpacker tries the general PE layout and verifies that output instead.
 
+When an otherwise verified image retains the recognized OpenSSL 3.0.8 RSA exception handler in non-executable data, the unpacker preserves the image and reports `recovered_with_known_defect`. This is not a repaired executable. To avoid that RSA code path under normal OpenSSL dispatch, set `OPENSSL_ia32cap=:~0x200000` in the target process's launch environment. The unpacker does not change the environment or section permissions.
+
 ## Build
 
 Rust 1.96 or newer is required.
@@ -59,6 +61,6 @@ Options:
 
 - `--dry-run`: rebuild and verify in memory; cannot be combined with `OUTPUT`.
 - `--events`: emit detailed JSONL events on stdout. Payload replay failures report how many candidates passed the prefix checks. The trace can contain raw key material; do not share it unredacted.
-- `--silent`: emit nothing on success and one fatal JSON object on failure.
+- `--silent`: emit nothing on clean success, one JSON warning on recovery with a known defect (exit 0), or one fatal JSON object on failure.
 - `-h`, `--help`: show command help.
 - `-V`, `--version`: show the version.

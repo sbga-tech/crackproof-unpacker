@@ -11,7 +11,7 @@ use super::{
     EXPORT_DIRECTORY, IAT_DIRECTORY, IMAGE_IMPORT_DESCRIPTOR_SIZE, IMPORT_DIRECTORY, ScanBudget,
     canonical_import_graph, covered_by_destinations, parse_export_candidate,
     parse_import_candidate, parse_relocation_candidate, resource_node, rva_slice, u32_at,
-    validate_base_relocation_directory, validate_debug_directory, validate_exception_directory,
+    assess_exception_directory, validate_base_relocation_directory, validate_debug_directory,
 };
 
 const DEBUG_DIRECTORY: usize = 6;
@@ -52,6 +52,7 @@ pub(super) struct PogoRecovery {
     pub(super) mapped: Vec<u8>,
     pub(super) pe: Pe,
     pub(super) directories: Vec<(usize, DataDirectory)>,
+    pub(super) defect: Option<super::SourceDefect>,
 }
 
 pub(super) fn recover(
@@ -137,9 +138,11 @@ pub(super) fn recover(
         virtual_address: range.start,
         size: range.end - range.start,
     });
-    if let Some(exception) = exception_directory {
-        validate_exception_directory(&recovered_mapped, &recovered_pe, exception)?;
-    }
+    let defect = if let Some(exception) = exception_directory {
+        assess_exception_directory(&recovered_mapped, &recovered_pe, exception, Some(discovery))?
+    } else {
+        None
+    };
     validate_base_relocation_directory(&recovered_mapped, &recovered_pe, relocation)?;
     validate_debug_directory(&recovered_mapped, &recovered_pe, debug)?;
 
@@ -186,6 +189,7 @@ pub(super) fn recover(
         mapped: recovered_mapped,
         pe: recovered_pe,
         directories,
+        defect,
     }))
 }
 

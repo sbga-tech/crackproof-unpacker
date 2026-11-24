@@ -415,6 +415,22 @@ impl StageTiming {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceDefect {
+    OpensslRsazUnwind,
+}
+
+impl SourceDefect {
+    pub fn notice(self) -> &'static str {
+        match self {
+            Self::OpensslRsazUnwind => {
+                "Recovered with known OpenSSL exception-handler defect. Runtime workaround: OPENSSL_ia32cap=:~0x200000."
+            }
+        }
+    }
+}
+
 /// Authoritative semantic result assembled from completed stage outputs.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct RunSummary {
@@ -423,6 +439,8 @@ pub struct RunSummary {
     pub input_pe: Option<PeSummary>,
     pub output_artifact: Option<OutputArtifactSummary>,
     pub output_pe: Option<PeSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_defect: Option<SourceDefect>,
     pub dry_run: bool,
     pub protector: Option<ProtectorInfo>,
     pub decryption: Option<DecryptionDetails>,

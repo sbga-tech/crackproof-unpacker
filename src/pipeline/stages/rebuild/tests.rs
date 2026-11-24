@@ -1210,6 +1210,87 @@ fn unwind_info_validates_chain_handlers_and_slot_encoding() {
 }
 
 #[test]
+fn rsaz_record_geometry_and_import_are_not_sufficient_evidence() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    let mut text = pe.sections[0].clone();
+    text.virtual_address = 0x2000;
+    text.characteristics = 0x6000_0020;
+    text.name_bytes = *b".text\0\0\0";
+    let mut rdata = text.clone();
+    rdata.virtual_address = 0x3000;
+    rdata.characteristics = 0x4000_0040;
+    rdata.name_bytes = *b".rdata\0\0";
+    pe.sections.extend([text, rdata]);
+    pe.section_count = 3;
+    pe.size_of_image = 0x4000;
+    let mut mapped = vec![0; 0x4000];
+    let marker = b"openssl-3.0.8\\crypto\\";
+    mapped[0x3000..0x3000 + marker.len()].copy_from_slice(marker);
+    let handler = 0x1100u32;
+    let iat = 0x1400u32;
+    put_u32(&mut mapped, handler as usize + 234, iat - (handler + 238));
+    let imports = LoaderDiscovery {
+        table_rva: 0,
+        metadata_ranges: Vec::new(),
+        image_size: pe.size_of_image,
+        modules: vec![ImportModule {
+            dll: "KERNEL32.dll".into(),
+            destination_rva: iat,
+            symbols: vec![ImportSymbol::Name {
+                hint: 0,
+                name: "RtlVirtualUnwind".into(),
+            }],
+        }],
+        function_count: 1,
+        named_count: 1,
+        ordinal_count: 0,
+    };
+    let mut evidence = openssl::RsazRows::default();
+    for (i, (begin, len, disp, constant, body, epilogue)) in [
+        (0x2000u32, 1609, 1124, 64, 31, 1597),
+        (0x2660, 1594, 676, 64, 31, 1582),
+        (0x2ca0, 251, 33, 32, 0, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let record = 0x3200 + i as u32 * 12;
+        let unwind = 0x3300 + i as u32 * 16;
+        for (j, value) in [begin, begin + len, unwind].into_iter().enumerate() {
+            put_u32(&mut mapped, record as usize + j * 4, value);
+        }
+        for (j, value) in [9, handler, begin + body, begin + epilogue]
+            .into_iter()
+            .enumerate()
+        {
+            put_u32(&mut mapped, unwind as usize + j * 4, value);
+        }
+        let operand = begin + disp;
+        put_u32(
+            &mut mapped,
+            operand as usize,
+            (handler - constant).wrapping_sub(operand + 4),
+        );
+        let failure =
+            validate_runtime_function(&mapped, &pe, record, &mut BTreeSet::new(), 0).unwrap_err();
+        let rejected = failure
+            .downcast_ref::<openssl::NonExecutableHandler>()
+            .unwrap();
+        assert_eq!(
+            evidence.accept(&mapped, &pe, &imports, record, rejected),
+            Some(begin)
+        );
+    }
+    assert!(evidence.finish().is_err());
+    let directory = DataDirectory {
+        virtual_address: 0x3200,
+        size: 36,
+    };
+    assert!(assess_exception_directory(&mapped, &pe, directory, Some(&imports)).is_err());
+}
+
+#[test]
 fn unwind_info_v2_validates_epilogues_and_spare_slots() {
     let mut pe = test_pe();
     pe.machine = Machine::Amd64;
