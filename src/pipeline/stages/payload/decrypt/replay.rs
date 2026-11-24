@@ -642,6 +642,7 @@ fn replay_nested_key_slice(
     keys: &[u32],
     decoders: &[DecoderCandidate],
     replay_maps: &[Option<&[u8; 256]>],
+    default_rotation_maps: &[Option<&[u8; 256]>],
     history: &[u8],
     destination_len: usize,
     exhaustive_rotations: bool,
@@ -661,6 +662,11 @@ fn replay_nested_key_slice(
             19..20
         };
         for shift in shifts {
+            let replay_maps = if shift == 19 {
+                default_rotation_maps
+            } else {
+                replay_maps
+            };
             if direct_record {
                 nested_transform_dwords_into(aes_plaintext, &mut scratch.transformed, key, shift);
                 for &byte_map in replay_maps {
@@ -798,6 +804,12 @@ fn replay_nested_record(
     let fixed_map = std::array::from_fn(|value| f8_byte(value as u8));
     let replay_maps =
         nested_replay_byte_maps(include_extended_maps, &fixed_map, byte_maps).collect::<Vec<_>>();
+    let fixed_only = [Some(&fixed_map)];
+    let default_rotation_maps = if include_extended_maps {
+        &fixed_only[..]
+    } else {
+        &replay_maps
+    };
     let key_workers = nested_key_worker_count(keys.len(), source.len(), destination_range.len());
     let parallel_key_replay = key_workers > 1;
     let key_chunk_size = keys.len().div_ceil(key_workers).max(1);
@@ -831,6 +843,7 @@ fn replay_nested_record(
                             key_chunk,
                             decoders,
                             &replay_maps,
+                            default_rotation_maps,
                             history,
                             destination_range.len(),
                             exhaustive_rotations,
@@ -858,6 +871,7 @@ fn replay_nested_record(
                 keys,
                 decoders,
                 &replay_maps,
+                default_rotation_maps,
                 history,
                 destination_range.len(),
                 exhaustive_rotations,
@@ -1058,8 +1072,7 @@ pub(super) struct DecryptionNestedReplayer<'a> {
     pub(super) payload_source: &'a [u8],
     pub(super) source_file_range: Range<usize>,
     pub(super) decoders: &'a [DecoderCandidate],
-    pub(super) contexts: Vec<PreparedAesContext>,
-    pub(super) fixed_contexts: bool,
+    pub(super) contexts: Option<Vec<PreparedAesContext>>,
     pub(super) extended_profile: bool,
     pub(super) exhaustive_rotations: bool,
     pub(super) cancellation: Option<&'a CancellationToken>,
@@ -1069,7 +1082,12 @@ impl NestedRecordReplayer for DecryptionNestedReplayer<'_> {
     fn begin_graph(&mut self, extended_profile: bool, exhaustive_rotations: bool) -> Result<()> {
         self.extended_profile = extended_profile;
         self.exhaustive_rotations = exhaustive_rotations;
-        if !self.fixed_contexts {
+        if let Some(token) = self.cancellation {
+            token.checkpoint()?;
+        }
+        let contexts = if let Some(contexts) = &self.contexts {
+            contexts
+        } else {
             let contexts = if let Some(cancellation) = self.cancellation {
                 scan_aes_contexts_in_range_with_cancellation(
                     self.payload_source,
@@ -1079,9 +1097,10 @@ impl NestedRecordReplayer for DecryptionNestedReplayer<'_> {
             } else {
                 scan_aes_contexts_in_range(self.payload_source, self.source_file_range.clone())?
             };
-            self.contexts = contexts.into_iter().map(PreparedAesContext::new).collect();
-        }
-        for (context_index, context) in self.contexts.iter().enumerate() {
+            self.contexts
+                .insert(contexts.into_iter().map(PreparedAesContext::new).collect())
+        };
+        for (context_index, context) in contexts.iter().enumerate() {
             debug!(
                 context_index,
                 file_offset = context.evidence.file_offset,
@@ -1101,8 +1120,12 @@ impl NestedRecordReplayer for DecryptionNestedReplayer<'_> {
         keys: &[u32],
         byte_maps: &[(usize, Box<[u8; 256]>)],
     ) -> Result<NestedReplay> {
+        let contexts = self
+            .contexts
+            .as_deref()
+            .expect("graph contexts initialized before replay");
         let legacy = replay_nested_record(
-            &self.contexts,
+            contexts,
             staged_outer,
             bootstrap,
             record,
@@ -1117,7 +1140,7 @@ impl NestedRecordReplayer for DecryptionNestedReplayer<'_> {
             return Ok(legacy);
         }
         replay_nested_record(
-            &self.contexts,
+            contexts,
             staged_outer,
             bootstrap,
             record,

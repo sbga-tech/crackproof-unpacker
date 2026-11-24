@@ -427,45 +427,41 @@ fn verify_trimmed_section_mapping(
     pe: &Pe,
     retained_directories: &[(usize, DataDirectory)],
 ) -> Result<()> {
-    let debug_pointers = retained_directories
-        .iter()
-        .find(|(index, _)| *index == 6)
-        .map(|(_, directory)| {
-            (0..usize::try_from(directory.size / 28)?)
-                .map(|index| {
-                    let start = directory
-                        .virtual_address
-                        .checked_add(u32::try_from(
-                            index
-                                .checked_mul(28)
-                                .context("debug pointer offset overflows")?,
-                        )?)
-                        .context("debug pointer RVA overflows")?
-                        .checked_add(24)
-                        .context("debug pointer RVA overflows")?;
-                    Ok(start
-                        ..start
-                            .checked_add(4)
-                            .context("debug pointer range overflows")?)
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
     ensure!(
         expected.len() >= usize::try_from(pe.size_of_image)?
             && actual.len() >= usize::try_from(pe.size_of_image)?,
         "mapped image is shorter than SizeOfImage"
     );
-    for rva in pe.size_of_headers..pe.size_of_image {
-        if !debug_pointers.iter().any(|pointer| pointer.contains(&rva)) {
-            ensure!(
-                expected.get(usize::try_from(rva)?) == actual.get(usize::try_from(rva)?),
-                "trimmed mapped image differs at RVA {rva:#x}"
+    let end = pe.size_of_image as usize;
+    let mut cursor = pe.size_of_headers as usize;
+    let compare = |range: Range<usize>| -> Result<()> {
+        let before = &expected[range.clone()];
+        let after = &actual[range.clone()];
+        if before != after {
+            let offset = before.iter().zip(after).position(|(x, y)| x != y).unwrap();
+            bail!(
+                "trimmed mapped image differs at RVA {:#x}",
+                range.start + offset
             );
         }
+        Ok(())
+    };
+    if let Some((_, directory)) = retained_directories
+        .iter()
+        .find(|(i, _)| *i == DEBUG_DIRECTORY)
+    {
+        for index in 0..(directory.size / 28) as usize {
+            let pointer = directory.virtual_address as usize + index * 28 + 24;
+            if pointer >= end {
+                break;
+            }
+            if cursor < pointer {
+                compare(cursor..pointer)?;
+            }
+            cursor = cursor.max((pointer + 4).min(end));
+        }
     }
-    Ok(())
+    compare(cursor..end)
 }
 
 fn validate_entry_evidence(mapped: &[u8], pe: &Pe, entry: OutputEntry) -> Result<()> {

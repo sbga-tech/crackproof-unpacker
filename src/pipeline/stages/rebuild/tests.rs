@@ -45,6 +45,32 @@ fn put_u64(image: &mut [u8], rva: usize, value: u64) {
     image[rva..rva + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+#[test]
+fn mapped_verification_exempts_only_debug_file_pointers() {
+    let pe = test_pe();
+    let original = vec![0; pe.size_of_image as usize];
+    let mut actual = original.clone();
+    let debug = [(
+        DEBUG_DIRECTORY,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 56,
+        },
+    )];
+    actual[0x1118..0x111c].fill(1);
+    actual[0x1134..0x1138].fill(2);
+    verify_trimmed_section_mapping(&original, &actual, &pe, &debug).unwrap();
+    for rva in [0x1117, 0x111c, 0x1133, 0x1138] {
+        actual[rva] = 3;
+        let error = verify_trimmed_section_mapping(&original, &actual, &pe, &debug).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("trimmed mapped image differs at RVA {rva:#x}")
+        );
+        actual[rva] = 0;
+    }
+}
+
 fn standard_import(image: &mut [u8], start: usize, suffix: u8) {
     put_u32(image, start, (start + 0x40) as u32);
     put_u32(image, start + 12, (start + 0x60) as u32);
