@@ -1790,6 +1790,88 @@ fn unchanged_native_profile_does_not_require_sparse_layout() {
 }
 
 #[test]
+fn single_page_evidence_needs_distinguishing_startup_semantics() {
+    let (mut plain, pe, _) = standalone_i386_fixture();
+    plain[0x2000..0x3000].fill(0xcc);
+    let mut encoded = plain.clone();
+    decode_sparse_text_pages_in_place(&mut encoded, &pe, SparsePageKey::PageRvaRol(3)).unwrap();
+    assert!(matches!(
+        sparse::page_evidence(&encoded, &pe).unwrap(),
+        sparse::PageEvidence::Partial(_)
+    ));
+    assert!(discover_output_entry(&encoded, &pe).is_err());
+    let selected = select_output_entry(&mut encoded, &pe).unwrap();
+    assert_eq!(
+        selected.code_transform,
+        crate::pipeline::outcome::CodeTransform::PageRvaRol { rotation: 3 }
+    );
+    assert_eq!(encoded, plain);
+
+    let (mut ambiguous, pe) = recognizable_startup_with_padded_text();
+    let last = pe.size_of_image as usize - SPARSE_PAGE_SIZE;
+    ambiguous[last..].fill(0x90);
+    decode_sparse_text_pages_in_place(&mut ambiguous, &pe, SparsePageKey::PageRvaRol(3)).unwrap();
+    assert!(matches!(
+        sparse::page_evidence(&ambiguous, &pe).unwrap(),
+        sparse::PageEvidence::Partial(_)
+    ));
+    assert!(discover_output_entry(&ambiguous, &pe).is_ok());
+    let before = ambiguous.clone();
+    assert!(select_output_entry(&mut ambiguous, &pe).is_err());
+    assert_eq!(ambiguous, before);
+}
+
+fn recognizable_startup_with_padded_text() -> (Vec<u8>, Pe) {
+    let (mut mapped, mut pe, _) = standalone_i386_fixture();
+    pe.sections[0].name_bytes = *b".crt\0\0\0\0";
+    let start = pe.size_of_image;
+    let mut text = section(2, start, 0x2000, IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ);
+    text.name_bytes = *b".text\0\0\0";
+    pe.sections.push(text);
+    pe.section_count += 1;
+    pe.size_of_image += 0x2000;
+    mapped.resize(pe.size_of_image as usize, 0xcc);
+    (mapped, pe)
+}
+
+#[test]
+fn recognizable_startup_does_not_leave_independently_encoded_text_unchanged() {
+    let (mut plain, pe) = recognizable_startup_with_padded_text();
+    assert_eq!(
+        select_output_entry(&mut plain, &pe).unwrap().code_transform,
+        crate::pipeline::outcome::CodeTransform::Unchanged
+    );
+    let mut encoded = plain.clone();
+    decode_sparse_text_pages_in_place(&mut encoded, &pe, SparsePageKey::PageRvaRol(3)).unwrap();
+    assert!(discover_output_entry(&encoded, &pe).is_ok());
+    let selected = select_output_entry(&mut encoded, &pe).unwrap();
+    assert_eq!(
+        selected.code_transform,
+        crate::pipeline::outcome::CodeTransform::PageRvaRol { rotation: 3 }
+    );
+    assert_eq!(encoded, plain);
+}
+
+#[test]
+fn incompatible_text_pages_do_not_select_a_whole_section_transform() {
+    let (plain, pe) = recognizable_startup_with_padded_text();
+    let mut encoded = plain.clone();
+    decode_sparse_text_pages_in_place(&mut encoded, &pe, SparsePageKey::PageIndex).unwrap();
+    let last = pe.size_of_image as usize - SPARSE_PAGE_SIZE;
+    let mut second = plain.clone();
+    for mixed in [false, true] {
+        if mixed {
+            decode_sparse_text_pages_in_place(&mut second, &pe, SparsePageKey::PageRvaRol(3))
+                .unwrap();
+        }
+        encoded[last..].copy_from_slice(&second[last..]);
+        let before = encoded.clone();
+        assert!(select_output_entry(&mut encoded, &pe).is_err());
+        assert_eq!(encoded, before);
+    }
+}
+
+#[test]
 fn dll_and_managed_recovered_programs_have_no_code_transform() {
     let (mut native_image, native_pe, native_layout) = amd64_dll_fixture();
 

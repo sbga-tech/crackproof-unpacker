@@ -16,14 +16,18 @@ use super::{
 fn corroborate_sparse<T: Copy>(
     mapped: &mut [u8],
     pe: &Pe,
-    candidates: &mut Vec<(SparsePageKey, T)>,
+    candidates: &mut Vec<(Option<SparsePageKey>, T)>,
     corroborates: impl Fn(&[u8], T) -> bool,
 ) -> Result<()> {
     let mut supported = None;
     for &(key, entry) in candidates.iter() {
-        decode_sparse_text_pages_in_place(mapped, pe, key)?;
+        if let Some(key) = key {
+            decode_sparse_text_pages_in_place(mapped, pe, key)?;
+        }
         let matches = corroborates(mapped, entry);
-        decode_sparse_text_pages_in_place(mapped, pe, key)?;
+        if let Some(key) = key {
+            decode_sparse_text_pages_in_place(mapped, pe, key)?;
+        }
         if matches {
             if supported.is_some() {
                 return Ok(());
@@ -84,93 +88,21 @@ impl SelectedOutputProfile {
     }
 }
 
-fn select_amd64_msvc_profile(mapped: &mut [u8], pe: &Pe) -> Result<Option<SelectedOutputProfile>> {
-    if let Some(entry) = discover_amd64_msvc_semantic_entry(mapped, pe)? {
-        info!(
-            entry_rva = entry.entry_rva,
-            "selected unchanged AMD64 MSVC startup entry"
-        );
-        return Ok(Some(SelectedOutputProfile {
-            entry: OutputEntry::Native(entry),
-            code_transform: CodeTransform::Unchanged,
-        }));
+fn native_entry(mapped: &[u8], pe: &Pe) -> Result<OutputEntry> {
+    if pe.machine_kind() == Machine::Amd64
+        && let Some(entry) = discover_amd64_msvc_semantic_entry(mapped, pe)?
+    {
+        return Ok(OutputEntry::Native(entry));
     }
-
-    let page_keys = unique_sparse_page_keys(pe)
-        .context("enumerating sparse executable-page profiles for AMD64 MSVC startup")?;
-    let mut successes = Vec::new();
-    for page_key in page_keys {
-        decode_sparse_text_pages_in_place(mapped, pe, page_key)
-            .with_context(|| format!("decoding sparse executable pages with {page_key:?}"))?;
-        let result = discover_amd64_msvc_semantic_entry(mapped, pe).and_then(|entry| {
-            let Some(entry) = entry else {
-                return Ok(None);
-            };
-            authenticate_sparse_output_entry(mapped, pe, OutputEntry::Native(entry))
-                .context("authenticating sparse AMD64 MSVC entry")?;
-            Ok(Some(entry))
-        });
-        decode_sparse_text_pages_in_place(mapped, pe, page_key).with_context(|| {
-            format!("restoring sparse executable pages after testing {page_key:?}")
-        })?;
-
-        match result {
-            Ok(Some(entry)) => {
-                debug!(
-                    ?page_key,
-                    entry_rva = entry.entry_rva,
-                    "sparse AMD64 MSVC startup profile authenticated"
-                );
-                successes.push((page_key, entry));
-            }
-            Ok(None) => {}
-            Err(error) => debug!(
-                ?page_key,
-                reason = %format!("{error:#}"),
-                "sparse AMD64 MSVC startup profile rejected"
-            ),
-        }
-    }
-
-    if successes.len() > 1 {
-        let sites = super::native::amd64::unwind_push_sites(mapped, pe)?;
-        corroborate_sparse(mapped, pe, &mut successes, |bytes, _| {
-            super::native::amd64::matches_unwind_pushes(bytes, &sites)
-        })?;
-    }
-
-    let [(page_key, entry)] = successes.as_slice() else {
-        if successes.is_empty() {
-            return Ok(None);
-        }
-        let profiles = successes
-            .iter()
-            .map(|(key, entry)| format!("{key:?} -> {:#x}", entry.entry_rva))
-            .collect::<Vec<_>>();
-        bail!(
-            "multiple sparse executable-page profiles produce AMD64 MSVC entries: {}",
-            profiles.join("; ")
-        );
-    };
-
-    decode_sparse_text_pages_in_place(mapped, pe, *page_key).with_context(|| {
-        format!("applying selected sparse executable-page profile {page_key:?}")
-    })?;
-    info!(
-        ?page_key,
-        entry_rva = entry.entry_rva,
-        "selected unique sparse AMD64 MSVC startup profile"
-    );
-    Ok(Some(SelectedOutputProfile {
-        entry: OutputEntry::Native(*entry),
-        code_transform: sparse_code_transform(*page_key),
-    }))
+    discover_output_entry(mapped, pe)
 }
 
-/// Selects the native output profile. A semantic entry in the decrypted
-/// image is authoritative; reversible sparse-page transforms are tested only
-/// as a fail-closed fallback. The selected fallback remains applied for the
-/// remainder of reconstruction.
+fn authenticated_entry(mapped: &[u8], pe: &Pe) -> Result<OutputEntry> {
+    let entry = native_entry(mapped, pe)?;
+    authenticate_sparse_output_entry(mapped, pe, entry)?;
+    Ok(entry)
+}
+
 pub(crate) fn select_output_entry(mapped: &mut [u8], pe: &Pe) -> Result<SelectedOutputProfile> {
     if pe.is_dll() || has_nonempty_com_descriptor(pe) {
         let raw = discover_output_entry(mapped, pe);
@@ -187,49 +119,47 @@ pub(crate) fn select_output_entry(mapped: &mut [u8], pe: &Pe) -> Result<Selected
             })
             .context("selecting DLL or managed output entry profile");
     }
-    if pe.machine_kind() == Machine::Amd64
-        && let Some(profile) = select_amd64_msvc_profile(mapped, pe)?
-    {
-        return Ok(profile);
-    }
-
-    let raw = discover_output_entry(mapped, pe);
-
-    let raw_error = match raw {
-        Ok(entry) => {
+    let evidence = super::sparse::page_evidence(mapped, pe)?;
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+    let page_keys = match evidence {
+        super::sparse::PageEvidence::Unique(key) => {
+            decode_sparse_text_pages_in_place(mapped, pe, key)?;
+            let entry = authenticated_entry(mapped, pe)?;
             info!(
+                ?key,
                 entry_rva = entry.entry_rva(),
-                "selected unchanged native startup entry"
+                "selected sparse text profile from page encoding and startup evidence"
             );
             return Ok(SelectedOutputProfile {
                 entry,
-                code_transform: CodeTransform::Unchanged,
+                code_transform: sparse_code_transform(key),
             });
         }
-        Err(error) => {
-            debug!(reason = %format!("{error:#}"), "raw native startup profile rejected");
-            error
+        super::sparse::PageEvidence::Partial(keys) => {
+            if let Ok(raw) = authenticated_entry(mapped, pe) {
+                successes.push((None, raw));
+            }
+            keys
+        }
+        super::sparse::PageEvidence::None => {
+            match native_entry(mapped, pe) {
+                Ok(entry) => {
+                    return Ok(SelectedOutputProfile {
+                        entry,
+                        code_transform: CodeTransform::Unchanged,
+                    });
+                }
+                Err(error) => failures.push(format!("raw: {error:#}")),
+            }
+            unique_sparse_page_keys(pe)?
         }
     };
-    let mut successes = Vec::new();
-    let mut failures = vec![format!("raw: {raw_error:#}")];
-
-    let page_keys = unique_sparse_page_keys(pe)
-        .context("enumerating sparse executable-page profiles for native application")?;
     for page_key in page_keys {
         debug!(page_key = ?page_key, "testing sparse executable-page startup profile");
         decode_sparse_text_pages_in_place(mapped, pe, page_key)
             .with_context(|| format!("decoding sparse executable pages with {page_key:?}"))?;
-        let result = discover_output_entry(mapped, pe).and_then(|entry| {
-            debug!(
-                page_key = ?page_key,
-                ?entry,
-                "diagnostic sparse semantic candidate"
-            );
-            authenticate_sparse_output_entry(mapped, pe, entry)
-                .context("authenticating sparse semantic entry")?;
-            Ok(entry)
-        });
+        let result = authenticated_entry(mapped, pe);
         decode_sparse_text_pages_in_place(mapped, pe, page_key).with_context(|| {
             format!("restoring sparse executable pages after testing {page_key:?}")
         })?;
@@ -237,7 +167,7 @@ pub(crate) fn select_output_entry(mapped: &mut [u8], pe: &Pe) -> Result<Selected
         match result {
             Ok(entry) => {
                 debug!(page_key = ?page_key, entry_rva = entry.entry_rva(), "sparse startup profile authenticated");
-                successes.push((page_key, entry));
+                successes.push((Some(page_key), entry));
             }
             Err(error) => {
                 debug!(page_key = ?page_key, reason = %format!("{error:#}"), "sparse startup profile rejected");
@@ -246,6 +176,19 @@ pub(crate) fn select_output_entry(mapped: &mut [u8], pe: &Pe) -> Result<Selected
         }
     }
 
+    if successes.len() > 1
+        && successes.iter().all(|(_, entry)| {
+            matches!(
+                entry.semantic().map(|e| e.evidence),
+                Some(SemanticEvidence::Amd64Msvc { .. })
+            )
+        })
+    {
+        let sites = super::native::amd64::unwind_push_sites(mapped, pe)?;
+        corroborate_sparse(mapped, pe, &mut successes, |bytes, _| {
+            super::native::amd64::matches_unwind_pushes(bytes, &sites)
+        })?;
+    }
     if successes.len() > 1
         && pe.machine_kind() == Machine::I386
         && successes.iter().all(|(_, entry)| {
@@ -282,7 +225,8 @@ pub(crate) fn select_output_entry(mapped: &mut [u8], pe: &Pe) -> Result<Selected
         );
     };
 
-    decode_sparse_text_pages_in_place(mapped, pe, *page_key).with_context(|| {
+    let page_key = page_key.context("sparse page evidence has no authenticated decoded startup")?;
+    decode_sparse_text_pages_in_place(mapped, pe, page_key).with_context(|| {
         format!("applying selected sparse executable-page profile {page_key:?}")
     })?;
     info!(
@@ -292,7 +236,7 @@ pub(crate) fn select_output_entry(mapped: &mut [u8], pe: &Pe) -> Result<Selected
     );
     Ok(SelectedOutputProfile {
         entry: *entry,
-        code_transform: sparse_code_transform(*page_key),
+        code_transform: sparse_code_transform(page_key),
     })
 }
 
