@@ -178,11 +178,33 @@ pub(super) fn recover(
         }
     }
 
+    if has_unmapped_data(&recovered_mapped, &recovered_pe)? {
+        return Ok(None);
+    }
+
     Ok(Some(PogoRecovery {
         mapped: recovered_mapped,
         pe: recovered_pe,
         directories,
     }))
+}
+
+fn has_unmapped_data(mapped: &[u8], pe: &Pe) -> Result<bool> {
+    let mut end = pe.size_of_headers as usize;
+    for section in &pe.sections {
+        let range = section.virtual_range()?;
+        let gap = mapped
+            .get(end..range.start as usize)
+            .context("POGO section gap is outside the recovered layout")?;
+        if gap.iter().any(|&byte| byte != 0) {
+            return Ok(true);
+        }
+        end = range.end as usize;
+    }
+    let tail = mapped
+        .get(end..)
+        .context("POGO section exceeds the recovered image")?;
+    Ok(tail.iter().any(|&byte| byte != 0))
 }
 
 fn parse_gctl(
@@ -946,6 +968,27 @@ mod tests {
                 characteristics: 0x6000_0020,
             }],
             file_len: 0,
+        }
+    }
+
+    #[test]
+    fn compact_layout_rejects_nonzero_header_section_and_tail_gaps() {
+        let mut pe = test_pe();
+        pe.sections[0].virtual_size = 0x100;
+        let mut second = pe.sections[0].clone();
+        second.index = 1;
+        second.virtual_address = 0x2000;
+        pe.sections.push(second);
+        pe.section_count = 2;
+        let mut mapped = vec![0; pe.size_of_image as usize];
+        for offset in [0x3ff, 0x1000, 0x10ff, 0x2000, 0x20ff] {
+            mapped[offset] = 1;
+        }
+        assert!(!has_unmapped_data(&mapped, &pe).unwrap());
+        for offset in [0x400, 0xfff, 0x1100, 0x1fff, 0x2100, 0x7fff] {
+            mapped[offset] = 1;
+            assert!(has_unmapped_data(&mapped, &pe).unwrap());
+            mapped[offset] = 0;
         }
     }
 

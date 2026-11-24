@@ -49,7 +49,9 @@ const MAX_SCAN_NESTED_WORK: usize = 16_000_000;
 /// The immutable handoff from packer-specific recovery to PE serialization.
 /// Authenticated payload-block destinations and POGO contributions take precedence;
 /// header values and structural scans are bounded fallback evidence.
-pub(crate) struct ReconstructionInput {
+pub(crate) struct ReconstructionInput<'a> {
+    pub(crate) packed: &'a [u8],
+    pub(crate) packed_pe: &'a Pe,
     pub(crate) mapped: Vec<u8>,
     pub(crate) decrypted_pe: Pe,
     pub(crate) output_entry: OutputEntry,
@@ -119,8 +121,10 @@ impl ScanBudget {
 /// placement first, including in-place standard imports. When that linker
 /// metadata is absent or uses an unsupported contribution family, bounded
 /// structural recovery emits the loader graph into a normalized import section.
-pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
+pub(crate) fn rebuild(input: ReconstructionInput<'_>) -> Result<Vec<u8>> {
     let ReconstructionInput {
+        packed,
+        packed_pe,
         mut mapped,
         decrypted_pe,
         output_entry,
@@ -175,6 +179,7 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
         decrypted_pe.directory(BASE_RELOCATION_DIRECTORY)?,
         selected_relocations,
         &destination_ranges,
+        Some((packed, packed_pe)),
     )?;
     let generated_rva = pe::align_up(decrypted_pe.size_of_image, decrypted_pe.section_alignment)?;
     let (relocation_directory, relocation_prefix) = place_base_relocation_payload(
@@ -2121,11 +2126,10 @@ pub(crate) fn declared_relocations_match_tls_closure(
 }
 
 fn validate_tls_relocation_closure(
-    mapped: &[u8],
-    pe: &Pe,
+    required_slots: &[BaseRelocationSlot],
     entries: &[BaseRelocationSlot],
 ) -> Result<()> {
-    for required in required_tls_relocation_slots(mapped, pe)? {
+    for required in required_slots {
         ensure!(
             has_effective_relocation(entries, required.target_rva),
             "dynamic-base TLS field or callback at RVA {:#x} lacks a base relocation",
@@ -2160,12 +2164,46 @@ fn emit_base_relocation_payload(entries: &[BaseRelocationSlot]) -> Result<Vec<u8
     Ok(output)
 }
 
+fn matches_packed_tls_stub(
+    packed: &[u8],
+    packed_pe: &Pe,
+    mapped: &[u8],
+    pe: &Pe,
+    required: &[BaseRelocationSlot],
+) -> Result<bool> {
+    let tls = pe.directory(TLS_DIRECTORY)?;
+    if packed_pe.machine_kind() != pe.machine_kind()
+        || packed_pe.image_base != pe.image_base
+        || packed_pe.directory(TLS_DIRECTORY)? != tls
+    {
+        return Ok(false);
+    }
+    let declared = packed_pe.directory(BASE_RELOCATION_DIRECTORY)?;
+    let expected = emit_base_relocation_payload(required)?;
+    if declared.size as usize != expected.len() || declared.is_empty() {
+        return Ok(false);
+    }
+    let range = packed_pe.rva_range_to_file_offset(declared.virtual_address, expected.len())?;
+    if packed[range] != expected {
+        return Ok(false);
+    }
+    let width = pe.pointer_width().bytes();
+    for slot in required {
+        let source = packed_pe.rva_range_to_file_offset(slot.target_rva, width)?;
+        if rva_slice(mapped, pe, slot.target_rva, width) != Some(&packed[source]) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn canonical_base_relocation_payload(
     mapped: &[u8],
     pe: &Pe,
     declared: DataDirectory,
     selected: Option<DataDirectory>,
     destination_ranges: &[Range<u32>],
+    packed_source: Option<(&[u8], &Pe)>,
 ) -> Result<Vec<u8>> {
     let selected_slots = selected
         .map(|directory| base_relocation_slots(mapped, pe, directory))
@@ -2217,10 +2255,28 @@ fn canonical_base_relocation_payload(
             }
         }
     }
+    let mut required = required_tls_relocation_slots(mapped, pe)?;
+    if required
+        .iter()
+        .any(|slot| !has_effective_relocation(&entries, slot.target_rva))
+        && let Some((packed, packed_pe)) = packed_source
+    {
+        required.sort_unstable_by_key(|slot| slot.target_rva);
+        if matches_packed_tls_stub(packed, packed_pe, mapped, pe, &required)? {
+            for &slot in &required {
+                if placeholders.contains(&slot.target_rva)
+                    && let Err(position) =
+                        entries.binary_search_by_key(&slot.target_rva, |e| e.target_rva)
+                {
+                    entries.insert(position, slot);
+                }
+            }
+        }
+    }
     for &entry in &entries {
         validate_preferred_relocation_value(mapped, pe, entry)?;
     }
-    validate_tls_relocation_closure(mapped, pe, &entries)?;
+    validate_tls_relocation_closure(&required, &entries)?;
     emit_base_relocation_payload(&entries)
 }
 

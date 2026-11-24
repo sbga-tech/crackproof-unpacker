@@ -22,6 +22,7 @@ The unpacker has passed 75 samples from games dated from 2018 through 2026.
 
 The unpacker fails closed when descriptors, decryption chains, startup semantics, imports, or output provenance are missing or ambiguous.
 Reconstructed files are normalized for correctness and may not be byte-identical to a runtime image or another unpacker's output.
+If linker metadata describes a compact section layout that would omit nonzero mapped bytes, the unpacker tries the general PE layout and verifies that output instead.
 
 ## Build
 

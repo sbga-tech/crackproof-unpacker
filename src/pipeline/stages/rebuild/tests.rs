@@ -875,6 +875,7 @@ fn canonical_relocations_merge_declared_reserved_slots() {
         declared,
         Some(selected),
         std::slice::from_ref(&hidden_destination),
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -929,11 +930,35 @@ fn dynamic_base_tls_requires_complete_relocation_closure() {
         virtual_address: 0,
         size: 0,
     };
-    assert!(canonical_base_relocation_payload(&image, &pe, empty, Some(selected), &[]).is_err());
+    assert!(
+        canonical_base_relocation_payload(&image, &pe, empty, Some(selected), &[], None).is_err()
+    );
+    let mut packed_pe = pe.clone();
+    packed_pe.directories[BASE_RELOCATION_DIRECTORY] = selected;
+    let mut packed = vec![0; packed_pe.file_len];
+    packed[0x200..].copy_from_slice(&image[0x1000..]);
+    packed[0x70c..0x70e].copy_from_slice(&0xa110u16.to_le_bytes());
+    let recover = |bytes: &[u8], mapped: &[u8]| {
+        canonical_base_relocation_payload(
+            mapped,
+            &pe,
+            empty,
+            Some(selected),
+            &[],
+            Some((bytes, &packed_pe)),
+        )
+    };
+    let restored = recover(&packed, &image).unwrap();
+    assert_eq!(&restored[12..14], &0xa110u16.to_le_bytes());
+    packed[0x310] ^= 1;
+    assert!(recover(&packed, &image).is_err());
+    packed[0x310] ^= 1;
+    image[0x150c..0x150e].copy_from_slice(&0x0114u16.to_le_bytes());
+    assert!(recover(&packed, &image).is_err());
 
     image[0x150c..0x150e].copy_from_slice(&0xa110u16.to_le_bytes());
     let payload =
-        canonical_base_relocation_payload(&image, &pe, empty, Some(selected), &[]).unwrap();
+        canonical_base_relocation_payload(&image, &pe, empty, Some(selected), &[], None).unwrap();
     assert_eq!(u32::from_le_bytes(payload[4..8].try_into().unwrap()), 20);
     assert_eq!(
         u16::from_le_bytes(payload[12..14].try_into().unwrap()),
@@ -1033,6 +1058,7 @@ fn authenticated_relocations_override_nonprovenant_declared_streams() {
         declared,
         Some(selected),
         std::slice::from_ref(&hidden_destination),
+        None,
     )
     .unwrap();
     assert_eq!(

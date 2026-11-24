@@ -66,8 +66,9 @@ const NESTED_FINAL_CHECKSUM_FROM_PRIMARY: u32 = 0xd88;
 const NESTED_TERMINAL_SEED_FROM_STAGE4: u32 = 0xf70;
 const AL_PROGRAM_WINDOW_LENGTH: u32 = MAX_AL_PROGRAM_BYTES as u32;
 const CONTROLLER_METADATA_RELATIVE: u32 = 0x40;
+const COMPACT_METADATA_RELATIVE: u32 = 0x20;
 const CONTROLLER_METADATA_LENGTH: u32 = 0x90;
-const CONTROLLER_DIRECTORIES_RELATIVE: u32 = 0x50;
+const METADATA_DIRECTORIES_OFFSET: u32 = 0x10;
 const CONTROLLER_DIRECTORIES_LENGTH: usize = 0x80;
 const MAX_REPLAY_WORK: usize = 512 << 20;
 const DATA_DIRECTORY_LENGTH: usize = 8;
@@ -661,11 +662,12 @@ fn profile(stage5: StageDescriptor) -> Result<Profile> {
 fn replay_controller_metadata(
     image: &mut [u8],
     controller_rva: u32,
+    relative: u32,
     cancellation: Option<&CancellationToken>,
 ) -> Result<HeaderMetadata> {
     let metadata_rva = add_rva(
         controller_rva,
-        CONTROLLER_METADATA_RELATIVE,
+        relative,
         "PE64 EXE terminal-profile-dispatch controller metadata",
     )?;
     let metadata_range = range(
@@ -681,8 +683,8 @@ fn replay_controller_metadata(
         "PE64 EXE terminal-profile-dispatch entry",
     )?;
     let directories_rva = add_rva(
-        controller_rva,
-        CONTROLLER_DIRECTORIES_RELATIVE,
+        metadata_rva,
+        METADATA_DIRECTORIES_OFFSET,
         "PE64 EXE terminal-profile-dispatch controller directories",
     )?;
     let directories_range = range(
@@ -705,6 +707,55 @@ fn replay_controller_metadata(
         .expect("PE64 EXE terminal-profile-dispatch controller directory span is fixed");
     image[metadata_range].copy_from_slice(&original);
     Ok(HeaderMetadata { entry, directories })
+}
+
+fn select_header_metadata(
+    image: &mut [u8],
+    controller_rva: u32,
+    source: &BoundPayloadSource<'_>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<HeaderMetadata> {
+    let ordinary = replay_controller_metadata(
+        image,
+        controller_rva,
+        CONTROLLER_METADATA_RELATIVE,
+        cancellation,
+    )?;
+    let first = &source.pe.sections[0];
+    let overlap = (CONTROLLER_METADATA_RELATIVE - COMPACT_METADATA_RELATIVE) as usize;
+    let tail = &ordinary.directories[CONTROLLER_DIRECTORIES_LENGTH - overlap..];
+    if first.name_bytes != *b".text\0\0\0"
+        || tail[..8] != first.name_bytes
+        || read_u32(tail, 12)? != first.virtual_address
+    {
+        return Ok(ordinary);
+    }
+    let compact = replay_controller_metadata(
+        image,
+        controller_rva,
+        COMPACT_METADATA_RELATIVE,
+        cancellation,
+    )?;
+    ensure!(
+        source
+            .pe
+            .section_for_rva_range(compact.entry, 1)?
+            .characteristics
+            & 0x2000_0000
+            != 0,
+        "compact terminal entry is not executable"
+    );
+    for slot in [3, 6] {
+        let dir = source.pe.directory(slot)?;
+        ensure!(
+            !dir.is_empty()
+                && read_u32(&compact.directories, slot * DATA_DIRECTORY_LENGTH)?
+                    == dir.virtual_address
+                && read_u32(&compact.directories, slot * DATA_DIRECTORY_LENGTH + 4)? == dir.size,
+            "compact terminal directory {slot} differs from packed PE evidence"
+        );
+    }
+    Ok(compact)
 }
 
 // The rooted checksum header substitutes a loader-owned resource location.
@@ -1346,7 +1397,8 @@ pub(super) fn recover(
         metadata_records,
         cancellation,
     )?;
-    let mut metadata = replay_controller_metadata(&mut controller_image, info[3], cancellation)?;
+    let mut metadata =
+        select_header_metadata(&mut controller_image, info[3], source, cancellation)?;
     restore_static_resource_directory(&mut metadata, source)?;
     prefill_managed_section(&mut controller_image, source)?;
     let terminal_rva = stage5_before.destination;

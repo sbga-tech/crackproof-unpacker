@@ -548,6 +548,8 @@ impl<'a> Pipeline<'a> {
                         })
                 } else {
                     rebuild::rebuild(ReconstructionInput {
+                        packed: &packed,
+                        packed_pe: &packed_pe,
                         mapped: image,
                         decrypted_pe,
                         output_entry,
