@@ -110,7 +110,7 @@ fn run_machine(args: Args, mode: Mode) -> i32 {
         }
         return 1;
     }
-    let mut observer = ObserverAdapter::new(hub.clone());
+    let mut observer = ObserverAdapter::new(hub.clone(), mode == Mode::Events);
     let request = PipelineRequest {
         input: args.input,
         output: args.output,

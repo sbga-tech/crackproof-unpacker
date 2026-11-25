@@ -35,6 +35,93 @@ struct StartupEvidence {
     direct_callee: bool,
 }
 
+pub(in crate::pipeline::stages::startup) fn cookie_time_import(
+    mapped: &[u8],
+    pe: &Pe,
+) -> Result<Option<u32>> {
+    use crate::pipeline::stages::imports::{
+        ImportProfile, ImportSymbol, discover_imports_in_image,
+    };
+    let graph = discover_imports_in_image(mapped, pe, ImportProfile::EncodedLoader)?;
+    let mut slot = None;
+    for module in &graph.modules {
+        if !module.dll.eq_ignore_ascii_case("kernel32.dll") {
+            continue;
+        }
+        for (i, symbol) in module.symbols.iter().enumerate() {
+            if matches!(symbol, ImportSymbol::Name { name, .. } if name == "GetSystemTimeAsFileTime")
+            {
+                if slot.is_some() {
+                    return Ok(None);
+                }
+                let rva = module.destination_rva + u32::try_from(i * 4)?;
+                slot = Some(u32::try_from(pe.rva_to_va(rva)?)?);
+            }
+        }
+    }
+    Ok(slot)
+}
+
+pub(in crate::pipeline::stages::startup) fn cookie_calls_time_import(
+    mapped: &[u8],
+    init: u32,
+    slot: u32,
+) -> bool {
+    let start = init as usize;
+    let bytes = &mapped[start..start + I386_COOKIE_EVIDENCE_LEN];
+    bytes.windows(10).any(|w| {
+        w[0] == 0x8d
+            && w[1] & 0xc7 == 0x45
+            && (w[2] as i8) <= -8
+            && w[3] == 0x50 + ((w[1] >> 3) & 7)
+            && w[4..6] == [0xff, 0x15]
+            && w[6..] == slot.to_le_bytes()
+    })
+}
+
+pub(crate) fn verify_dll_entry(mapped: &[u8], pe: &Pe) -> Result<u32> {
+    let ranges = executable_section_ranges(mapped, pe)?;
+    let entry = pe.entry_rva;
+    ensure!(
+        is_executable_range(&ranges, entry, 35)?,
+        "I386 DLL entry is outside executable code"
+    );
+    let code = mapped_bytes(mapped, entry, 35)?;
+    ensure!(
+        code[..10] == [0x55, 0x8b, 0xec, 0x83, 0x7d, 0x0c, 1, 0x75, 5, 0xe8]
+            && code[14..24] == [0xff, 0x75, 0x10, 0xff, 0x75, 0x0c, 0xff, 0x75, 8, 0xe8]
+            && code[28..] == [0x83, 0xc4, 0x0c, 0x5d, 0xc2, 0x0c, 0],
+        "I386 DLL entry lacks its process-attach and stdcall dispatch contract"
+    );
+    let init = direct_rel32_target(mapped, entry + 9, 0xe8)?.context("invalid DLL cookie call")?;
+    let dispatch =
+        direct_rel32_target(mapped, entry + 23, 0xe8)?.context("invalid DLL CRT call")?;
+    ensure!(
+        is_executable_range(&ranges, init, I386_COOKIE_EVIDENCE_LEN)?
+            && is_executable_range(&ranges, dispatch, 12)?,
+        "I386 DLL CRT targets are not executable"
+    );
+    let (cookie, _) = i386_security_cookie_evidence(mapped, pe, &ranges, init, true)?
+        .context("missing DLL cookie initializer proof")?;
+    let prolog = mapped_bytes(mapped, dispatch, 12)?;
+    ensure!(
+        prolog[0] == 0x6a && prolog[1] > 0 && prolog[1] <= 0x7f && prolog[2] == 0x68,
+        "I386 DLL CRT dispatch lacks SEH arguments"
+    );
+    let scope = pe.va_to_rva(u64::from(read_u32_rva(mapped, dispatch + 3)?))?;
+    ensure!(
+        is_mapped_readable_non_executable_range(mapped, pe, &ranges, scope, 4)?,
+        "I386 DLL SEH scope is not readable data"
+    );
+    let seh =
+        direct_rel32_target(mapped, dispatch + 7, 0xe8)?.context("missing DLL SEH helper call")?;
+    ensure!(
+        i386_seh_startup_helper_evidence(mapped, pe, &ranges, seh, cookie)?,
+        "DLL CRT helper does not bind the same security cookie"
+    );
+    Ok(entry)
+}
+
 pub(crate) fn discover_i386_semantic_entry(mapped: &[u8], pe: &Pe) -> Result<SemanticEntry> {
     let executable_ranges = executable_section_ranges(mapped, pe)?;
     ensure_executable_scan_bound(&executable_ranges)?;

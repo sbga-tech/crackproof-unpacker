@@ -11,7 +11,7 @@ use super::{
     EXPORT_DIRECTORY, IAT_DIRECTORY, IMAGE_IMPORT_DESCRIPTOR_SIZE, IMPORT_DIRECTORY, ScanBudget,
     canonical_import_graph, covered_by_destinations, parse_export_candidate,
     parse_import_candidate, parse_relocation_candidate, resource_node, rva_slice, u32_at,
-    validate_base_relocation_directory, validate_debug_directory, validate_exception_directory,
+    assess_exception_directory, validate_base_relocation_directory, validate_debug_directory,
 };
 
 const DEBUG_DIRECTORY: usize = 6;
@@ -52,6 +52,7 @@ pub(super) struct PogoRecovery {
     pub(super) mapped: Vec<u8>,
     pub(super) pe: Pe,
     pub(super) directories: Vec<(usize, DataDirectory)>,
+    pub(super) defect: Option<super::SourceDefect>,
 }
 
 pub(super) fn recover(
@@ -60,7 +61,7 @@ pub(super) fn recover(
     discovery: &LoaderDiscovery,
     destination_ranges: &[Range<u32>],
 ) -> Result<Option<PogoRecovery>> {
-    let Some(gctl) = parse_gctl(mapped, pe, destination_ranges)? else {
+    let Some(gctl) = parse_pogo(mapped, pe, destination_ranges, GCTL_SIGNATURE)? else {
         return Ok(None);
     };
     let Some(grouped) = group_contributions(&gctl)? else {
@@ -137,9 +138,11 @@ pub(super) fn recover(
         virtual_address: range.start,
         size: range.end - range.start,
     });
-    if let Some(exception) = exception_directory {
-        validate_exception_directory(&recovered_mapped, &recovered_pe, exception)?;
-    }
+    let defect = if let Some(exception) = exception_directory {
+        assess_exception_directory(&recovered_mapped, &recovered_pe, exception, Some(discovery))?
+    } else {
+        None
+    };
     validate_base_relocation_directory(&recovered_mapped, &recovered_pe, relocation)?;
     validate_debug_directory(&recovered_mapped, &recovered_pe, debug)?;
 
@@ -178,17 +181,41 @@ pub(super) fn recover(
         }
     }
 
+    if has_unmapped_data(&recovered_mapped, &recovered_pe)? {
+        return Ok(None);
+    }
+
     Ok(Some(PogoRecovery {
         mapped: recovered_mapped,
         pe: recovered_pe,
         directories,
+        defect,
     }))
 }
 
-fn parse_gctl(
+fn has_unmapped_data(mapped: &[u8], pe: &Pe) -> Result<bool> {
+    let mut end = pe.size_of_headers as usize;
+    for section in &pe.sections {
+        let range = section.virtual_range()?;
+        let gap = mapped
+            .get(end..range.start as usize)
+            .context("POGO section gap is outside the recovered layout")?;
+        if gap.iter().any(|&byte| byte != 0) {
+            return Ok(true);
+        }
+        end = range.end as usize;
+    }
+    let tail = mapped
+        .get(end..)
+        .context("POGO section exceeds the recovered image")?;
+    Ok(tail.iter().any(|&byte| byte != 0))
+}
+
+fn parse_pogo(
     mapped: &[u8],
     pe: &Pe,
     destination_ranges: &[Range<u32>],
+    signature: &[u8; 4],
 ) -> Result<Option<GctlLayout>> {
     let Some(debug) = pe
         .directories
@@ -240,24 +267,20 @@ fn parse_gctl(
         );
         let payload = rva_slice(mapped, pe, rva, usize::try_from(size)?)
             .context("POGO payload exceeds mapped image")?;
-        if !payload.starts_with(GCTL_SIGNATURE) {
+        if !payload.starts_with(signature) {
             continue;
         }
         ensure!(
             selected.is_none(),
-            "multiple authenticated GCTL payloads found"
+            "multiple authenticated POGO layouts found"
         );
-        selected = Some(parse_gctl_payload(payload, pe)?);
+        selected = Some(parse_contributions(&payload[signature.len()..], pe)?);
     }
     Ok(selected)
 }
 
-fn parse_gctl_payload(payload: &[u8], pe: &Pe) -> Result<GctlLayout> {
-    ensure!(
-        payload.starts_with(GCTL_SIGNATURE),
-        "GCTL signature is absent"
-    );
-    let mut offset = GCTL_SIGNATURE.len();
+fn parse_contributions(payload: &[u8], pe: &Pe) -> Result<GctlLayout> {
+    let mut offset = 0;
     let mut contributions = Vec::new();
     let mut previous_end = 0u32;
     while offset < payload.len() {
@@ -472,6 +495,56 @@ fn recovered_pe(
         pe::align_up(u32::try_from(section_table_end)?, recovered.file_alignment)?;
     recovered.size_of_image = pe::align_up(relocation_range.end, recovered.section_alignment)?;
     Ok(recovered)
+}
+
+pub(super) fn relocation_after_resources(
+    mapped: &[u8],
+    pe: &Pe,
+    destinations: &[Range<u32>],
+    records: &[Range<u32>],
+) -> Result<Option<DataDirectory>> {
+    let Some(layout) = parse_pogo(mapped, pe, destinations, &[0; 4])? else {
+        return Ok(None);
+    };
+    let [.., tree, data] = layout.contributions.as_slice() else {
+        return Ok(None);
+    };
+    if tree.name != ".rsrc$01" || data.name != ".rsrc$02" || tree.range.end != data.range.start {
+        return Ok(None);
+    }
+    let root = tree.range.start;
+    let start = pe::align_up(data.range.end, pe.section_alignment)?;
+    let Some(owner) = destinations
+        .iter()
+        .find(|r| r.contains(&root) && r.contains(&start))
+    else {
+        return Ok(None);
+    };
+    if !records.iter().any(|r| r.start == start) {
+        return Ok(None);
+    }
+    let section = pe.section_for_rva_range(
+        root,
+        (start - root) as usize + BASE_RELOCATION_BLOCK_HEADER_SIZE,
+    )?;
+    if section.characteristics & super::IMAGE_SCN_MEM_EXECUTE != 0
+        || !resource_node(mapped, pe, root, root, 0, &mut 0)?
+            .is_some_and(|end| data.range.contains(&(end - 1)))
+    {
+        return Ok(None);
+    }
+    let end = section.virtual_range()?.end.min(owner.end);
+    let Some(candidate) =
+        parse_relocation_candidate(mapped, pe, start, end, &mut ScanBudget::default())?
+    else {
+        return Ok(None);
+    };
+    let tail = &mapped[(start + candidate.size) as usize..end as usize];
+    ensure!(
+        tail.len() < pe.section_alignment as usize && tail.iter().all(|&b| b == 0),
+        "relocation stream after resources does not close its authenticated destination"
+    );
+    Ok(Some(candidate))
 }
 
 fn recover_relocations(
@@ -949,6 +1022,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compact_layout_rejects_nonzero_header_section_and_tail_gaps() {
+        let mut pe = test_pe();
+        pe.sections[0].virtual_size = 0x100;
+        let mut second = pe.sections[0].clone();
+        second.index = 1;
+        second.virtual_address = 0x2000;
+        pe.sections.push(second);
+        pe.section_count = 2;
+        let mut mapped = vec![0; pe.size_of_image as usize];
+        for offset in [0x3ff, 0x1000, 0x10ff, 0x2000, 0x20ff] {
+            mapped[offset] = 1;
+        }
+        assert!(!has_unmapped_data(&mapped, &pe).unwrap());
+        for offset in [0x400, 0xfff, 0x1100, 0x1fff, 0x2100, 0x7fff] {
+            mapped[offset] = 1;
+            assert!(has_unmapped_data(&mapped, &pe).unwrap());
+            mapped[offset] = 0;
+        }
+    }
+
     fn append_contribution(payload: &mut Vec<u8>, rva: u32, size: u32, name: &str) {
         payload.extend_from_slice(&rva.to_le_bytes());
         payload.extend_from_slice(&size.to_le_bytes());
@@ -957,6 +1051,56 @@ mod tests {
         while !payload.len().is_multiple_of(4) {
             payload.push(0);
         }
+    }
+
+    #[test]
+    fn resource_contributions_identify_an_interior_relocation_producer() {
+        let mut pe = test_pe();
+        pe.sections[0].characteristics = 0x4000_0040;
+        pe.directories[DEBUG_DIRECTORY] = DataDirectory {
+            virtual_address: 0x1100,
+            size: 28,
+        };
+        let mut mapped = vec![0; pe.size_of_image as usize];
+        let mut payload = vec![0; 4];
+        append_contribution(&mut payload, 0x2000, 0x100, ".rsrc$01");
+        append_contribution(&mut payload, 0x2100, 0x20, ".rsrc$02");
+        mapped[0x1200..0x1200 + payload.len()].copy_from_slice(&payload);
+        for (offset, value) in [
+            (0x110c, 13u32),
+            (0x1110, payload.len() as u32),
+            (0x1114, 0x1200),
+            (0x1118, 0x1200),
+            (0x2014, 0x80000020),
+            (0x2034, 0x80000040),
+            (0x2054, 0x60),
+            (0x2060, 0x2100),
+            (0x2064, 0x20),
+            (0x3000, 0x1000),
+            (0x3004, 12),
+        ] {
+            mapped[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for offset in [0x200e, 0x202e, 0x204e] {
+            mapped[offset] = 1;
+        }
+        mapped[0x3008..0x300a].copy_from_slice(&0xa800u16.to_le_bytes());
+        mapped[0x1800..0x1808].copy_from_slice(&(pe.image_base + 0x1600).to_le_bytes());
+        let destinations = [0x1000..0x3200];
+        let records = [0x1000..0x3000, 0x3000..0x3200];
+        let recover = |bytes: &[u8], records: &[Range<u32>]| {
+            relocation_after_resources(bytes, &pe, &destinations, records)
+        };
+        assert_eq!(
+            recover(&mapped, &records).unwrap(),
+            Some(DataDirectory {
+                virtual_address: 0x3000,
+                size: 12
+            })
+        );
+        assert_eq!(recover(&mapped, &destinations).unwrap(), None);
+        mapped[0x300c] = 1;
+        assert!(recover(&mapped, &records).is_err());
     }
 
     #[test]
@@ -971,7 +1115,7 @@ mod tests {
         append_contribution(&mut payload, 0x5000, 0x100, "_RDATA");
         append_contribution(&mut payload, 0x6000, 0x200, ".rsrc$01");
 
-        let gctl = parse_gctl_payload(&payload, &pe).unwrap();
+        let gctl = parse_contributions(&payload[GCTL_SIGNATURE.len()..], &pe).unwrap();
         let grouped = group_contributions(&gctl).unwrap().unwrap();
 
         assert_eq!(grouped[&SectionKind::Text], 0x1000..0x2000);
@@ -986,12 +1130,12 @@ mod tests {
         let mut overlapping = GCTL_SIGNATURE.to_vec();
         append_contribution(&mut overlapping, 0x1000, 0x1000, ".text");
         append_contribution(&mut overlapping, 0x1800, 0x100, ".rdata");
-        assert!(parse_gctl_payload(&overlapping, &pe).is_err());
+        assert!(parse_contributions(&overlapping[GCTL_SIGNATURE.len()..], &pe).is_err());
 
         let mut padded = GCTL_SIGNATURE.to_vec();
         append_contribution(&mut padded, 0x1000, 0x1000, ".text");
         *padded.last_mut().unwrap() = 1;
-        assert!(parse_gctl_payload(&padded, &pe).is_err());
+        assert!(parse_contributions(&padded[GCTL_SIGNATURE.len()..], &pe).is_err());
     }
 
     #[test]
@@ -1002,7 +1146,7 @@ mod tests {
         append_contribution(&mut payload, 0x2000, 0x1000, ".rdata");
         append_contribution(&mut payload, 0x3000, 0x800, ".data");
 
-        let gctl = parse_gctl_payload(&payload, &pe).unwrap();
+        let gctl = parse_contributions(&payload[GCTL_SIGNATURE.len()..], &pe).unwrap();
         let grouped = group_contributions(&gctl).unwrap().unwrap();
 
         assert!(!grouped.contains_key(&SectionKind::Pdata));

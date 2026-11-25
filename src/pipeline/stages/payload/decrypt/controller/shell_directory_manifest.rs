@@ -47,6 +47,9 @@ const MAX_ZERO_FILL_BYTES: usize = 512 << 20;
 enum ManifestProfile {
     Direct,
     Compact,
+    LegacyExecutable,
+    Dll1874,
+    Dll1898,
 }
 
 impl ManifestProfile {
@@ -54,20 +57,24 @@ impl ManifestProfile {
         match self {
             Self::Direct => 0x1670,
             Self::Compact => 0x1590,
+            Self::LegacyExecutable => 0x1640,
+            Self::Dll1874 => 0x1200,
+            Self::Dll1898 => 0x1230,
         }
     }
 
     const fn controller_layout_shift(self) -> u32 {
         match self {
-            Self::Direct => 0x10,
+            Self::Direct | Self::Dll1898 => 0x10,
             Self::Compact => 0x28,
+            Self::LegacyExecutable | Self::Dll1874 => 0,
         }
     }
 
     const fn codec_operation_relative(self) -> u32 {
         match self {
-            Self::Direct => 0x15e0,
-            Self::Compact => 0x13d8,
+            Self::Direct | Self::Dll1898 => 0x15e0,
+            Self::Compact | Self::LegacyExecutable | Self::Dll1874 => 0x13d8,
         }
     }
 
@@ -75,6 +82,9 @@ impl ManifestProfile {
         match self {
             Self::Direct => 0xad0,
             Self::Compact => 0xf70,
+            Self::LegacyExecutable => 0xa90,
+            Self::Dll1874 => 0x978,
+            Self::Dll1898 => 0x9a8,
         }
     }
 
@@ -82,6 +92,9 @@ impl ManifestProfile {
         match self {
             Self::Direct => 0xa70,
             Self::Compact => 0xf00,
+            Self::LegacyExecutable => 0xa30,
+            Self::Dll1874 => 0x918,
+            Self::Dll1898 => 0x948,
         }
     }
 
@@ -93,6 +106,8 @@ impl ManifestProfile {
         match self {
             Self::Direct => 0xa00,
             Self::Compact => 0xe20,
+            Self::LegacyExecutable => 0x9c0,
+            Self::Dll1874 | Self::Dll1898 => self.byte_map_program_relative() - 0x38,
         }
     }
 
@@ -100,6 +115,9 @@ impl ManifestProfile {
         match self {
             Self::Direct => 0x42a0,
             Self::Compact => 0x4fc0,
+            Self::LegacyExecutable => 0x42c0,
+            Self::Dll1874 => 0x2484,
+            Self::Dll1898 => 0x2458,
         }
     }
 
@@ -107,6 +125,9 @@ impl ManifestProfile {
         match self {
             Self::Direct => 0x40dc,
             Self::Compact => 0x4de0,
+            Self::LegacyExecutable => 0x408c,
+            Self::Dll1874 => 0x23a8,
+            Self::Dll1898 => 0x237c,
         }
     }
 
@@ -118,20 +139,23 @@ impl ManifestProfile {
         match self {
             Self::Direct => 0x3c48,
             Self::Compact => 0x48b8,
+            Self::LegacyExecutable => 0x3c38,
+            Self::Dll1874 => 0x21a0,
+            Self::Dll1898 => 0x2170,
         }
     }
 
-    const fn checksum_list_from_info(self) -> u32 {
+    fn list_layouts(self) -> &'static [(u32, u32, u32)] {
         match self {
-            Self::Direct => 0x210,
-            Self::Compact => 0x1a0,
-        }
-    }
-
-    const fn compressed_list_from_info(self) -> u32 {
-        match self {
-            Self::Direct => 0x350,
-            Self::Compact => 0x270,
+            Self::Direct => &[(0x210, 0x20, 0x350)],
+            Self::Compact => &[(0x1a0, 0x20, 0x270)],
+            Self::LegacyExecutable => &[
+                (0x1c0, 0x20, 0x2b0),
+                (0x1a0, 0x30, 0x290),
+                (0x1d0, 0x20, 0x2d0),
+            ],
+            Self::Dll1874 => &[(0x180, 0x20, 0x260)],
+            Self::Dll1898 => &[(0x180, 0x20, 0x260), (0x1d0, 0x20, 0x300)],
         }
     }
 
@@ -164,6 +188,41 @@ impl ManifestProfile {
                     shell_length == 0x1c04
                         && (mode, controls) == (0x0000_6000, (0x128, 0x184, 0x1c8)),
                     "rooted compact PE32 shell has the wrong dispatch geometry"
+                );
+            }
+            Self::LegacyExecutable | Self::Dll1874 | Self::Dll1898 => {
+                let nt = read_u32(image, 0x3c)?;
+                let expected_length = match self {
+                    Self::LegacyExecutable => 0x1cc8,
+                    Self::Dll1874 => 0x1874,
+                    Self::Dll1898 => 0x1898,
+                    _ => unreachable!(),
+                };
+                let ranges: &[(u32, u32)] = if read_u32(image, table + 0x5c)? == 0x34 {
+                    &[(0, 0x34), (0x38, 0x20), (0x5c, 0x3c), (0xa0, 0x58)]
+                } else {
+                    ensure!(
+                        self == Self::LegacyExecutable,
+                        "legacy DLL layout lacks its four header spans"
+                    );
+                    &[(0, 0x58), (0x5c, 0x3c), (0xa0, 0x58)]
+                };
+                ensure!(
+                    shell_length == expected_length
+                        && (mode == 0x10000 || (mode == 0 && self == Self::LegacyExecutable)),
+                    "legacy PE32 shell dispatch mismatch"
+                );
+                for (index, &(relative, length)) in ranges.iter().enumerate() {
+                    let field = table + 0x58 + index * 8;
+                    ensure!(
+                        nt.checked_add(relative) == Some(read_u32(image, field)?)
+                            && read_u32(image, field + 4)? == length,
+                        "legacy header checksum span mismatch"
+                    );
+                }
+                ensure!(
+                    read_u32(image, table + 0x58 + ranges.len() * 8 + 4)? == 0,
+                    "legacy header checksum list is not closed"
                 );
             }
         }
@@ -228,6 +287,7 @@ pub(crate) struct Finalizer {
     metadata_entry: u32,
     metadata_directories: [u8; 128],
     shell_table: usize,
+    file_program_candidates: usize,
     byte_map_layer_rva: u32,
     payload_manifest_rva: u32,
     manifest_layout: PayloadManifestLayout,
@@ -251,16 +311,21 @@ fn rooted_shell_marker_table(image: &[u8], root: u32, profile: ManifestProfile) 
 fn rooted_shell_table(image: &[u8], info: &[u32; 8]) -> Result<Option<(ManifestProfile, usize)>> {
     let root = info[6];
 
-    if let Some(table) = rooted_shell_marker_table(image, root, ManifestProfile::Direct) {
-        ManifestProfile::Direct.validate_shell(image, table, root)?;
-        return Ok(Some((ManifestProfile::Direct, table)));
+    let mut selected = None;
+    for profile in [
+        ManifestProfile::Direct,
+        ManifestProfile::Compact,
+        ManifestProfile::LegacyExecutable,
+        ManifestProfile::Dll1874,
+        ManifestProfile::Dll1898,
+    ] {
+        if let Some(table) = rooted_shell_marker_table(image, root, profile) {
+            profile.validate_shell(image, table, root)?;
+            ensure!(selected.is_none(), "multiple rooted PE32 shell tables");
+            selected = Some((profile, table));
+        }
     }
-
-    let Some(table) = rooted_shell_marker_table(image, root, ManifestProfile::Compact) else {
-        return Ok(None);
-    };
-    ManifestProfile::Compact.validate_shell(image, table, root)?;
-    Ok(Some((ManifestProfile::Compact, table)))
+    Ok(selected)
 }
 
 fn rooted_header_checksum(
@@ -325,19 +390,15 @@ fn rooted_manifest_layout(
     let compressed_info_rva = read_u32(image, config + 0x40)?;
     let zero_list_rva = read_u32(image, config + 0x48)?;
     ensure!(
-        file_checksums_rva
-            == info_base
-                .checked_add(profile.checksum_list_from_info())
-                .context("rooted file-checksum list RVA overflows")?
-            && file_checksums_size == 0x20,
-        "rooted payload-manifest checksum list disagrees with its controller profile"
-    );
-    ensure!(
-        compressed_info_rva
-            == info_base
-                .checked_add(profile.compressed_list_from_info())
-                .context("rooted compressed-info list RVA overflows")?,
-        "rooted payload-manifest block list disagrees with its controller profile"
+        profile
+            .list_layouts()
+            .iter()
+            .any(|&(checksum, length, blocks)| {
+                info_base.checked_add(checksum) == Some(file_checksums_rva)
+                    && file_checksums_size == length
+                    && info_base.checked_add(blocks) == Some(compressed_info_rva)
+            }),
+        "rooted payload-manifest lists disagree with controller geometry"
     );
     ensure!(
         zero_list_rva != 0,
@@ -710,7 +771,7 @@ pub(super) fn recover(
     }
     let file_decoder_table = snapshot_decoder_table(&image, key_offsets[0])?;
     let layer_decoder_table = snapshot_decoder_table(&image, key_offsets[1])?;
-    let (file_raw_aes_key, _) = recover_aes(&image, key_offsets[2])?;
+    let (file_raw_aes_key, file_aes) = recover_aes(&image, key_offsets[2])?;
     let (layer_raw_aes_key, layer_aes) = recover_aes(&image, key_offsets[3])?;
 
     let checksum_base = controller_start
@@ -891,6 +952,47 @@ pub(super) fn recover(
         blocks,
     };
     ensure_terminal_zero_ranges_are_disjoint_from_payload_destinations(&zero_ranges, &block_table)?;
+    let (file_program, file_program_candidates) = if matches!(
+        profile,
+        ManifestProfile::LegacyExecutable | ManifestProfile::Dll1874 | ManifestProfile::Dll1898
+    ) {
+        let second_rva = rooted_stage_program_rva(
+            payload_manifest,
+            profile.file_program_relative() + 0x60,
+            0x60,
+            "second legacy PE32 program",
+        )?;
+        let second = exact_lfsr_al_map(&image, second_rva, 0x60, "second legacy PE32 program")?;
+        let mut survivor = None;
+        for program in [file_program, second] {
+            if super::super::replay::chain_prefixes_are_viable(
+                source.payload_source,
+                block_table.stream_base,
+                &block_table.blocks,
+                &file_aes,
+                &file_decoder_table,
+                |bytes| {
+                    for b in bytes {
+                        *b = program.map[usize::from(*b)];
+                    }
+                },
+                true,
+            )? {
+                ensure!(
+                    survivor.is_none(),
+                    "legacy PE32 terminal file program is ambiguous"
+                );
+                survivor = Some(program);
+            }
+        }
+        (
+            survivor
+                .context("neither legacy PE32 terminal file program matches the block stream")?,
+            2,
+        )
+    } else {
+        (file_program, 1)
+    };
     for range in zero_ranges {
         image[range].fill(0);
     }
@@ -913,6 +1015,7 @@ pub(super) fn recover(
             metadata_entry,
             metadata_directories,
             shell_table: table,
+            file_program_candidates,
             byte_map_layer_rva: byte_map_layer.source,
             payload_manifest_rva: payload_manifest.source,
             manifest_layout,
@@ -962,7 +1065,7 @@ pub(super) fn finalize(
         custom_program_rva = finalizer.custom_program.offset,
         file_program_rva = finalizer.file_program.offset,
         file_program_length = finalizer.file_program.length,
-        byte_map_candidates = 1,
+        byte_map_candidates = finalizer.file_program_candidates,
         blocks = block_table.blocks.len(),
         "selected PE32 shell-directory-manifest controller"
     );
@@ -976,7 +1079,7 @@ pub(super) fn finalize(
             decoded_block_count: block_table.blocks.len() - copied_block_count,
             aes_key_candidates: 1,
             decoder_candidates: 1,
-            byte_transform_candidates: 1,
+            byte_transform_candidates: finalizer.file_program_candidates,
             selected_chain: None,
             selected_controller: Some(SelectedController::ShellDirectoryManifest(
                 SelectedShellDirectoryManifestController {

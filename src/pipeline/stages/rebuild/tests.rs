@@ -45,6 +45,32 @@ fn put_u64(image: &mut [u8], rva: usize, value: u64) {
     image[rva..rva + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+#[test]
+fn mapped_verification_exempts_only_debug_file_pointers() {
+    let pe = test_pe();
+    let original = vec![0; pe.size_of_image as usize];
+    let mut actual = original.clone();
+    let debug = [(
+        DEBUG_DIRECTORY,
+        DataDirectory {
+            virtual_address: 0x1100,
+            size: 56,
+        },
+    )];
+    actual[0x1118..0x111c].fill(1);
+    actual[0x1134..0x1138].fill(2);
+    verify_trimmed_section_mapping(&original, &actual, &pe, &debug).unwrap();
+    for rva in [0x1117, 0x111c, 0x1133, 0x1138] {
+        actual[rva] = 3;
+        let error = verify_trimmed_section_mapping(&original, &actual, &pe, &debug).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("trimmed mapped image differs at RVA {rva:#x}")
+        );
+        actual[rva] = 0;
+    }
+}
+
 fn standard_import(image: &mut [u8], start: usize, suffix: u8) {
     put_u32(image, start, (start + 0x40) as u32);
     put_u32(image, start + 12, (start + 0x60) as u32);
@@ -875,6 +901,7 @@ fn canonical_relocations_merge_declared_reserved_slots() {
         declared,
         Some(selected),
         std::slice::from_ref(&hidden_destination),
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -929,11 +956,35 @@ fn dynamic_base_tls_requires_complete_relocation_closure() {
         virtual_address: 0,
         size: 0,
     };
-    assert!(canonical_base_relocation_payload(&image, &pe, empty, Some(selected), &[]).is_err());
+    assert!(
+        canonical_base_relocation_payload(&image, &pe, empty, Some(selected), &[], None).is_err()
+    );
+    let mut packed_pe = pe.clone();
+    packed_pe.directories[BASE_RELOCATION_DIRECTORY] = selected;
+    let mut packed = vec![0; packed_pe.file_len];
+    packed[0x200..].copy_from_slice(&image[0x1000..]);
+    packed[0x70c..0x70e].copy_from_slice(&0xa110u16.to_le_bytes());
+    let recover = |bytes: &[u8], mapped: &[u8]| {
+        canonical_base_relocation_payload(
+            mapped,
+            &pe,
+            empty,
+            Some(selected),
+            &[],
+            Some((bytes, &packed_pe)),
+        )
+    };
+    let restored = recover(&packed, &image).unwrap();
+    assert_eq!(&restored[12..14], &0xa110u16.to_le_bytes());
+    packed[0x310] ^= 1;
+    assert!(recover(&packed, &image).is_err());
+    packed[0x310] ^= 1;
+    image[0x150c..0x150e].copy_from_slice(&0x0114u16.to_le_bytes());
+    assert!(recover(&packed, &image).is_err());
 
     image[0x150c..0x150e].copy_from_slice(&0xa110u16.to_le_bytes());
     let payload =
-        canonical_base_relocation_payload(&image, &pe, empty, Some(selected), &[]).unwrap();
+        canonical_base_relocation_payload(&image, &pe, empty, Some(selected), &[], None).unwrap();
     assert_eq!(u32::from_le_bytes(payload[4..8].try_into().unwrap()), 20);
     assert_eq!(
         u16::from_le_bytes(payload[12..14].try_into().unwrap()),
@@ -1033,6 +1084,7 @@ fn authenticated_relocations_override_nonprovenant_declared_streams() {
         declared,
         Some(selected),
         std::slice::from_ref(&hidden_destination),
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1181,6 +1233,87 @@ fn unwind_info_validates_chain_handlers_and_slot_encoding() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn rsaz_record_geometry_and_import_are_not_sufficient_evidence() {
+    let mut pe = test_pe();
+    pe.machine = Machine::Amd64;
+    let mut text = pe.sections[0].clone();
+    text.virtual_address = 0x2000;
+    text.characteristics = 0x6000_0020;
+    text.name_bytes = *b".text\0\0\0";
+    let mut rdata = text.clone();
+    rdata.virtual_address = 0x3000;
+    rdata.characteristics = 0x4000_0040;
+    rdata.name_bytes = *b".rdata\0\0";
+    pe.sections.extend([text, rdata]);
+    pe.section_count = 3;
+    pe.size_of_image = 0x4000;
+    let mut mapped = vec![0; 0x4000];
+    let marker = b"openssl-3.0.8\\crypto\\";
+    mapped[0x3000..0x3000 + marker.len()].copy_from_slice(marker);
+    let handler = 0x1100u32;
+    let iat = 0x1400u32;
+    put_u32(&mut mapped, handler as usize + 234, iat - (handler + 238));
+    let imports = LoaderDiscovery {
+        table_rva: 0,
+        metadata_ranges: Vec::new(),
+        image_size: pe.size_of_image,
+        modules: vec![ImportModule {
+            dll: "KERNEL32.dll".into(),
+            destination_rva: iat,
+            symbols: vec![ImportSymbol::Name {
+                hint: 0,
+                name: "RtlVirtualUnwind".into(),
+            }],
+        }],
+        function_count: 1,
+        named_count: 1,
+        ordinal_count: 0,
+    };
+    let mut evidence = openssl::RsazRows::default();
+    for (i, (begin, len, disp, constant, body, epilogue)) in [
+        (0x2000u32, 1609, 1124, 64, 31, 1597),
+        (0x2660, 1594, 676, 64, 31, 1582),
+        (0x2ca0, 251, 33, 32, 0, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let record = 0x3200 + i as u32 * 12;
+        let unwind = 0x3300 + i as u32 * 16;
+        for (j, value) in [begin, begin + len, unwind].into_iter().enumerate() {
+            put_u32(&mut mapped, record as usize + j * 4, value);
+        }
+        for (j, value) in [9, handler, begin + body, begin + epilogue]
+            .into_iter()
+            .enumerate()
+        {
+            put_u32(&mut mapped, unwind as usize + j * 4, value);
+        }
+        let operand = begin + disp;
+        put_u32(
+            &mut mapped,
+            operand as usize,
+            (handler - constant).wrapping_sub(operand + 4),
+        );
+        let failure =
+            validate_runtime_function(&mapped, &pe, record, &mut BTreeSet::new(), 0).unwrap_err();
+        let rejected = failure
+            .downcast_ref::<openssl::NonExecutableHandler>()
+            .unwrap();
+        assert_eq!(
+            evidence.accept(&mapped, &pe, &imports, record, rejected),
+            Some(begin)
+        );
+    }
+    assert!(evidence.finish().is_err());
+    let directory = DataDirectory {
+        virtual_address: 0x3200,
+        size: 36,
+    };
+    assert!(assess_exception_directory(&mapped, &pe, directory, Some(&imports)).is_err());
 }
 
 #[test]

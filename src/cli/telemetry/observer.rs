@@ -8,11 +8,12 @@ use super::hub::{EventPayload, SharedHub};
 
 pub(crate) struct ObserverAdapter {
     hub: SharedHub,
+    full_summary: bool,
 }
 
 impl ObserverAdapter {
-    pub(crate) fn new(hub: SharedHub) -> Self {
-        Self { hub }
+    pub(crate) fn new(hub: SharedHub, full_summary: bool) -> Self {
+        Self { hub, full_summary }
     }
 }
 
@@ -99,12 +100,25 @@ impl Observer for ObserverAdapter {
             StateEvent::RunCompleted { summary } => {
                 hub.current_stage = None;
                 hub.current_operation = None;
+                let (level, status, message) = match summary.source_defect {
+                    Some(defect) => (
+                        "warn",
+                        "recovered_with_known_defect",
+                        Some(defect.notice().to_owned()),
+                    ),
+                    None => ("info", "completed", None),
+                };
+                let data = if self.full_summary {
+                    json!({"status": status, "summary": summary})
+                } else {
+                    json!({"status": status, "source_defect": summary.source_defect, "output_artifact": summary.output_artifact})
+                };
                 hub.emit(
-                    "info",
+                    level,
                     None,
                     None,
                     "run_completed",
-                    EventPayload::new(None, json!({"status": "completed", "summary": summary})),
+                    EventPayload::new(message, data),
                 )
             }
             StateEvent::RunFailed { failure } => {
@@ -144,6 +158,11 @@ pub(crate) fn completion_summary(summary: &RunSummary) -> String {
                 output.path.as_deref().unwrap_or("<unknown>"),
                 output.size
             ));
+        } else if summary.source_defect.is_some() {
+            lines.push(format!(
+                "Output recovered in memory  {} bytes  not written",
+                output.size
+            ));
         } else {
             lines.push(format!(
                 "Output verified in memory  {} bytes  not written",
@@ -156,6 +175,9 @@ pub(crate) fn completion_summary(summary: &RunSummary) -> String {
             "Imports {} modules  {} functions",
             imports.module_count, imports.function_count
         ));
+    }
+    if let Some(defect) = summary.source_defect {
+        lines.push(format!("Warning: {}", defect.notice()));
     }
     lines.join("\n")
 }

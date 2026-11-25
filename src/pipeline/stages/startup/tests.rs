@@ -1247,7 +1247,7 @@ fn native_i386_dll_entry_profile_fails_closed() {
     let error = discover_output_entry(&image, &pe).unwrap_err().to_string();
 
     assert!(
-        error.contains("I386 native DLL entry discovery is unsupported"),
+        error.contains("I386 DLL entry lacks its process-attach and stdcall dispatch contract"),
         "{error}"
     );
 }
@@ -1494,6 +1494,57 @@ fn place_standalone_i386_entry(
 }
 
 #[test]
+fn native_i386_dll_requires_matching_dispatch_and_cookie_evidence() {
+    let (mut image, mut pe, layout) = standalone_i386_fixture();
+    pe.coff_characteristics |= crate::pe::IMAGE_FILE_DLL;
+    let dispatch = layout.entry + SEMANTIC_VENEER_LEN as u32;
+    let entry = 0x1600;
+    pe.entry_rva = entry;
+    let start = offset(entry);
+    image[start..start + 35].copy_from_slice(&[
+        0x55, 0x8b, 0xec, 0x83, 0x7d, 0x0c, 1, 0x75, 5, 0xe8, 0, 0, 0, 0, 0xff, 0x75, 0x10, 0xff,
+        0x75, 0x0c, 0xff, 0x75, 8, 0xe8, 0, 0, 0, 0, 0x83, 0xc4, 0x0c, 0x5d, 0xc2, 0x0c, 0,
+    ]);
+    write_rel32(&mut image, entry + 9, 0xe8, layout.cookie_initializer);
+    write_rel32(&mut image, entry + 23, 0xe8, dispatch);
+    assert_eq!(
+        discover_output_entry(&image, &pe).unwrap(),
+        OutputEntry::NativeDll { entry_rva: entry }
+    );
+    image[start + 33] = 8;
+    assert!(discover_output_entry(&image, &pe).is_err());
+    image[start + 33] = 12;
+    write_u32_at(
+        &mut image,
+        layout.seh_helper + 0x21,
+        TEST_IMAGE_BASE as u32 + layout.cookie_complement,
+    );
+    assert!(discover_output_entry(&image, &pe).is_err());
+}
+
+#[test]
+fn ambiguous_amd64_profiles_must_match_each_recorded_push_register() {
+    let sites = [(0, 2, 13), (2, 3, 13), (5, 2, 5)];
+    let mut prologues = [0x41, 0x55, 0x41, 0xff, 0xf5, 0x40, 0x55];
+    assert!(native::amd64::matches_unwind_pushes(&prologues, &sites));
+    prologues[2] = 0x40;
+    assert!(!native::amd64::matches_unwind_pushes(&prologues, &sites));
+    prologues[2] = 0x41;
+    prologues[6] = 0x53;
+    assert!(!native::amd64::matches_unwind_pushes(&prologues, &sites));
+}
+
+#[test]
+fn cookie_time_call_binds_stack_argument_and_import_cell() {
+    let mut bytes = [0u8; I386_COOKIE_EVIDENCE_LEN];
+    bytes[..10].copy_from_slice(&[0x8d, 0x45, 0xf4, 0x50, 0xff, 0x15, 0x20, 0x10, 0x40, 0]);
+    assert!(native::i386::cookie_calls_time_import(&bytes, 0, 0x401020));
+    assert!(!native::i386::cookie_calls_time_import(&bytes, 0, 0x401024));
+    bytes[3] = 0x51;
+    assert!(!native::i386::cookie_calls_time_import(&bytes, 0, 0x401020));
+}
+
+#[test]
 fn recognizes_standalone_i386_msvc_oep_without_predecessor() {
     let (image, pe, layout) = standalone_i386_fixture();
 
@@ -1736,6 +1787,88 @@ fn unchanged_native_profile_does_not_require_sparse_layout() {
         }
     );
     assert_eq!(mapped, original);
+}
+
+#[test]
+fn single_page_evidence_needs_distinguishing_startup_semantics() {
+    let (mut plain, pe, _) = standalone_i386_fixture();
+    plain[0x2000..0x3000].fill(0xcc);
+    let mut encoded = plain.clone();
+    decode_sparse_text_pages_in_place(&mut encoded, &pe, SparsePageKey::PageRvaRol(3)).unwrap();
+    assert!(matches!(
+        sparse::page_evidence(&encoded, &pe).unwrap(),
+        sparse::PageEvidence::Partial(_)
+    ));
+    assert!(discover_output_entry(&encoded, &pe).is_err());
+    let selected = select_output_entry(&mut encoded, &pe).unwrap();
+    assert_eq!(
+        selected.code_transform,
+        crate::pipeline::outcome::CodeTransform::PageRvaRol { rotation: 3 }
+    );
+    assert_eq!(encoded, plain);
+
+    let (mut ambiguous, pe) = recognizable_startup_with_padded_text();
+    let last = pe.size_of_image as usize - SPARSE_PAGE_SIZE;
+    ambiguous[last..].fill(0x90);
+    decode_sparse_text_pages_in_place(&mut ambiguous, &pe, SparsePageKey::PageRvaRol(3)).unwrap();
+    assert!(matches!(
+        sparse::page_evidence(&ambiguous, &pe).unwrap(),
+        sparse::PageEvidence::Partial(_)
+    ));
+    assert!(discover_output_entry(&ambiguous, &pe).is_ok());
+    let before = ambiguous.clone();
+    assert!(select_output_entry(&mut ambiguous, &pe).is_err());
+    assert_eq!(ambiguous, before);
+}
+
+fn recognizable_startup_with_padded_text() -> (Vec<u8>, Pe) {
+    let (mut mapped, mut pe, _) = standalone_i386_fixture();
+    pe.sections[0].name_bytes = *b".crt\0\0\0\0";
+    let start = pe.size_of_image;
+    let mut text = section(2, start, 0x2000, IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ);
+    text.name_bytes = *b".text\0\0\0";
+    pe.sections.push(text);
+    pe.section_count += 1;
+    pe.size_of_image += 0x2000;
+    mapped.resize(pe.size_of_image as usize, 0xcc);
+    (mapped, pe)
+}
+
+#[test]
+fn recognizable_startup_does_not_leave_independently_encoded_text_unchanged() {
+    let (mut plain, pe) = recognizable_startup_with_padded_text();
+    assert_eq!(
+        select_output_entry(&mut plain, &pe).unwrap().code_transform,
+        crate::pipeline::outcome::CodeTransform::Unchanged
+    );
+    let mut encoded = plain.clone();
+    decode_sparse_text_pages_in_place(&mut encoded, &pe, SparsePageKey::PageRvaRol(3)).unwrap();
+    assert!(discover_output_entry(&encoded, &pe).is_ok());
+    let selected = select_output_entry(&mut encoded, &pe).unwrap();
+    assert_eq!(
+        selected.code_transform,
+        crate::pipeline::outcome::CodeTransform::PageRvaRol { rotation: 3 }
+    );
+    assert_eq!(encoded, plain);
+}
+
+#[test]
+fn incompatible_text_pages_do_not_select_a_whole_section_transform() {
+    let (plain, pe) = recognizable_startup_with_padded_text();
+    let mut encoded = plain.clone();
+    decode_sparse_text_pages_in_place(&mut encoded, &pe, SparsePageKey::PageIndex).unwrap();
+    let last = pe.size_of_image as usize - SPARSE_PAGE_SIZE;
+    let mut second = plain.clone();
+    for mixed in [false, true] {
+        if mixed {
+            decode_sparse_text_pages_in_place(&mut second, &pe, SparsePageKey::PageRvaRol(3))
+                .unwrap();
+        }
+        encoded[last..].copy_from_slice(&second[last..]);
+        let before = encoded.clone();
+        assert!(select_output_entry(&mut encoded, &pe).is_err());
+        assert_eq!(encoded, before);
+    }
 }
 
 #[test]

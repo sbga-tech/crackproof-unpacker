@@ -206,7 +206,6 @@ impl Pe {
             data_directory_table_offset,
             directories,
             sections,
-            #[cfg(test)]
             file_len: data.len(),
         };
         pe.validate_layout_for(data.len(), layout)?;

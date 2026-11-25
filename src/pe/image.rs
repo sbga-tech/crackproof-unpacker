@@ -120,7 +120,6 @@ impl Pe {
         Ok(self.rva_range_to_file_offset(rva, 1)?.start)
     }
 
-    #[cfg(test)]
     pub fn rva_range_to_file_offset(&self, rva: u32, len: usize) -> Result<Range<usize>> {
         ensure!(len != 0, "RVA range length is zero");
         let len_u32 = u32::try_from(len).context("RVA range length exceeds u32")?;

@@ -108,11 +108,16 @@ pub(crate) struct PayloadPlanSelectionError {
     message: String,
 }
 impl PayloadPlanSelectionError {
-    fn no_authenticated_chain(decryption_details: DecryptionDetails) -> Self {
+    fn no_authenticated_chain(
+        decryption_details: DecryptionDetails,
+        tested: usize,
+        replayed: usize,
+    ) -> Self {
         Self {
             decryption_details,
-            message: "no AES-context and decoder-precursor chain replays every payload block"
-                .to_owned(),
+            message: format!(
+                "no AES-context and decoder-precursor chain replays every payload block: {replayed} of {tested} candidates passed prefix checks and reached full replay"
+            ),
         }
     }
 
@@ -637,6 +642,7 @@ fn replay_nested_key_slice(
     keys: &[u32],
     decoders: &[DecoderCandidate],
     replay_maps: &[Option<&[u8; 256]>],
+    default_rotation_maps: &[Option<&[u8; 256]>],
     history: &[u8],
     destination_len: usize,
     exhaustive_rotations: bool,
@@ -656,6 +662,11 @@ fn replay_nested_key_slice(
             19..20
         };
         for shift in shifts {
+            let replay_maps = if shift == 19 {
+                default_rotation_maps
+            } else {
+                replay_maps
+            };
             if direct_record {
                 nested_transform_dwords_into(aes_plaintext, &mut scratch.transformed, key, shift);
                 for &byte_map in replay_maps {
@@ -793,6 +804,12 @@ fn replay_nested_record(
     let fixed_map = std::array::from_fn(|value| f8_byte(value as u8));
     let replay_maps =
         nested_replay_byte_maps(include_extended_maps, &fixed_map, byte_maps).collect::<Vec<_>>();
+    let fixed_only = [Some(&fixed_map)];
+    let default_rotation_maps = if include_extended_maps {
+        &fixed_only[..]
+    } else {
+        &replay_maps
+    };
     let key_workers = nested_key_worker_count(keys.len(), source.len(), destination_range.len());
     let parallel_key_replay = key_workers > 1;
     let key_chunk_size = keys.len().div_ceil(key_workers).max(1);
@@ -826,6 +843,7 @@ fn replay_nested_record(
                             key_chunk,
                             decoders,
                             &replay_maps,
+                            default_rotation_maps,
                             history,
                             destination_range.len(),
                             exhaustive_rotations,
@@ -853,6 +871,7 @@ fn replay_nested_record(
                 keys,
                 decoders,
                 &replay_maps,
+                default_rotation_maps,
                 history,
                 destination_range.len(),
                 exhaustive_rotations,
@@ -1053,8 +1072,7 @@ pub(super) struct DecryptionNestedReplayer<'a> {
     pub(super) payload_source: &'a [u8],
     pub(super) source_file_range: Range<usize>,
     pub(super) decoders: &'a [DecoderCandidate],
-    pub(super) contexts: Vec<PreparedAesContext>,
-    pub(super) fixed_contexts: bool,
+    pub(super) contexts: Option<Vec<PreparedAesContext>>,
     pub(super) extended_profile: bool,
     pub(super) exhaustive_rotations: bool,
     pub(super) cancellation: Option<&'a CancellationToken>,
@@ -1064,7 +1082,12 @@ impl NestedRecordReplayer for DecryptionNestedReplayer<'_> {
     fn begin_graph(&mut self, extended_profile: bool, exhaustive_rotations: bool) -> Result<()> {
         self.extended_profile = extended_profile;
         self.exhaustive_rotations = exhaustive_rotations;
-        if !self.fixed_contexts {
+        if let Some(token) = self.cancellation {
+            token.checkpoint()?;
+        }
+        let contexts = if let Some(contexts) = &self.contexts {
+            contexts
+        } else {
             let contexts = if let Some(cancellation) = self.cancellation {
                 scan_aes_contexts_in_range_with_cancellation(
                     self.payload_source,
@@ -1074,9 +1097,10 @@ impl NestedRecordReplayer for DecryptionNestedReplayer<'_> {
             } else {
                 scan_aes_contexts_in_range(self.payload_source, self.source_file_range.clone())?
             };
-            self.contexts = contexts.into_iter().map(PreparedAesContext::new).collect();
-        }
-        for (context_index, context) in self.contexts.iter().enumerate() {
+            self.contexts
+                .insert(contexts.into_iter().map(PreparedAesContext::new).collect())
+        };
+        for (context_index, context) in contexts.iter().enumerate() {
             debug!(
                 context_index,
                 file_offset = context.evidence.file_offset,
@@ -1096,8 +1120,12 @@ impl NestedRecordReplayer for DecryptionNestedReplayer<'_> {
         keys: &[u32],
         byte_maps: &[(usize, Box<[u8; 256]>)],
     ) -> Result<NestedReplay> {
+        let contexts = self
+            .contexts
+            .as_deref()
+            .expect("graph contexts initialized before replay");
         let legacy = replay_nested_record(
-            &self.contexts,
+            contexts,
             staged_outer,
             bootstrap,
             record,
@@ -1112,7 +1140,7 @@ impl NestedRecordReplayer for DecryptionNestedReplayer<'_> {
             return Ok(legacy);
         }
         replay_nested_record(
-            &self.contexts,
+            contexts,
             staged_outer,
             bootstrap,
             record,
@@ -1224,13 +1252,14 @@ fn chain_replays(
     Ok(None)
 }
 
-fn chain_prefixes_are_viable(
+pub(super) fn chain_prefixes_are_viable(
     packed: &[u8],
     stream_base: usize,
     records: &[PayloadBlock],
     decryptor: &Aes256CbcDecryptor,
     decoder_table: &[u8],
-    post_transform: &PayloadPostTransform,
+    transform: impl Fn(&mut [u8]),
+    allow_zero_width_controls: bool,
 ) -> Result<bool> {
     let mut prefix = [0u8; 16];
     for record in records {
@@ -1250,7 +1279,7 @@ fn chain_prefixes_are_viable(
                 .context("validated payload block prefix range disappeared")?,
         );
         decryptor.decrypt_full_blocks_in_place(&mut prefix[..prefix_len]);
-        post_transform.apply(&mut prefix[..prefix_len]);
+        transform(&mut prefix[..prefix_len]);
         let history_len = record.destination_rva.min(4);
         if !custom_decoder_prefix_is_viable(
             decoder_table,
@@ -1258,7 +1287,7 @@ fn chain_prefixes_are_viable(
             record.encoded_length,
             history_len,
             record.destination_length,
-            false,
+            allow_zero_width_controls,
         ) {
             return Ok(false);
         }
@@ -1478,7 +1507,8 @@ fn select_payload_plan_impl(
                     records,
                     &context.decryptor,
                     &decoder.table,
-                    post_transform,
+                    |bytes| post_transform.apply(bytes),
+                    false,
                 )? {
                     continue;
                 }
@@ -1496,7 +1526,12 @@ fn select_payload_plan_impl(
         "prefix-viable replay candidate count exceeds its bounded product"
     );
     if candidates.is_empty() {
-        return Err(PayloadPlanSelectionError::no_authenticated_chain(decryption_details).into());
+        return Err(PayloadPlanSelectionError::no_authenticated_chain(
+            decryption_details,
+            replay_pairs,
+            0,
+        )
+        .into());
     }
 
     let scratch_bytes = mapped
@@ -1591,6 +1626,7 @@ fn select_payload_plan_impl(
 
     let mut selected = None;
     let mut selected_is_ambiguous = false;
+    let replayed = candidate_results.len();
     for candidate_result in candidate_results {
         let candidate = candidate_result.candidate;
         let context = &contexts[candidate.context_index];
@@ -1639,7 +1675,12 @@ fn select_payload_plan_impl(
         "multiple AES-context, post-transform, and decoder-precursor chains replay every payload block"
     );
     let Some(selected) = selected else {
-        return Err(PayloadPlanSelectionError::no_authenticated_chain(decryption_details).into());
+        return Err(PayloadPlanSelectionError::no_authenticated_chain(
+            decryption_details,
+            replay_pairs,
+            replayed,
+        )
+        .into());
     };
     let context = &contexts[selected.context_index];
     let decoder = &decoder_candidates[selected.decoder_index];

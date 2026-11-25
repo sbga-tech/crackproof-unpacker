@@ -17,7 +17,7 @@ impl SilentRenderer {
 
 impl Renderer for SilentRenderer {
     fn render(&mut self, event: &EventRecord) -> io::Result<()> {
-        if event.kind != "run_failed" {
+        if event.kind != "run_failed" && !(event.kind == "run_completed" && event.level == "warn") {
             return Ok(());
         }
         serde_json::to_writer(&mut self.writer, event).map_err(io::Error::other)?;

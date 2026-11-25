@@ -1087,6 +1087,12 @@ fn commit_nested_output_maps(
     Ok(())
 }
 
+fn overlaps_accepted_descriptor(accepted: &HashSet<usize>, descriptor_offset: usize) -> bool {
+    accepted
+        .iter()
+        .any(|&offset| offset.abs_diff(descriptor_offset) < PAYLOAD_BLOCK_DESCRIPTOR_SIZE)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_nested_maps_from_graph_profile(
     outer: &[u8],
@@ -1129,6 +1135,7 @@ fn collect_nested_maps_from_graph_profile(
             include_length_complements,
         );
         let mut progress = false;
+        let mut rejected_keys = HashSet::new();
         for output_pass in 0..=output_ranges.len() {
             let include_outputs = output_pass != 0;
             let output_contexts: &[Range<usize>] = if output_pass == 0 {
@@ -1160,10 +1167,12 @@ fn collect_nested_maps_from_graph_profile(
                         continue;
                     }
                     ensure!(
-                        keys.len() < MAX_NESTED_KEY_CANDIDATES,
+                        key_set.len() <= MAX_NESTED_KEY_CANDIDATES,
                         "nested stage produced too many key candidates"
                     );
-                    keys.push(key);
+                    if !rejected_keys.contains(&key) {
+                        keys.push(key);
+                    }
                 }
                 if scalar_index + 1 == scalar_candidates.direct_len {
                     direct_key_count = keys.len();
@@ -1174,14 +1183,16 @@ fn collect_nested_maps_from_graph_profile(
                 checksum_bases = ?checksum_bases,
                 scalar_candidates = scalar_candidates.values.len(),
                 direct_scalars = scalar_candidates.direct_len,
-                key_candidates = keys.len(),
+                key_candidates = key_set.len(),
+                replay_keys = keys.len(),
                 "constructed bounded nested replay candidates"
             );
+            let mut all_missed = true;
             for record in &records {
-                if processed.contains(&record.descriptor_offset) {
+                if overlaps_accepted_descriptor(&processed, record.descriptor_offset) {
                     continue;
                 }
-                work_budget.charge(keys.len(), record.encoded_length)?;
+                work_budget.charge(key_set.len(), record.encoded_length)?;
                 // A unique metadata-rooted result needs no speculative search. If that
                 // prefix is empty or ambiguous, validate the complete candidate set so
                 // a uniquely structured bounded-output candidate can close the graph.
@@ -1206,6 +1217,7 @@ fn collect_nested_maps_from_graph_profile(
                         continue;
                     }
                     NestedReplay::Ambiguous => {
+                        all_missed = false;
                         debug!(
                             descriptor_offset = record.descriptor_offset,
                             output_pass,
@@ -1298,6 +1310,14 @@ fn collect_nested_maps_from_graph_profile(
             }
             if progress {
                 break;
+            }
+            if all_missed && output_pass < output_ranges.len() {
+                if rejected_keys.is_empty() {
+                    rejected_keys = key_set;
+                } else {
+                    let room = MAX_NESTED_KEY_CANDIDATES - rejected_keys.len();
+                    rejected_keys.extend(keys.into_iter().take(room));
+                }
             }
         }
         if !progress {

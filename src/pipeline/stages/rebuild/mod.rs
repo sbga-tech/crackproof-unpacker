@@ -4,6 +4,7 @@ use std::ops::Range;
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::pe::{self, DataDirectory, Pe, PointerWidth};
+use crate::pipeline::outcome::SourceDefect;
 use crate::pipeline::stages::imports::{
     ImportModule, ImportProfile, ImportSymbol, LoaderDiscovery, named_thunk_rva,
 };
@@ -21,6 +22,7 @@ const TLS_DIRECTORY: usize = 9;
 const IMAGE_IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const IMAGE_EXPORT_DIRECTORY_SIZE: usize = 40;
 const IAT_DIRECTORY: usize = 12;
+mod openssl;
 mod clr;
 mod pogo;
 const DELAY_IMPORT_DIRECTORY: usize = 13;
@@ -49,7 +51,9 @@ const MAX_SCAN_NESTED_WORK: usize = 16_000_000;
 /// The immutable handoff from packer-specific recovery to PE serialization.
 /// Authenticated payload-block destinations and POGO contributions take precedence;
 /// header values and structural scans are bounded fallback evidence.
-pub(crate) struct ReconstructionInput {
+pub(crate) struct ReconstructionInput<'a> {
+    pub(crate) packed: &'a [u8],
+    pub(crate) packed_pe: &'a Pe,
     pub(crate) mapped: Vec<u8>,
     pub(crate) decrypted_pe: Pe,
     pub(crate) output_entry: OutputEntry,
@@ -119,8 +123,10 @@ impl ScanBudget {
 /// placement first, including in-place standard imports. When that linker
 /// metadata is absent or uses an unsupported contribution family, bounded
 /// structural recovery emits the loader graph into a normalized import section.
-pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
+pub(crate) fn rebuild(input: ReconstructionInput<'_>) -> Result<(Vec<u8>, Option<SourceDefect>)> {
     let ReconstructionInput {
+        packed,
+        packed_pe,
         mut mapped,
         decrypted_pe,
         output_entry,
@@ -159,11 +165,12 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
             clear_discovered_imports(&mut mapped, &decrypted_pe, &discovery)?
         }
     }
-    let mut retained_directories = recover_directories(
+    let (mut retained_directories, defect) = recover_directories(
         &mapped,
         &decrypted_pe,
         &destination_ranges,
         &destination_record_ranges,
+        &discovery,
     )?;
     let selected_relocations = retained_directories
         .iter()
@@ -175,6 +182,7 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
         decrypted_pe.directory(BASE_RELOCATION_DIRECTORY)?,
         selected_relocations,
         &destination_ranges,
+        Some((packed, packed_pe)),
     )?;
     let generated_rva = pe::align_up(decrypted_pe.size_of_image, decrypted_pe.section_alignment)?;
     let (relocation_directory, relocation_prefix) = place_base_relocation_payload(
@@ -315,18 +323,20 @@ pub(crate) fn rebuild(input: ReconstructionInput) -> Result<Vec<u8>> {
             );
         }
     }
-    Ok(output)
+    verify_inherited_defect(defect, &final_mapped, &final_pe, &discovery)?;
+    Ok((output, defect))
 }
 
 fn rebuild_pogo(
     recovery: pogo::PogoRecovery,
     output_entry: OutputEntry,
     discovery: &LoaderDiscovery,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Option<SourceDefect>)> {
     let pogo::PogoRecovery {
         mapped,
         pe,
         directories,
+        defect,
     } = recovery;
     validate_entry_evidence(&mapped, &pe, output_entry)?;
     let import_directory = directories
@@ -407,7 +417,8 @@ fn rebuild_pogo(
             && u32_at(&output, final_pe.size_of_uninitialized_data_offset())? == aggregates.2,
         "POGO-reconstructed aggregate section sizes are inconsistent"
     );
-    Ok(output)
+    verify_inherited_defect(defect, &final_mapped, &final_pe, discovery)?;
+    Ok((output, defect))
 }
 
 fn verify_trimmed_section_mapping(
@@ -416,45 +427,41 @@ fn verify_trimmed_section_mapping(
     pe: &Pe,
     retained_directories: &[(usize, DataDirectory)],
 ) -> Result<()> {
-    let debug_pointers = retained_directories
-        .iter()
-        .find(|(index, _)| *index == 6)
-        .map(|(_, directory)| {
-            (0..usize::try_from(directory.size / 28)?)
-                .map(|index| {
-                    let start = directory
-                        .virtual_address
-                        .checked_add(u32::try_from(
-                            index
-                                .checked_mul(28)
-                                .context("debug pointer offset overflows")?,
-                        )?)
-                        .context("debug pointer RVA overflows")?
-                        .checked_add(24)
-                        .context("debug pointer RVA overflows")?;
-                    Ok(start
-                        ..start
-                            .checked_add(4)
-                            .context("debug pointer range overflows")?)
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
     ensure!(
         expected.len() >= usize::try_from(pe.size_of_image)?
             && actual.len() >= usize::try_from(pe.size_of_image)?,
         "mapped image is shorter than SizeOfImage"
     );
-    for rva in pe.size_of_headers..pe.size_of_image {
-        if !debug_pointers.iter().any(|pointer| pointer.contains(&rva)) {
-            ensure!(
-                expected.get(usize::try_from(rva)?) == actual.get(usize::try_from(rva)?),
-                "trimmed mapped image differs at RVA {rva:#x}"
+    let end = pe.size_of_image as usize;
+    let mut cursor = pe.size_of_headers as usize;
+    let compare = |range: Range<usize>| -> Result<()> {
+        let before = &expected[range.clone()];
+        let after = &actual[range.clone()];
+        if before != after {
+            let offset = before.iter().zip(after).position(|(x, y)| x != y).unwrap();
+            bail!(
+                "trimmed mapped image differs at RVA {:#x}",
+                range.start + offset
             );
         }
+        Ok(())
+    };
+    if let Some((_, directory)) = retained_directories
+        .iter()
+        .find(|(i, _)| *i == DEBUG_DIRECTORY)
+    {
+        for index in 0..(directory.size / 28) as usize {
+            let pointer = directory.virtual_address as usize + index * 28 + 24;
+            if pointer >= end {
+                break;
+            }
+            if cursor < pointer {
+                compare(cursor..pointer)?;
+            }
+            cursor = cursor.max((pointer + 4).min(end));
+        }
     }
-    Ok(())
+    compare(cursor..end)
 }
 
 fn validate_entry_evidence(mapped: &[u8], pe: &Pe, entry: OutputEntry) -> Result<()> {
@@ -1407,7 +1414,9 @@ fn recover_directories(
     pe: &Pe,
     destination_ranges: &[Range<u32>],
     destination_record_ranges: &[Range<u32>],
-) -> Result<Vec<(usize, DataDirectory)>> {
+    discovery: &LoaderDiscovery,
+) -> Result<(Vec<(usize, DataDirectory)>, Option<SourceDefect>)> {
+    let mut defect = None;
     let mut result = Vec::new();
     for (index, directory) in pe.directories.iter().copied().enumerate() {
         if matches!(
@@ -1432,8 +1441,14 @@ fn recover_directories(
             continue;
         }
         if index == EXCEPTION_DIRECTORY {
-            if let Some(recovered) = recover_exception_directory(mapped, pe, directory)? {
-                result.push((index, recovered));
+            match recover_exception_directory(mapped, pe, directory) {
+                Ok(Some(recovered)) => result.push((index, recovered)),
+                Ok(None) => {}
+                Err(error) if error.is::<openssl::NonExecutableHandler>() => {
+                    defect = assess_exception_directory(mapped, pe, directory, Some(discovery))?;
+                    result.push((index, directory));
+                }
+                Err(error) => return Err(error),
             }
             continue;
         }
@@ -1461,7 +1476,7 @@ fn recover_directories(
         };
         result.push((index, directory));
     }
-    Ok(result)
+    Ok((result, defect))
 }
 
 fn validate_retained_directory(
@@ -1560,6 +1575,32 @@ fn recover_exception_directory(
 }
 
 fn validate_exception_directory(mapped: &[u8], pe: &Pe, directory: DataDirectory) -> Result<()> {
+    assess_exception_directory(mapped, pe, directory, None).map(|_| ())
+}
+
+fn verify_inherited_defect(
+    expected: Option<SourceDefect>,
+    mapped: &[u8],
+    pe: &Pe,
+    discovery: &LoaderDiscovery,
+) -> Result<()> {
+    if expected.is_some() {
+        let directory = pe.directory(EXCEPTION_DIRECTORY)?;
+        ensure!(
+            assess_exception_directory(mapped, pe, directory, Some(discovery))? == expected,
+            "inherited exception-handler evidence changed during reconstruction"
+        );
+    }
+    Ok(())
+}
+
+fn assess_exception_directory(
+    mapped: &[u8],
+    pe: &Pe,
+    directory: DataDirectory,
+    discovery: Option<&LoaderDiscovery>,
+) -> Result<Option<SourceDefect>> {
+    let mut rsaz = openssl::RsazRows::default();
     ensure!(
         pe.pointer_width() == PointerWidth::U64,
         "exception directory is only retained for PE32+"
@@ -1578,14 +1619,20 @@ fn validate_exception_directory(mapped: &[u8], pe: &Pe, directory: DataDirectory
             .virtual_address
             .checked_add(offset)
             .context("runtime-function RVA overflow")?;
-        let (begin, _, _) = validate_runtime_function(mapped, pe, record, &mut BTreeSet::new(), 0)?;
+        let begin = match validate_runtime_function(mapped, pe, record, &mut BTreeSet::new(), 0) {
+            Ok((begin, _, _)) => begin,
+            Err(error) => discovery
+                .zip(error.downcast_ref::<openssl::NonExecutableHandler>())
+                .and_then(|(imports, handler)| rsaz.accept(mapped, pe, imports, record, handler))
+                .ok_or(error)?,
+        };
         ensure!(
             previous_begin.is_none_or(|previous| begin > previous),
             "runtime-function entries are not strictly sorted"
         );
         previous_begin = Some(begin);
     }
-    Ok(())
+    rsaz.finish()
 }
 
 fn validate_runtime_function(
@@ -1877,10 +1924,13 @@ fn validate_unwind_info(
             );
             ensure!(handler != 0, "UNWIND_INFO handler RVA is null");
             let section = pe.section_for_rva_range(handler, 1)?;
-            ensure!(
-                section.characteristics & 0x2000_0000 != 0,
-                "UNWIND_INFO handler is not executable"
-            );
+            if section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+                return Err(openssl::NonExecutableHandler {
+                    unwind: unwind_rva,
+                    handler,
+                }
+                .into());
+            }
         }
         Ok(contract)
     }
@@ -1921,6 +1971,14 @@ fn recover_base_relocation_directory(
         return Ok(Some(produced));
     }
     if declared_relocations != 0 && declared_relocations_match_tls_closure(mapped, pe, declared)? {
+        if let Some(directory) = pogo::relocation_after_resources(
+            mapped,
+            pe,
+            destination_ranges,
+            destination_record_ranges,
+        )? {
+            return Ok(Some(directory));
+        }
         return Ok(Some(declared));
     }
 
@@ -2121,11 +2179,10 @@ pub(crate) fn declared_relocations_match_tls_closure(
 }
 
 fn validate_tls_relocation_closure(
-    mapped: &[u8],
-    pe: &Pe,
+    required_slots: &[BaseRelocationSlot],
     entries: &[BaseRelocationSlot],
 ) -> Result<()> {
-    for required in required_tls_relocation_slots(mapped, pe)? {
+    for required in required_slots {
         ensure!(
             has_effective_relocation(entries, required.target_rva),
             "dynamic-base TLS field or callback at RVA {:#x} lacks a base relocation",
@@ -2160,12 +2217,46 @@ fn emit_base_relocation_payload(entries: &[BaseRelocationSlot]) -> Result<Vec<u8
     Ok(output)
 }
 
+fn matches_packed_tls_stub(
+    packed: &[u8],
+    packed_pe: &Pe,
+    mapped: &[u8],
+    pe: &Pe,
+    required: &[BaseRelocationSlot],
+) -> Result<bool> {
+    let tls = pe.directory(TLS_DIRECTORY)?;
+    if packed_pe.machine_kind() != pe.machine_kind()
+        || packed_pe.image_base != pe.image_base
+        || packed_pe.directory(TLS_DIRECTORY)? != tls
+    {
+        return Ok(false);
+    }
+    let declared = packed_pe.directory(BASE_RELOCATION_DIRECTORY)?;
+    let expected = emit_base_relocation_payload(required)?;
+    if declared.size as usize != expected.len() || declared.is_empty() {
+        return Ok(false);
+    }
+    let range = packed_pe.rva_range_to_file_offset(declared.virtual_address, expected.len())?;
+    if packed[range] != expected {
+        return Ok(false);
+    }
+    let width = pe.pointer_width().bytes();
+    for slot in required {
+        let source = packed_pe.rva_range_to_file_offset(slot.target_rva, width)?;
+        if rva_slice(mapped, pe, slot.target_rva, width) != Some(&packed[source]) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn canonical_base_relocation_payload(
     mapped: &[u8],
     pe: &Pe,
     declared: DataDirectory,
     selected: Option<DataDirectory>,
     destination_ranges: &[Range<u32>],
+    packed_source: Option<(&[u8], &Pe)>,
 ) -> Result<Vec<u8>> {
     let selected_slots = selected
         .map(|directory| base_relocation_slots(mapped, pe, directory))
@@ -2217,10 +2308,28 @@ fn canonical_base_relocation_payload(
             }
         }
     }
+    let mut required = required_tls_relocation_slots(mapped, pe)?;
+    if required
+        .iter()
+        .any(|slot| !has_effective_relocation(&entries, slot.target_rva))
+        && let Some((packed, packed_pe)) = packed_source
+    {
+        required.sort_unstable_by_key(|slot| slot.target_rva);
+        if matches_packed_tls_stub(packed, packed_pe, mapped, pe, &required)? {
+            for &slot in &required {
+                if placeholders.contains(&slot.target_rva)
+                    && let Err(position) =
+                        entries.binary_search_by_key(&slot.target_rva, |e| e.target_rva)
+                {
+                    entries.insert(position, slot);
+                }
+            }
+        }
+    }
     for &entry in &entries {
         validate_preferred_relocation_value(mapped, pe, entry)?;
     }
-    validate_tls_relocation_closure(mapped, pe, &entries)?;
+    validate_tls_relocation_closure(&required, &entries)?;
     emit_base_relocation_payload(&entries)
 }
 

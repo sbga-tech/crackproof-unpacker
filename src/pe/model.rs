@@ -168,7 +168,6 @@ pub struct Pe {
     pub data_directory_table_offset: usize,
     pub directories: Vec<DataDirectory>,
     pub sections: Vec<Section>,
-    #[cfg(test)]
     pub file_len: usize,
 }
 

@@ -544,10 +544,13 @@ impl<'a> Pipeline<'a> {
                                 rebuilt.output,
                                 Some(rebuilt.generated),
                                 Some(rebuilt.source),
+                                None,
                             )
                         })
                 } else {
                     rebuild::rebuild(ReconstructionInput {
+                        packed: &packed,
+                        packed_pe: &packed_pe,
                         mapped: image,
                         decrypted_pe,
                         output_entry,
@@ -556,7 +559,7 @@ impl<'a> Pipeline<'a> {
                         destination_record_ranges,
                         destination_ranges,
                     })
-                    .map(|output| (output, None, None))
+                    .map(|(output, defect)| (output, None, None, defect))
                 }
                 .context("rebuilding static PE output")?;
                 let output_pe =
@@ -569,7 +572,7 @@ impl<'a> Pipeline<'a> {
                     size_of_image = output_pe.size_of_image,
                     file_bytes = rebuilt.0.len(),
                     managed = managed_kind.is_some(),
-                    "verified reconstructed PE output"
+                    "{}", if rebuilt.3.is_some() { "reconstructed PE output with inherited source defect" } else { "verified reconstructed PE output" }
                 );
                 for section in &output_pe.sections {
                     debug!(
@@ -618,7 +621,9 @@ impl<'a> Pipeline<'a> {
             },
         )?;
         let (rebuilt, output_pe) = rebuilt;
-        let (image, generated_semantic_clr_container, managed_semantic_clr_source) = rebuilt;
+        let (image, generated_semantic_clr_container, managed_semantic_clr_source, source_defect) =
+            rebuilt;
+        summary.source_defect = source_defect;
         summary.output_pe = Some(output_pe);
         summary.generated_semantic_clr_container = generated_semantic_clr_container;
         summary.managed_semantic_clr_source = managed_semantic_clr_source;

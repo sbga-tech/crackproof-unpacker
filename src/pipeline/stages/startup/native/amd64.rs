@@ -781,6 +781,50 @@ fn amd64_unwind_prologue_evidence(
     Ok(true)
 }
 
+pub(in crate::pipeline::stages::startup) fn unwind_push_sites(
+    mapped: &[u8],
+    pe: &Pe,
+) -> Result<Vec<(u32, usize, u8)>> {
+    let executable_ranges = executable_section_ranges(mapped, pe)?;
+    let mut sites = Vec::new();
+    let Some(index) = Amd64RuntimeFunctionIndex::parse(mapped, pe, &executable_ranges)? else {
+        return Ok(sites);
+    };
+    for function in index.records {
+        let unwind_rva = read_u32_rva(mapped, function.record_rva + 8)?;
+        let header = mapped_bytes(mapped, unwind_rva, 4)?;
+        if header[0] & 7 != 1 || header[2] == 0 {
+            continue;
+        }
+        let code = mapped_bytes(mapped, unwind_rva + 4, 2)?;
+        let end = usize::from(code[0]);
+        if code[1] & 15 == 0
+            && end >= 2
+            && code[0] <= header[1]
+            && u32::from(header[1]) <= function.end_rva - function.begin_rva
+        {
+            sites.push((function.begin_rva, end, code[1] >> 4));
+        }
+    }
+    Ok(sites)
+}
+
+pub(in crate::pipeline::stages::startup) fn matches_unwind_pushes(
+    mapped: &[u8],
+    sites: &[(u32, usize, u8)],
+) -> bool {
+    sites.iter().all(|&(begin, end, reg)| {
+        let stop = begin as usize + end;
+        let last = mapped[stop - 1];
+        let prev = mapped[stop - 2];
+        let rex = |byte: u8| (0x40..=0x4f).contains(&byte) && byte & 1 != 0;
+        (last == 0x50 + (reg & 7) && rex(prev) == (reg >= 8))
+            || (last == 0xf0 + (reg & 7)
+                && prev == 0xff
+                && (end >= 3 && rex(mapped[stop - 3])) == (reg >= 8))
+    })
+}
+
 fn amd64_push_matches(prologue: &[u8], end: usize, register: u8) -> bool {
     if register < 8 {
         end >= 1 && prologue.get(end - 1) == Some(&(0x50 + register))
